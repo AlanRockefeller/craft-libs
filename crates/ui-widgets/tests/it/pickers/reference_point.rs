@@ -10,7 +10,7 @@ use craft_ui::testing::Fixture;
 use craft_ui::testing::focus::AccessActionKind;
 use craft_ui::testing::trial;
 use egui::epaint::RectShape;
-use egui::{Color32, Key, Modifiers, Pos2, Rect, Shape, Ui};
+use egui::{Color32, Key, Modifiers, Pos2, Rect, Shape, Ui, Vec2};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -360,7 +360,10 @@ fn the_squares_take_the_inks_of_the_dots_they_stand_in_for() {
         let (dot_pick, dot_beside) = painted_inks(dots);
         let (square_pick, square_beside) = painted_inks(squares);
         if apart {
-            assert_ne!(dot_pick, dot_beside, "in the enabled state the pick reads in an ink of its own, so this comparison tells the two apart");
+            assert!(
+                dot_beside.iter().all(|ink| *ink != dot_pick),
+                "in the enabled state the pick reads in an ink of its own, so this comparison tells the two apart"
+            );
         }
         assert_eq!(square_pick, dot_pick, "in the {state} state the pick's square is filled with the ink of the pick's dot");
         assert_eq!(square_beside, dot_beside, "and the other squares are outlined in the inks of the other dots, in the {state} state");
