@@ -117,7 +117,7 @@ fn cells(fixture: &Fixture) -> Vec<Rect> {
 }
 
 /// The mark a point shows: the shape drawn inside its cell that is smaller than the cell and as tall as it is wide.
-fn mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
+fn mark(shapes: &[Shape], cell: Rect) -> Option<&RectShape> {
     shapes.iter().find_map(|shape| match shape {
         Shape::Rect(rect)
             if cell.contains_rect(rect.rect) && rect.rect.width() < cell.width() && (rect.rect.width() - rect.rect.height()).abs() <= ROUNDING =>
@@ -129,7 +129,7 @@ fn mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
 }
 
 /// The mark of the point in `cell`, whatever its size: the shape as tall as it is wide centred on the cell.
-fn centred_mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
+fn centred_mark(shapes: &[Shape], cell: Rect) -> Option<&RectShape> {
     // The centre cell shares its centre with the picker's background. Choose the smallest centred square, not the
     // first painted one, without requiring containment: an oversized mark must still reach the containment assertion.
     shapes
