@@ -1,14 +1,16 @@
 //! `ReferencePoint` marks its nine points with the dot the picker has always shown; asked for a presentation, it marks
-//! them with the squares of the box's grid, joined to their neighbours, and keeps every part, cell, name and pick.
+//! them with the squares of the box's grid, joined to their neighbours, and keeps every part, cell, name and pick. The
+//! squares take their share of the cell they are drawn in, so they and their joins fit even a room smaller than the
+//! picker asks for.
 
 use craft_behavior::Anchor9;
-use craft_ui::contract::{Bind, Show as _};
+use craft_ui::contract::{Bind, Props as _, Show as _};
 use craft_ui::pickers::{PointPresentation, ReferencePoint};
 use craft_ui::testing::Fixture;
 use craft_ui::testing::focus::AccessActionKind;
 use craft_ui::testing::trial;
 use egui::epaint::RectShape;
-use egui::{Key, Modifiers, Pos2, Rect, Shape, Ui};
+use egui::{Color32, Key, Modifiers, Pos2, Rect, Shape, Ui};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -21,6 +23,13 @@ const CENTRE: usize = 4;
 /// The slack a painted shape is compared with: the rounding of the layout.
 const ROUNDING: f32 = 0.5;
 
+/// The share of its cell a square takes, as the presentation's own constant holds it: the look the observed proxy gives
+/// the nine points, with about a third of the cell left for the line that joins them.
+const SQUARE_OF_CELL: f32 = 0.7;
+
+/// The slack the share is read with, a twentieth of it: a rect the layout rounded moves a share this much at most.
+const SHARE_SLACK: f32 = 0.05;
+
 /// The nine points' names, in the order the picker declares them: row by row from the top left.
 const NAMES: [&str; GRID * GRID] = ["Top left", "Top", "Top right", "Left", "Center", "Right", "Bottom left", "Bottom", "Bottom right"];
 
@@ -30,12 +39,13 @@ struct Picker {
     presentation: PointPresentation,
     compact: bool,
     growth: Option<(f64, f64)>,
+    enabled: bool,
 }
 
 impl Picker {
     /// The picker as the library shows it, the centre picked.
     fn dots() -> Self {
-        Picker { point: Cell::new(Anchor9::Centre), presentation: PointPresentation::Dots, compact: false, growth: None }
+        Picker { point: Cell::new(Anchor9::Centre), presentation: PointPresentation::Dots, compact: false, growth: None, enabled: true }
     }
 
     fn squares() -> Self {
@@ -51,16 +61,33 @@ impl Picker {
         Picker { compact: true, ..self }
     }
 
-    fn show(&self, ui: &mut Ui) {
-        let mut point = self.point.get();
-        let mut picker = ReferencePoint::new("Reference point", Bind::bound(&mut point)).presentation(self.presentation);
+    /// The picker the tokens paint disabled, so a trial can compare the two presentations' inks in that state too.
+    fn disabled(self) -> Self {
+        Picker { enabled: false, ..self }
+    }
+
+    /// The picker this holds, over `point`.
+    fn build<'b>(&self, point: &'b mut Anchor9) -> ReferencePoint<'b> {
+        let mut picker = ReferencePoint::new("Reference point", Bind::bound(point)).presentation(self.presentation).enabled(self.enabled);
         if self.compact {
             picker = picker.compact();
         }
         if let Some(growth) = self.growth {
             picker = picker.growth(growth);
         }
-        picker.show(ui);
+        picker
+    }
+
+    fn show(&self, ui: &mut Ui) {
+        let mut point = self.point.get();
+        self.build(&mut point).show(ui);
+        self.point.set(point);
+    }
+
+    /// The picker at `rect`, the room a fixed slot gives it, rather than the size it asks for.
+    fn show_in(&self, ui: &mut Ui, rect: Rect) {
+        let mut point = self.point.get();
+        self.build(&mut point).show_at(ui, rect);
         self.point.set(point);
     }
 }
@@ -72,6 +99,17 @@ fn settled(picker: &Rc<Picker>) -> Fixture {
     fixture.settle();
     fixture
 }
+
+/// A settled fixture showing `picker` at `rect`, which the caller keeps to read the point back.
+fn settled_in(picker: &Rc<Picker>, rect: Rect) -> Fixture {
+    let shown = picker.clone();
+    let mut fixture = Fixture::new(move |ui| shown.show_in(ui, rect));
+    fixture.settle();
+    fixture
+}
+
+/// The share of the room the picker asks for that a fixed slot leaves it, in the trial that forces a smaller room.
+const SLOT: f32 = 0.5;
 
 /// The nine points' cells, as the picker reports them to a screen reader: also the names and the count it keeps.
 fn cells(fixture: &Fixture) -> Vec<Rect> {
@@ -86,6 +124,14 @@ fn mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
         {
             Some(rect)
         }
+        _ => None,
+    })
+}
+
+/// The mark of the point in `cell`, whatever its size: the shape as tall as it is wide centred on the cell.
+fn centred_mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
+    shapes.iter().find_map(|shape| match shape {
+        Shape::Rect(rect) if same(rect.rect.center(), cell.center()) && (rect.rect.width() - rect.rect.height()).abs() <= ROUNDING => Some(rect),
         _ => None,
     })
 }
@@ -105,6 +151,19 @@ fn lines(shapes: &[Shape]) -> Vec<[Pos2; 2]> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether `shapes` holds an arrowhead in `cell`. At this pin `Draw::fill` of a `PaintShape::Polygon` adds the filled
+/// polygon as a mesh and no stroked loop (a polygon with only a fill returns before its closed path), so a head is the
+/// mesh whose bounds lie in the cell and are smaller than it.
+fn head_in(shapes: &[Shape], cell: Rect) -> bool {
+    shapes.iter().any(|shape| match shape {
+        Shape::Mesh(mesh) => {
+            let bounds = mesh.calc_bounds();
+            cell.contains_rect(bounds) && bounds.width() < cell.width()
+        }
+        _ => false,
+    })
 }
 
 /// The lines the squares presentation draws: the point of each cell joined to the point on its right and to the one
@@ -133,6 +192,25 @@ fn same(first: Pos2, second: Pos2) -> bool {
 /// Whether `painted` holds a line joining the two points `wanted` joins, either way round.
 fn joins(painted: &[[Pos2; 2]], wanted: [Pos2; 2]) -> bool {
     painted.iter().any(|line| (same(line[0], wanted[0]) && same(line[1], wanted[1])) || (same(line[0], wanted[1]) && same(line[1], wanted[0])))
+}
+
+/// The ink `picker` paints its pick with and the ink of the eight points beside it: a mark that is filled gives its
+/// fill, and one that is outlined gives its outline, so the two presentations are compared on the colour each point
+/// reads in rather than on how it is drawn.
+fn painted_inks(picker: Picker) -> (Color32, Vec<Color32>) {
+    let picker = Rc::new(picker);
+    let mut fixture = settled(&picker);
+    let cells = cells(&fixture);
+    let shapes = fixture.frame_shapes();
+    let marks = marks(&shapes, &cells);
+    let pick = marks[CENTRE].fill;
+    let beside = marks
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != CENTRE)
+        .map(|(_, mark)| if mark.stroke.is_empty() { mark.fill } else { mark.stroke.color })
+        .collect();
+    (pick, beside)
 }
 
 #[trial]
@@ -169,12 +247,31 @@ fn the_squares_presentation_outlines_the_points_and_joins_them_into_the_boxs_gri
         assert_eq!(mark.fill.a() > 0, picked, "the pick's square is filled and the rest are not, at {at}");
         assert_eq!(!mark.stroke.is_empty(), !picked, "the rest are outlined and the pick is not, at {at}");
     }
+    assert!((0..GRID * GRID).all(|at| !head_in(&shapes, cells[at])), "no point shows an arrowhead without growth");
     let painted = lines(&shapes);
     let wanted = links(&marks);
     assert_eq!(painted.len(), GRID_LINES, "the squares are joined to the neighbours they have: {painted:?}");
     assert_eq!(wanted.len(), GRID_LINES, "and the joins wanted are the same number");
     for line in &wanted {
         assert!(joins(&painted, *line), "a line joins {line:?}, of {painted:?}");
+    }
+}
+
+#[trial]
+fn a_square_takes_the_documented_share_of_its_cell() {
+    for (name, picker) in [("full", Picker::squares()), ("compact", Picker::squares().compact())] {
+        let picker = Rc::new(picker);
+        let mut fixture = settled(&picker);
+        let cells = cells(&fixture);
+        let shapes = fixture.frame_shapes();
+        let marks = marks(&shapes, &cells);
+        for (at, mark) in marks.iter().enumerate() {
+            let share = mark.rect.width() / cells[at].width();
+            assert!(
+                (share - SQUARE_OF_CELL).abs() <= SHARE_SLACK,
+                "the {name} square at {at} takes {share} of its cell, not the {SQUARE_OF_CELL} the presentation holds"
+            );
+        }
     }
 }
 
@@ -196,15 +293,77 @@ fn the_presentation_changes_the_mark_and_leaves_every_cell_and_the_size_alone() 
 }
 
 #[trial]
-fn the_growth_arrows_are_shown_beside_the_pick_in_either_presentation() {
-    let arrows = |picker: Picker| {
+fn the_growth_arrows_keep_their_shafts_beside_the_pick_in_either_presentation() {
+    let shafts = |picker: Picker| {
         let picker = Rc::new(picker.grown());
         let mut fixture = settled(&picker);
         lines(&fixture.frame_shapes()).len()
     };
     let neighbours = GRID * GRID - 1;
-    assert_eq!(arrows(Picker::dots()), neighbours, "the dots presentation shows one arrow per point beside the centre pick");
-    assert_eq!(arrows(Picker::squares()), neighbours + GRID_LINES, "the squares presentation keeps those arrows beside its joins");
+    assert_eq!(shafts(Picker::dots()), neighbours, "the dots presentation shows one shaft per point beside the centre pick");
+    assert_eq!(shafts(Picker::squares()), neighbours + GRID_LINES, "the squares presentation keeps those shafts beside its twelve joins");
+}
+
+#[trial]
+fn every_growth_arrow_has_a_head_of_its_own_in_either_presentation() {
+    let neighbours = GRID * GRID - 1;
+    for (name, picker) in [("dots", Picker::dots()), ("squares", Picker::squares())] {
+        let picker = Rc::new(picker.grown());
+        let mut fixture = settled(&picker);
+        let cells = cells(&fixture);
+        let shapes = fixture.frame_shapes();
+        let headed: Vec<usize> = (0..GRID * GRID).filter(|at| head_in(&shapes, cells[*at])).collect();
+        assert_eq!(headed.len(), neighbours, "the {name} presentation draws a head in each of the eight cells beside the pick: {headed:?}");
+        assert!(!headed.contains(&CENTRE), "and none in the pick's own cell, {name}");
+    }
+}
+
+#[trial]
+fn the_squares_take_the_inks_of_the_dots_they_stand_in_for() {
+    let states = [("enabled", Picker::dots(), Picker::squares()), ("disabled", Picker::dots().disabled(), Picker::squares().disabled())];
+    for (state, dots, squares) in states {
+        let (dot_pick, dot_beside) = painted_inks(dots);
+        let (square_pick, square_beside) = painted_inks(squares);
+        assert_eq!(square_pick, dot_pick, "in the {state} state the pick's square is filled with the ink of the pick's dot");
+        assert_eq!(square_beside, dot_beside, "and the other squares are outlined in the inks of the other dots, in the {state} state");
+    }
+}
+
+#[trial]
+fn the_squares_and_their_joins_fit_a_room_smaller_than_the_picker_asks_for() {
+    let picker = Rc::new(Picker::squares());
+    let mut natural = settled(&picker);
+    let asked = natural.shown();
+    let natural_side = {
+        let shapes = natural.frame_shapes();
+        marks(&shapes, &cells(&natural))[CENTRE].rect.width()
+    };
+    let forced = Rect::from_min_size(asked.min, asked.size() * SLOT);
+    let mut fixture = settled_in(&picker, forced);
+    let cells = cells(&fixture);
+    assert_eq!(cells.len(), GRID * GRID, "the fixed room keeps the nine points");
+    assert!(
+        cells[0].width() < asked.width() / GRID as f32,
+        "the room is smaller than the one the picker asks for: a cell of {:?} in a room of {forced:?}",
+        cells[0].size()
+    );
+    let shapes = fixture.frame_shapes();
+    let marks: Vec<&RectShape> = cells
+        .iter()
+        .enumerate()
+        .map(|(at, cell)| centred_mark(&shapes, *cell).unwrap_or_else(|| panic!("no mark at the centre of the cell at {at}")))
+        .collect();
+    for (at, (cell, mark)) in cells.iter().zip(&marks).enumerate() {
+        assert!(cell.contains_rect(mark.rect), "the square of the point at {at} stays in its cell: {:?} in {cell:?}", mark.rect);
+    }
+    assert!(marks[0].rect.width() < natural_side, "the squares shrink with the room: {:?} against {natural_side}", marks[0].rect.width());
+    let painted = lines(&shapes);
+    let wanted = links(&marks);
+    assert_eq!(painted.len(), GRID_LINES, "the squares are still joined to the neighbours they have: {painted:?}");
+    assert_eq!(wanted.len(), GRID_LINES, "and the joins wanted are the same number");
+    for line in &wanted {
+        assert!(joins(&painted, *line), "a line joins {line:?}, of {painted:?}");
+    }
 }
 
 #[trial]

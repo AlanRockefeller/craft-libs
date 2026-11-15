@@ -26,8 +26,9 @@ const GRID: usize = 3;
 /// The side of the dot every point shows; the large picker draws the picked one twice as wide.
 const DOT: f32 = 3.5;
 
-/// The side of a point's square in the connected-squares presentation, as a share of its cell: the observed proxy's
-/// squares leave about a third of the pitch for the line that joins them.
+/// The share of a cell a point's square takes in the connected-squares presentation: the observed proxy's squares
+/// leave about a third of the pitch for the line that joins them. A room smaller than the picker asks for keeps that
+/// share of the smaller cell, so a square never leaves the cell it is drawn in.
 const SQUARE: f32 = 0.7;
 
 /// The arrow's tip, from the cell's centre, as a share of the arrow's extent.
@@ -69,7 +70,8 @@ pub struct ReferencePointStyle {
     dot: f32,
     /// The side of the picked point's dot.
     picked_dot: f32,
-    /// The side of one point's square: the connected-squares presentation's mark.
+    /// The side of one point's square at the picker's natural size: the connected-squares presentation's mark. A room
+    /// smaller than the picker asks for shrinks it with its cell.
     square: f32,
     /// The dots' corner radius.
     dot_radius: egui::CornerRadius,
@@ -88,9 +90,12 @@ pub struct ReferencePointStyle {
 /// the pointer takes the hover fill; a mixed value picks no point. The
 /// [`presentation`](ReferencePoint::presentation) picks that mark instead: the square of
 /// [`PointPresentation::ConnectedSquares`], the nine joined into the box's grid, with the pick's square filled and the
-/// others outlined. With [`growth`](ReferencePoint::growth) the cells next to the pick show arrows toward where the
-/// box grows, over whatever the presentation marks them with. The [`compact`](ReferencePoint::compact) picker is the
-/// size of an options bar's icon, its pick's dot as wide as the others, with no arrows.
+/// others outlined; the squares take their share of the cell they are drawn in, so a picker in a room smaller than it
+/// asks for still shows nine squares with the lines between them. With [`growth`](ReferencePoint::growth) the cells
+/// next to the pick show arrows toward where the box grows, over whatever the presentation marks them with. The
+/// [`compact`](ReferencePoint::compact) picker is the size of an options bar's icon and shows no arrows: every dot is
+/// the one width, the pick's in the accent colour, and every square the one side, the pick's filled where the others
+/// are outlined.
 #[derive(crate::contract::Component, crate::contract::Props)]
 #[component(exempt(case = "rtl", reason = "The nine points are positions in a box, not reading order: the left point stays on the left."))]
 pub struct ReferencePoint<'a> {
@@ -101,7 +106,8 @@ pub struct ReferencePoint<'a> {
     /// it where the box shrinks. Without it the cells show no arrows.
     #[prop]
     growth: Option<(f64, f64)>,
-    /// The options-bar size: the whole grid is `size.icon.md` square. It shows no growth arrows.
+    /// The options-bar size: the whole grid is `size.icon.md` square, and the pick keeps the dots' one width rather
+    /// than the wider dot of the full size. It shows no growth arrows.
     #[style_key]
     #[prop(flag)]
     compact: bool,
@@ -161,10 +167,17 @@ impl<'a> ReferencePoint<'a> {
         ((end - start).dot(along) > 0.0).then_some((start, end))
     }
 
+    /// The side of a point's square in the room this picker is given: [`SQUARE`] of the smallest cell of `cx.rect`,
+    /// and never more than the style gives it for the picker's natural size. The marks and the joins read it, so they
+    /// agree wherever the picker is shown, however small the room.
+    fn square_side(cx: &Cx<'_, Self>) -> f32 {
+        cx.style.square.min((cx.rect.size() / GRID as f32).min_elem() * SQUARE)
+    }
+
     /// The box's grid, under the marks: every square joined to the squares beside it, from the one's edge to the
-    /// other's.
-    fn paint_links(draw: &Draw<'_>, cx: &Cx<'_, Self>) {
-        let half = cx.style.square / 2.0;
+    /// other's, in squares of side `side`.
+    fn paint_links(draw: &Draw<'_>, cx: &Cx<'_, Self>, side: f32) {
+        let half = side / 2.0;
         let line = cx.resolve(&cx.style.arrow_ink);
         for at in 0..Anchor9::ALL.len() {
             for step in [(1, 0), (0, 1)] {
@@ -175,17 +188,18 @@ impl<'a> ReferencePoint<'a> {
         }
     }
 
-    /// The mark of the point at `cell`: a dot, or the square the presentation gives it, the pick's filled.
-    fn paint_mark(draw: &Draw<'_>, cx: &Cx<'_, Self>, cell: Rect, presentation: PointPresentation, picked: bool) {
+    /// The mark of the point at `cell`: a dot, or the square of side `side` the presentation gives it, the pick's
+    /// filled.
+    fn paint_mark(draw: &Draw<'_>, cx: &Cx<'_, Self>, cell: Rect, presentation: PointPresentation, side: f32, picked: bool) {
         match presentation {
             PointPresentation::Dots => {
-                let (side, ink) = if picked { (cx.style.picked_dot, &cx.style.ink) } else { (cx.style.dot, &cx.style.arrow_ink) };
-                let dot = Rect::from_center_size(cell.center(), Vec2::splat(side));
+                let (extent, ink) = if picked { (cx.style.picked_dot, &cx.style.ink) } else { (cx.style.dot, &cx.style.arrow_ink) };
+                let dot = Rect::from_center_size(cell.center(), Vec2::splat(extent));
                 draw.fill(&PaintShape::Rect(dot, cx.style.dot_radius), cx.resolve(ink));
             }
             PointPresentation::ConnectedSquares => {
                 // The pick is the filled square; the others are outlines, as the observed proxy draws them.
-                let square = Rect::from_center_size(cell.center(), Vec2::splat(cx.style.square));
+                let square = Rect::from_center_size(cell.center(), Vec2::splat(side));
                 let ink = if picked { &cx.style.ink } else { &cx.style.arrow_ink };
                 if picked {
                     draw.fill(&PaintShape::Rect(square, egui::CornerRadius::ZERO), cx.resolve(ink));
@@ -291,12 +305,13 @@ impl Component for ReferencePoint<'_> {
         let current = Self::position_of(cx.value());
         debug_assert!(!(self.compact && self.growth.is_some()), "the compact picker shows no growth arrows");
         let draw = ui.draw();
+        let side = Self::square_side(cx);
         if self.presentation == PointPresentation::ConnectedSquares {
-            Self::paint_links(&draw, cx);
+            Self::paint_links(&draw, cx, side);
         }
         for (at, point) in Anchor9::ALL.iter().enumerate() {
             let cell = Self::cell_rect(cx.rect, at);
-            Self::paint_mark(&draw, cx, cell, self.presentation, current == Some(at));
+            Self::paint_mark(&draw, cx, cell, self.presentation, side, current == Some(at));
             if let Some(growth) = self.growth
                 && let Some(anchor) = current.map(|pick| Anchor9::ALL[pick])
                 && let Some((dx, dy)) = Self::arrow(anchor, *point, growth)
