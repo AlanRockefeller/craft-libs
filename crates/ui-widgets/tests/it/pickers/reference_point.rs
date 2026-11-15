@@ -153,17 +153,27 @@ fn lines(shapes: &[Shape]) -> Vec<[Pos2; 2]> {
         .collect()
 }
 
-/// Whether `shapes` holds an arrowhead in `cell`. At this pin `Draw::fill` of a `PaintShape::Polygon` adds the filled
-/// polygon as a mesh and no stroked loop (a polygon with only a fill returns before its closed path), so a head is the
-/// mesh whose bounds lie in the cell and are smaller than it.
-fn head_in(shapes: &[Shape], cell: Rect) -> bool {
-    shapes.iter().any(|shape| match shape {
-        Shape::Mesh(mesh) => {
-            let bounds = mesh.calc_bounds();
-            cell.contains_rect(bounds) && bounds.width() < cell.width()
-        }
-        _ => false,
-    })
+/// The middle of the vertices of a filled polygon's mesh: where the shape it fills sits.
+fn middle_of(mesh: &egui::epaint::Mesh) -> Pos2 {
+    let count = mesh.vertices.len().max(1) as f32;
+    let sum = mesh.vertices.iter().fold(Vec2::ZERO, |sum, vertex| sum + vertex.pos.to_vec2());
+    (sum / count).to_pos2()
+}
+
+/// The middles of the meshes a frame painted. At this pin the only mesh a picker's frame holds is an arrow's head:
+/// `Draw::fill` of a `PaintShape::Polygon` adds `fill_polygon`'s mesh and returns before its closed path
+/// (`ui-contract/src/primitives/draw.rs`), while the marks and the joins are rects and two-point paths, and the sunken
+/// surface is a fill with a border stroke rather than a bevel (the suite's default theme, `craft.artcraft`, sets no
+/// `shape.edge`, so the edge is flat). Nothing here filters on size, so an oversized mark cannot hide from the
+/// containment assertions the trials make.
+fn head_middles(shapes: &[Shape]) -> Vec<Pos2> {
+    shapes
+        .iter()
+        .filter_map(|shape| match shape {
+            Shape::Mesh(mesh) => Some(middle_of(mesh)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The lines the squares presentation draws: the point of each cell joined to the point on its right and to the one
@@ -247,7 +257,6 @@ fn the_squares_presentation_outlines_the_points_and_joins_them_into_the_boxs_gri
         assert_eq!(mark.fill.a() > 0, picked, "the pick's square is filled and the rest are not, at {at}");
         assert_eq!(!mark.stroke.is_empty(), !picked, "the rest are outlined and the pick is not, at {at}");
     }
-    assert!((0..GRID * GRID).all(|at| !head_in(&shapes, cells[at])), "no point shows an arrowhead without growth");
     let painted = lines(&shapes);
     let wanted = links(&marks);
     assert_eq!(painted.len(), GRID_LINES, "the squares are joined to the neighbours they have: {painted:?}");
@@ -257,8 +266,12 @@ fn the_squares_presentation_outlines_the_points_and_joins_them_into_the_boxs_gri
     }
 }
 
+/// The look's proportion where the style's side and the drawn cell are the same: a square takes [`SQUARE_OF_CELL`] of
+/// its cell at the picker's natural allocation and at the compact one. A room larger than the picker asks for caps the
+/// square at the style's side for the natural size, so the share there is smaller than this: the cap is what keeps the
+/// look at its design size, and the forced-room trial covers the other side.
 #[trial]
-fn a_square_takes_the_documented_share_of_its_cell() {
+fn the_square_takes_the_looks_share_of_its_cell_at_the_natural_size_and_when_compact() {
     for (name, picker) in [("full", Picker::squares()), ("compact", Picker::squares().compact())] {
         let picker = Rc::new(picker);
         let mut fixture = settled(&picker);
@@ -305,25 +318,50 @@ fn the_growth_arrows_keep_their_shafts_beside_the_pick_in_either_presentation() 
 }
 
 #[trial]
-fn every_growth_arrow_has_a_head_of_its_own_in_either_presentation() {
+fn the_only_meshes_a_picker_paints_are_the_heads_of_its_growth_arrows() {
     let neighbours = GRID * GRID - 1;
-    for (name, picker) in [("dots", Picker::dots()), ("squares", Picker::squares())] {
-        let picker = Rc::new(picker.grown());
-        let mut fixture = settled(&picker);
-        let cells = cells(&fixture);
-        let shapes = fixture.frame_shapes();
-        let headed: Vec<usize> = (0..GRID * GRID).filter(|at| head_in(&shapes, cells[*at])).collect();
-        assert_eq!(headed.len(), neighbours, "the {name} presentation draws a head in each of the eight cells beside the pick: {headed:?}");
-        assert!(!headed.contains(&CENTRE), "and none in the pick's own cell, {name}");
+    for (name, squares) in [("dots", false), ("squares", true)] {
+        for grown in [false, true] {
+            let mut picker = Picker::dots();
+            if squares {
+                picker = Picker::squares();
+            }
+            if grown {
+                picker = picker.grown();
+            }
+            let picker = Rc::new(picker);
+            let mut fixture = settled(&picker);
+            let cells = cells(&fixture);
+            let middles = head_middles(&fixture.frame_shapes());
+            let wanted = if grown { neighbours } else { 0 };
+            assert_eq!(middles.len(), wanted, "the {name} presentation paints {wanted} meshes with growth: {middles:?}");
+            for at in (0..GRID * GRID).filter(|at| *at != CENTRE) {
+                assert_eq!(
+                    middles.iter().filter(|middle| cells[at].contains(**middle)).count(),
+                    if grown { 1 } else { 0 },
+                    "the cell at {at} holds the middle of the head beside the pick, {name}"
+                );
+            }
+            if grown {
+                assert!(middles.iter().all(|middle| !cells[CENTRE].contains(*middle)), "and no head's middle sits in the pick's own cell, {name}");
+            }
+        }
     }
 }
 
+/// The squares read in the dots' inks. The two states say different things: enabled, the pick's ink is the one the
+/// pick's dot reads in and the eight others read in theirs, which are two different inks, so the comparison tells a
+/// pick's ink from a point's; disabled, the tokens give the pick and the points one colour, so that pass shows the two
+/// presentations agree on the state rather than that they tell the inks apart.
 #[trial]
 fn the_squares_take_the_inks_of_the_dots_they_stand_in_for() {
-    let states = [("enabled", Picker::dots(), Picker::squares()), ("disabled", Picker::dots().disabled(), Picker::squares().disabled())];
-    for (state, dots, squares) in states {
+    let states = [("enabled", true, Picker::dots(), Picker::squares()), ("disabled", false, Picker::dots().disabled(), Picker::squares().disabled())];
+    for (state, apart, dots, squares) in states {
         let (dot_pick, dot_beside) = painted_inks(dots);
         let (square_pick, square_beside) = painted_inks(squares);
+        if apart {
+            assert_ne!(dot_pick, dot_beside, "in the enabled state the pick reads in an ink of its own, so this comparison tells the two apart");
+        }
         assert_eq!(square_pick, dot_pick, "in the {state} state the pick's square is filled with the ink of the pick's dot");
         assert_eq!(square_beside, dot_beside, "and the other squares are outlined in the inks of the other dots, in the {state} state");
     }
