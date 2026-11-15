@@ -130,10 +130,15 @@ fn mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
 
 /// The mark of the point in `cell`, whatever its size: the shape as tall as it is wide centred on the cell.
 fn centred_mark<'a>(shapes: &'a [Shape], cell: Rect) -> Option<&'a RectShape> {
-    shapes.iter().find_map(|shape| match shape {
-        Shape::Rect(rect) if same(rect.rect.center(), cell.center()) && (rect.rect.width() - rect.rect.height()).abs() <= ROUNDING => Some(rect),
-        _ => None,
-    })
+    // The centre cell shares its centre with the picker's background. Choose the smallest centred square, not the
+    // first painted one, without requiring containment: an oversized mark must still reach the containment assertion.
+    shapes
+        .iter()
+        .filter_map(|shape| match shape {
+            Shape::Rect(rect) if same(rect.rect.center(), cell.center()) && (rect.rect.width() - rect.rect.height()).abs() <= ROUNDING => Some(rect),
+            _ => None,
+        })
+        .min_by(|a, b| a.rect.width().total_cmp(&b.rect.width()))
 }
 
 /// The mark of each of the nine points, in the order of [`NAMES`].
