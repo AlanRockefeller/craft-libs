@@ -9,7 +9,7 @@ pub use label::{Label, Message, Word};
 #[doc(hidden)]
 pub use shell::ShellEntry;
 pub use shell::{BodyMode, RevealEdge, ShellCx, ShellRegions, SlotKey, WindowKey};
-pub use units::{LengthUnits, PointSize, UnitKind, UnitWords, Units};
+pub use units::{ColumnSize, LengthUnits, PointSize, UnitKind, UnitWords, Units};
 
 use crate::runtime::commands::CommandChain;
 use crate::runtime::egui::memory::FastMap;
@@ -137,6 +137,10 @@ pub struct Scoped {
     /// The shrink step of the unwrapped `Row` or `Stack` body that encloses the scope, as its direct children in flow
     /// take part in it.
     pub(crate) shrink: Option<Shrink>,
+    /// The sweep of the content-sized `Stack` column that encloses the scope, as its direct children in flow see it:
+    /// a held fill-width child reports the width it measured at, and after the column's second sweep measures and
+    /// shows at the width the column settled on (`ColumnSweep`).
+    pub(crate) column: Option<ColumnSweep>,
     /// The scope runs in the least measure of a body (`Shrink::Least`): every leaf in flow takes its least width. It
     /// holds through the bodies nested inside.
     pub(crate) least: bool,
@@ -205,6 +209,9 @@ pub struct Inherited {
     pub(crate) today: Option<CalendarDate>,
     /// `RootEnv::tab_toggles_chrome`.
     pub(crate) tab_toggles_chrome: bool,
+    /// `RootEnv::canvas_pattern`: the canvas surround shows the theme's pattern.
+    #[doc(hidden)]
+    pub canvas_pattern: bool,
     /// The line height per point of text of the leading face of the interface stack, as the frame began: control
     /// heights depend on it, so the key covers it.
     #[doc(hidden)]
@@ -241,6 +248,17 @@ pub(crate) enum Shrink {
     Apply(Id),
     /// A `Stack` body: each leaf shows at most the stack's room, never below its least.
     Fit,
+}
+
+/// The sweep of a content-sized `Stack` column, as its direct children shown in flow see it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ColumnSweep {
+    /// The first sweep of the measuring run of the column `Id`: each held fill-width child reports the width it
+    /// measured at (`layout::report_held`).
+    Count(Id),
+    /// The width the column settled on, in its second sweep and in the real run after one: a held fill-width child
+    /// measures and shows across it.
+    Column(f32),
 }
 
 /// The line of an unwrapped `Row` body, as its direct children placed in flow see it: a child of one line sits with
@@ -296,6 +314,11 @@ pub(crate) struct ScrollOwner {
 }
 
 impl Scoped {
+    /// How far from a handle, point or edge a press still takes it, in screen points: the theme's `size.hit.target`.
+    pub fn hit_reach(&self) -> f32 {
+        self.tokens.size.hit.target
+    }
+
     /// Whether the scope is the body of a container with a view of its own, as the innermost scroll owner: its stops
     /// take the document key role (`KeyRole::document`).
     pub(crate) fn in_view_body(&self) -> bool {
@@ -348,6 +371,7 @@ impl Scoped {
         self.fill_body = None;
         self.fill_share = None;
         self.shrink = None;
+        self.column = None;
         self.offered = None;
     }
 
@@ -442,6 +466,7 @@ impl Env {
                     dates: host_dates(ctx, host.as_ref()),
                     today: root.today,
                     tab_toggles_chrome: root.tab_toggles_chrome,
+                    canvas_pattern: root.canvas_pattern,
                     host,
                     values: root.values.clone(),
                 }),
@@ -469,6 +494,7 @@ impl Env {
                 fill_body: None,
                 fill_share: None,
                 shrink: None,
+                column: None,
                 least: false,
                 offered: None,
                 measure: None,
@@ -505,6 +531,13 @@ impl Env {
         let viewport = pass::current_viewport(ctx);
         let found = PerViewport::<ViewportEnvs>::with(ctx, viewport, |envs| envs.root.clone());
         found.unwrap_or_else(|| Env::from_root(ctx, &RootEnv::fallback(ctx), None, scale::pixels_per_point(ctx)))
+    }
+
+    /// How far from a handle, point or edge a press still takes it, in screen points: the theme's `size.hit.target` as
+    /// the running viewport's root env has it. `ToolContext::reach` reads the same
+    /// value; code with no tool context (a menu capture hit-testing a canvas point) reads it here.
+    pub fn root_hit_reach(ctx: &Context) -> f32 {
+        Self::of_root(ctx).hit_reach()
     }
 
     /// The `Host` of the running viewport's root env.

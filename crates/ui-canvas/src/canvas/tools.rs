@@ -11,6 +11,7 @@ use super::rotate::ViewTurn;
 use super::zoom_motion::{HoldZoom, ZoomDrag};
 use super::{CanvasTool, ToolAction, ToolContext, ToolKey, ToolPath, ToolPointer};
 use crate::primitives::Draw;
+use craft_behavior::PointerButton;
 use craft_behavior::canvas::zoom;
 use craft_behavior::geometry::crop::normalized_angle;
 use craft_behavior::kurbo::{Rect, Size, Vec2};
@@ -239,12 +240,23 @@ pub struct HandTool {
     /// The pointer at the previous drag pass: a drag step is the flick's input.
     last: Pos2,
     flick: FlickPan,
+    /// Lent by the momentary set: a secondary press pans too.
+    lent: bool,
+    /// The press's scroll-all-windows choice, reported with every pan of the gesture and of its glide.
+    scroll_all: bool,
 }
 
 impl HandTool {
     /// A Hand tool under `options`.
     pub fn new(options: NavigationOptions) -> Self {
-        Self { options, start: None, last: Pos2::ZERO, flick: FlickPan::default() }
+        Self { options, start: None, last: Pos2::ZERO, flick: FlickPan::default(), lent: false, scroll_all: false }
+    }
+
+    /// This tool as the momentary set lends it: a secondary press pans as well.
+    #[must_use]
+    pub(super) fn lent(mut self) -> Self {
+        self.lent = true;
+        self
     }
 
     /// Ends a glide: the app's clamp of the view the tool set (Overscroll off) moved it, so the view hit a scroll
@@ -268,6 +280,14 @@ impl HandTool {
 }
 
 impl CanvasTool for HandTool {
+    fn view_only(&self) -> bool {
+        true
+    }
+
+    fn takes(&self, button: PointerButton, _mods: Mods) -> bool {
+        button == PointerButton::Primary || (self.lent && button == PointerButton::Secondary)
+    }
+
     fn each_pass(&mut self, cx: &mut ToolContext<'_>) {
         if self.start.is_some() || !self.flick.gliding() {
             return;
@@ -275,7 +295,7 @@ impl CanvasTool for HandTool {
         let Some(space) = cx.space() else { return };
         // The glide steps from the view it set, not the shown one, so steps under half a device pixel add up.
         if let Some(view) = self.glide(&space.target(), cx.time) {
-            cx.set_view(view);
+            cx.pan_view(view, self.scroll_all);
         }
         if self.flick.gliding() {
             cx.request_repaint();
@@ -286,6 +306,8 @@ impl CanvasTool for HandTool {
         self.flick.stop();
         self.start = cx.space().map(|space| (space.view, pointer.pos));
         self.last = pointer.pos;
+        // Chosen here so a Shift released during the drag or the glide does not change where the pan goes.
+        self.scroll_all = self.options.scroll_all_windows || pointer.mods.shift;
         ToolAction::Claimed
     }
 
@@ -295,7 +317,7 @@ impl CanvasTool for HandTool {
         self.last = pointer.pos;
         let mut next = view;
         pan(&mut next, pointer.pos - from);
-        cx.set_view(next);
+        cx.pan_view(next, self.scroll_all);
         self.flick.drag(pointer.time, delta);
         if delta != egui::Vec2::ZERO {
             cx.request_repaint();
@@ -314,7 +336,7 @@ impl CanvasTool for HandTool {
         if self.flick.gliding() {
             cx.request_repaint();
         }
-        cx.set_view(next);
+        cx.pan_view(next, self.scroll_all);
     }
 
     fn cancel(&mut self, _reason: CancelReason, cx: &mut ToolContext<'_>) {
@@ -418,6 +440,10 @@ fn click_step(view: &CanvasView, screen: Pos2, out: bool, size: Size, options: &
 }
 
 impl CanvasTool for ZoomTool {
+    fn view_only(&self) -> bool {
+        true
+    }
+
     fn each_pass(&mut self, cx: &mut ToolContext<'_>) {
         // The hold advances without pointer movement, so a press held perfectly still keeps zooming.
         if self.press.is_some() {
@@ -517,6 +543,10 @@ pub struct RotateViewTool {
 }
 
 impl CanvasTool for RotateViewTool {
+    fn view_only(&self) -> bool {
+        true
+    }
+
     fn press(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) -> ToolAction {
         self.drag = cx.space().map(|space| (ViewTurn::begin(&space.view, pointer.pos), space.view));
         ToolAction::Claimed

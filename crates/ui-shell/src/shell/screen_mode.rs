@@ -10,8 +10,9 @@ use egui::Context;
 use std::sync::Arc;
 
 /// The three screen modes. The shell keeps the current one in its `screen_mode` binding and maps it to the body mode,
-/// the document tabs and the scroll bars.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// the document tabs and the scroll bars. Saved as `"standard"`, `"fullScreenWithMenuBar"` and `"fullScreen"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ScreenMode {
     /// Everything shows.
@@ -74,7 +75,7 @@ pub enum ScreenModeCommands {
     #[command(label = "Full Screen Mode", kind = "radio", group = "screen_mode", alias = "screenMode.fullScreen")]
     FullScreen,
     /// The next mode.
-    #[command(label = "Cycle Screen Mode", default = "F")]
+    #[command(label = "Cycle Screen Mode", default = "F", icon = "app_window")]
     Cycle,
     /// The previous mode.
     #[command(label = "Cycle Screen Mode Backwards", default = "Shift+F")]
@@ -122,7 +123,8 @@ pub(super) struct ScreenModeFollow {
 impl ScreenModeFollow {
     /// Reads the mode from `bind` and applies this pass's screen-mode commands. With `os`, follows the OS window and
     /// brings it to the mode; an embedded shell passes false and its mode only changes what its own region shows.
-    /// Writes the mode back under `name` when it changed. Returns the mode and whether it changed.
+    /// Writes the mode back under `name` when this pass changed it. Returns the mode and whether it differs from the mode
+    /// the last pass applied, whoever wrote it.
     pub(super) fn follow(
         &mut self,
         ctx: &Context,
@@ -135,6 +137,7 @@ impl ScreenModeFollow {
             Some(Mixed::Same(held)) => held,
             _ => ScreenMode::default(),
         };
+        let last = self.applied;
         let mut mode = before;
         while let Some((command, _)) = cx.take_command::<ScreenModeCommands>() {
             mode = command.apply(mode);
@@ -147,7 +150,7 @@ impl ScreenModeFollow {
             let event = EditEvent::set(Mixed::Same(before), mode, name, None);
             let _ = bind.write(cx, &event);
         }
-        (mode, mode != before)
+        (mode, mode != last)
     }
 
     /// Follows the OS window out of full screen and sends the actions that bring it to `mode`. Returns the mode the

@@ -11,7 +11,7 @@ use craft_theme::variant::Tone;
 use craft_ui::bars::{Bar, BarKind, StatusMessage, StatusReadout, StatusValues};
 use craft_ui::buttons::{IconButton, Link};
 use craft_ui::canvas::{PickStep, ViewCommands};
-use craft_ui::contract::{Bind, BodyCx, Props as _, Remember as _, SaveKey, Show as _, ShowContainer as _};
+use craft_ui::contract::{Bind, BodyCx, PaneEdge, Props as _, Remember as _, SaveKey, Show as _, ShowContainer as _};
 use craft_ui::dialog::{DialogResult, PromptChoice, StandardPrompt};
 use craft_ui::display::{Divider, Text};
 use craft_ui::docking::{DockConfig, DockEvent, DockPanels as _};
@@ -82,7 +82,7 @@ impl<'a> EditorMock<'a> {
             .screen_mode(screen_mode)
             .title_bar_if(true, |ui, _, state: &mut MockState| title_bar(ui, state))
             .options_bar(true, |ui, _, state: &mut MockState| options_bar(ui, state))
-            .tools(true, |ui, _, state: &mut MockState| tool_rail(ui, state))
+            .tools(PaneEdge::Start, true, |ui, _, state: &mut MockState| tool_rail(ui, state))
             .status(true, |ui, _, state: &mut MockState| status_bar(ui, state))
             .body_label(label)
             .body(|ui, cx, state: &mut MockState| body(ui, cx, state));
@@ -111,8 +111,11 @@ fn body(ui: &mut Ui, cx: &mut BodyCx<'_>, state: &mut MockState) {
         }
     }
 
-    while let Some((command, _)) = cx.take_command::<Tool>() {
-        select(ui, state, command);
+    while let Some((command, fired)) = cx.take_command::<Tool>() {
+        // A tool key's release picks nothing.
+        if fired.phase != commands::FirePhase::Release {
+            select(ui, state, command);
+        }
     }
     while let Some((key, _)) = cx.take_command::<ToolKey>() {
         match key {
@@ -148,7 +151,7 @@ fn body(ui: &mut Ui, cx: &mut BodyCx<'_>, state: &mut MockState) {
             for command in dialogs {
                 match command {
                     AppCommand::GaussianBlur => {
-                        host.open(HostedParamDialog::new(BLUR_KEY, DialogFields::new(), |fields| {
+                        host.open(HostedParamDialog::new(ui.ctx(), BLUR_KEY, DialogFields::new(), |fields| {
                             ParamDialog::new(BLUR_KEY, "Gaussian Blur", Param::parse_list(BLUR)).values(Bind::bound(fields)).remember(BLUR_MEMORY)
                         }));
                     }
@@ -163,7 +166,7 @@ fn body(ui: &mut Ui, cx: &mut BodyCx<'_>, state: &mut MockState) {
                     _ => {}
                 }
             }
-            if let Some(result) = host.take::<HostedParamDialog>().and_then(DialogResult::<ParamResult>::ok) {
+            if let Some(result) = host.take_keyed::<HostedParamDialog>().map(|(result, _)| result).and_then(DialogResult::<ParamResult>::ok) {
                 result.remember(ui);
                 state.document.dirty = true;
             }

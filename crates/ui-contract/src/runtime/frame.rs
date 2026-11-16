@@ -10,6 +10,7 @@ use crate::runtime::{access, cursor, drag, focus, ime, keys, layout_memory, meas
 use craft_behavior::{DocKey, GestureId};
 use craft_host::Host;
 use craft_host::target::Os;
+use craft_keymap::Mods;
 use craft_theme::{AppSizes, Appearance, Contrast, HitSizes, Mode, SUITE_DEFAULT, Size, TextSize, ThemeDef, builtins, resolve_sized};
 use egui::{Context, Id, Ui, ViewportId};
 use std::any::TypeId;
@@ -27,17 +28,25 @@ pub struct FrameInput {
     pub commands: CommandInput,
     /// The app's `Host`, read through `EnvView::host`.
     pub host: Option<Arc<Host>>,
+    /// The modifiers the app's own tablet or latched-key reader holds down beyond the window's input.
+    pub latched: Mods,
 }
 
 impl FrameInput {
     /// A frame with `root` and no host.
     pub fn new(root: RootEnv) -> Self {
-        FrameInput { root, commands: CommandInput::new(), host: None }
+        FrameInput { root, commands: CommandInput::new(), host: None, latched: Mods::NONE }
     }
 
     /// Sets the command input.
     pub fn commands(mut self, commands: CommandInput) -> Self {
         self.commands = commands;
+        self
+    }
+
+    /// Sets the modifiers latched beyond the window's input.
+    pub fn latched(mut self, mods: Mods) -> Self {
+        self.latched = mods;
         self
     }
 
@@ -107,6 +116,8 @@ pub struct FrameOutput {
     /// The steps of outer gestures since the last call, in order. Every `GestureHost` reads them with `handle_output`,
     /// before `removed_gestures`.
     pub outer_edits: Vec<OuterEdit>,
+    /// Whether a component refused this pass's input since the last call (`frame::refuse`): the app plays its alert.
+    pub refused: bool,
 }
 
 /// The per-frame and per-context state of the frame loop.
@@ -334,6 +345,12 @@ pub(crate) fn in_pass(ctx: &Context) -> bool {
     pass_state::with::<FrameState, _>(ctx, |state| state.passes_open > 0)
 }
 
+/// Records that the running pass refused its input (the text part refusing a Tab); the next `take_output` reports it
+/// in `FrameOutput::refused`. Public so an app's own widget refuses through the same channel.
+pub fn refuse(ctx: &Context) {
+    pass_state::with::<FrameState, _>(ctx, |state| state.output.refused = true);
+}
+
 /// Everything accumulated since the last call, across passes and discarded passes.
 pub fn take_output(ctx: &Context) -> FrameOutput {
     let mut output = pass_state::with::<FrameState, _>(ctx, |state| std::mem::take(&mut state.output));
@@ -398,7 +415,8 @@ pub fn discardable(ctx: &Context) -> bool {
 }
 
 /// Discards the running pass, so nothing of it paints, and runs it again, when [`discardable`]: for a host that learns
-/// only after a part ran that the part showed what it must not.
+/// only after a part ran that the part showed what it must not. A pass after a discard carries no input (events,
+/// injected steps and press edges enter a frame's first pass only); held state persists.
 pub fn discard_pass(ctx: &Context, reason: &'static str) {
     crate::runtime::egui::sizing::request_discard(ctx, crate::runtime::egui::sizing::Rerun::App(reason));
 }
@@ -448,7 +466,8 @@ pub fn take_chrome_toggles(ctx: &Context, viewport: ViewportId, window: &WindowK
 struct ViewportRecord {
     held: HeldInput,
     press_cancelled: bool,
-    now: f64,
+    /// `None` until the viewport's first pass begins.
+    now: Option<f64>,
 }
 
 impl Stored for ViewportRecord {}
@@ -470,6 +489,9 @@ pub struct PassFacts {
     pub frame_nr: u64,
     /// The pass's time in seconds.
     pub now: f64,
+    /// Seconds since this viewport's previous pass. A frame's later passes share its pass clock, so they read 0; a
+    /// viewport's first pass reads 0.
+    pub elapsed: f64,
 }
 
 thread_local! {
@@ -488,7 +510,7 @@ pub fn running(ctx: &Context) -> Option<PassFacts> {
 pub(crate) fn facts(ctx: &Context) -> PassFacts {
     running(ctx).unwrap_or_else(|| {
         let viewport = ctx.viewport_id();
-        PassFacts { viewport, pass_nr: pass::pass_nr(ctx, viewport), frame_nr: pass::frame_nr(ctx, viewport), now: clock(ctx) }
+        PassFacts { viewport, pass_nr: pass::pass_nr(ctx, viewport), frame_nr: pass::frame_nr(ctx, viewport), now: clock(ctx), elapsed: 0.0 }
     })
 }
 
@@ -497,7 +519,7 @@ pub(crate) fn facts(ctx: &Context) -> PassFacts {
 pub fn clock(ctx: &Context) -> f64 {
     match running(ctx) {
         Some(facts) => facts.now,
-        None => PerViewport::<ViewportRecord>::with(ctx, pass::current_viewport(ctx), |record| record.now),
+        None => PerViewport::<ViewportRecord>::with(ctx, pass::current_viewport(ctx), |record| record.now.unwrap_or(0.0)),
     }
 }
 
@@ -521,6 +543,9 @@ pub(crate) fn input_hook(ctx: &Context, input: &mut RawInput) {
     let viewport = input.viewport_id;
     // H0a: the next injected step joins the input and passes the stages below like real input.
     let injected = crate::runtime::egui::injected::input_hook(ctx, input);
+    // H0c: the legacy pinch fold, the text cap and the Control-click mapping, on injected and real input alike, before
+    // the one-press rule sees a mapped press and before the IME and key stages read the text.
+    raw_input::prepare(ctx, input);
     // H0b: the OS colour scheme egui's integration reports reaches the system reader.
     crate::runtime::env::system::input_hook(ctx, &input.events);
     // H0: one press per pass.
@@ -554,17 +579,17 @@ pub(crate) fn begin_pass(ui: &mut Ui) {
     // H5: read the clock once; the runtime cancelled a captured press since this viewport's last pass.
     let now = pass::now(&ctx);
     let (pass_nr, frame_nr) = (pass::pass_nr(&ctx, viewport), ctx.cumulative_frame_nr_for(viewport));
+    let (elapsed, cancelled) = PerViewport::<ViewportRecord>::with(&ctx, viewport, |record| {
+        let elapsed = record.now.replace(now).map_or(0.0, |previous| (now - previous).max(0.0));
+        (elapsed, std::mem::take(&mut record.press_cancelled))
+    });
     RUNNING.with(|running| {
         let mut running = running.borrow_mut();
         // A pass of this viewport that never ended (a panic unwound through it) is not still running.
         running.retain(|pass| !(pass.ctx == ctx && pass.facts.viewport == viewport));
-        running.push(RunningPass { ctx: ctx.clone(), facts: PassFacts { viewport, pass_nr, frame_nr, now } });
+        running.push(RunningPass { ctx: ctx.clone(), facts: PassFacts { viewport, pass_nr, frame_nr, now, elapsed } });
     });
     pass_state::hold(&ctx);
-    let cancelled = PerViewport::<ViewportRecord>::with(&ctx, viewport, |record| {
-        record.now = now;
-        std::mem::take(&mut record.press_cancelled)
-    });
     if cancelled {
         raw_input::stop_dragging(&ctx);
     }
@@ -572,7 +597,7 @@ pub(crate) fn begin_pass(ui: &mut Ui) {
     windows::begin(&ctx);
     // H5: the pointer snapshot, before any component runs.
     let input = frame_input.unwrap_or_else(|| FrameInput::new(RootEnv::fallback(&ctx)));
-    pointer::begin(&ctx, frame_hit(&ctx));
+    pointer::begin(&ctx, frame_hit(&ctx), input.latched);
     drag::begin(&ctx);
     // H5: install the root `Env` and the theme styles' direction from `FrameInput.root`.
     let env = Env::from_root(&ctx, &input.root, input.host, scale::pixels_per_point(&ctx));
@@ -580,7 +605,7 @@ pub(crate) fn begin_pass(ui: &mut Ui) {
     Env::set_root(&ctx, viewport, env.clone());
     drop(Env::install_for(ui, env));
     // H7: focus moves and the press classification, then the pass's intents, then the wheel split.
-    focus::begin(&ctx, input.root.tab_all_controls || windows::os_of(&ctx) != Os::Mac);
+    focus::begin(&ctx, input.root.tab_all_controls || windows::os_of(&ctx) != Os::Mac, input.root.dialog_tab);
     ime::begin(&ctx, focus::focused_rec(&ctx).filter(|rec| rec.stop.text).map(|rec| rec.stop.root));
     // Lead-1: an Escape over a captured press cancels the press and reaches no component. Any other Escape the key
     // stage took ends egui's own drag, as egui's Escape would have before any widget runs.

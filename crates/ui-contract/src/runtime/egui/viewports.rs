@@ -1,7 +1,7 @@
 //! `show_viewport_immediate`, viewport-builder conversion, viewport facts and window commands.
 
-use craft_host::target::WindowChrome;
-use egui::{Context, Pos2, Rect, Ui, Vec2, ViewportBuilder, ViewportCommand, ViewportId, ViewportInfo, WindowLevel};
+use craft_host::target::{Backend, WindowChrome};
+use egui::{Context, Pos2, Rect, Ui, UserAttentionType, Vec2, ViewportBuilder, ViewportCommand, ViewportId, ViewportInfo, WindowLevel};
 
 /// Whether the integration opens OS viewports: false where egui embeds them in the root (web, tests).
 pub(crate) fn available(ctx: &Context) -> bool {
@@ -32,6 +32,8 @@ pub(crate) struct Spec<'a> {
     pub taskbar: bool,
     /// Whether the window opens hidden; [`show`] reveals it.
     pub hidden: bool,
+    /// The app id the OS window carries (dock icon, Wayland compositor rules); empty carries none.
+    pub app_id: &'a str,
 }
 
 /// Opens (or keeps) the OS viewport `id` and runs `body` once for each pass the viewport gets in this call.
@@ -40,6 +42,9 @@ pub(crate) fn show_immediate<T>(ctx: &Context, id: ViewportId, spec: &Spec<'_>, 
         ViewportBuilder::default().with_title(spec.title).with_resizable(spec.resizable).with_taskbar(spec.taskbar).with_window_level(spec.level);
     if spec.hidden {
         builder = builder.with_visible(false);
+    }
+    if !spec.app_id.is_empty() {
+        builder = builder.with_app_id(spec.app_id);
     }
     builder = match spec.chrome {
         WindowChrome::Integrated => builder.with_decorations(false),
@@ -124,6 +129,15 @@ pub(crate) fn reported(ctx: &Context) -> Vec<(ViewportId, Facts)> {
     ctx.input(|input| input.raw.viewports.iter().map(|(id, info)| (*id, facts_of(info))).collect())
 }
 
+/// The window that has the keys: the one the running pass's input reports focused, else the root. Where it reports
+/// more than one focused, the root wins.
+pub(crate) fn key_window(ctx: &Context) -> ViewportId {
+    ctx.input(|input| {
+        input.raw.viewports.iter().filter(|(_, info)| info.focused == Some(true)).map(|(id, _)| *id).min_by_key(|id| *id != ViewportId::ROOT)
+    })
+    .unwrap_or(ViewportId::ROOT)
+}
+
 /// The window's facts in the raw input of `viewport`, for the input hook: where `ctx.input` addresses the parent.
 pub(crate) fn inner_size_in(input: &egui::RawInput, viewport: ViewportId) -> Option<Vec2> {
     input.viewports.get(&viewport).and_then(|info| info.inner_rect).map(|rect| rect.size())
@@ -137,9 +151,15 @@ pub(crate) fn command(ctx: &Context, viewport: ViewportId, command: ViewportComm
     ctx.send_viewport_cmd_to(viewport, command);
 }
 
-/// Raises `viewport` and gives it OS focus.
+/// Raises `viewport` and gives it OS focus. A minimized window ignores `Focus`, so it is restored first. A Wayland
+/// compositor lets no client focus an existing window: there the window asks for the user's attention instead.
 pub(crate) fn raise(ctx: &Context, viewport: ViewportId) {
-    command(ctx, viewport, ViewportCommand::Focus);
+    command(ctx, viewport, ViewportCommand::Minimized(false));
+    if crate::runtime::windows::shell_of(ctx, viewport).backend == Backend::Wayland {
+        command(ctx, viewport, ViewportCommand::RequestUserAttention(UserAttentionType::Informational));
+    } else {
+        command(ctx, viewport, ViewportCommand::Focus);
+    }
     ctx.request_repaint_of(viewport);
 }
 

@@ -4,7 +4,7 @@
 
 use super::{Erased, ErasedPass, Host, HostCx, LeafHooks, Measuring, ShapeHooks, ShowAt, TypeFacts, blank_core, paint_ui};
 use crate::contract::PaintUi;
-use crate::contract::cx::{CxCore, PartsCx};
+use crate::contract::cx::{CxCore, PartsCx, gesture_key};
 use crate::contract::steps::{self, MeasureIn, PartsStep, ShapeKind};
 use crate::contract::{
     Access, BodyCx, Collection, Common, Component, Container, Cx, Inner, Internal, ItemFn, Meta, OverlayUi, Resolved, Show, TipFn, Validity, ValueOf,
@@ -19,7 +19,7 @@ use crate::runtime::memory::{MemoryStage, sub};
 use crate::runtime::overlay::CloseReason;
 use crate::runtime::reads::{self, BindKey};
 use crate::style::{Flags, StateSet, StyleCx, StyleView, UiTokens};
-use craft_behavior::{EditEvent, Flow, ItemSource, KeyRole, PartRef, Proposal, Roving, Sense};
+use craft_behavior::{EditEvent, Flow, Gesture, ItemSource, KeyRole, PartRef, Proposal, Roving, Sense};
 use craft_theme::Variant;
 use egui::{Context, Id, Rect, Ui, Vec2};
 use std::collections::HashMap;
@@ -283,6 +283,7 @@ impl<'a, C: Component> ErasedPass<'a> for TypedPass<'_, 'a, C> {
             scrolls: &mut parts.scrolls,
             text: &mut parts.text,
             last_state: last,
+            gesture_running: self.cx.core.memory.recall::<Gesture<ValueOf<C>>>(gesture_key(id)).is_running(),
             measure,
             items: geometry,
         };
@@ -535,8 +536,10 @@ pub(crate) fn show_container<C: Container, R>(
     Inner { output, inner, settle }
 }
 
-/// A layer-like container that shows nothing this pass runs no pipeline: it takes its id as step 3 would, forgets
-/// its layer and returns its output's unshown form. `None` when it shows, or when its output has no unshown form.
+/// A layer-like container that shows nothing this pass runs no pipeline: it takes its id as step 3 would, without
+/// registering it, and returns its output's unshown form. Its shown life ends at once: the first pass it shows
+/// nothing forgets its layer and drops its shown and press entries, so a reopen is a first pass. `None` when it
+/// shows, or when its output has no unshown form.
 fn unshown<C: Container>(comp: &mut C, ui: &Ui) -> Option<C::Output> {
     let props = comp.props(Internal::new());
     if matches!(props.mount, crate::contract::Mount::Inline | crate::contract::Mount::Pane(_) | crate::contract::Mount::Window { .. }) {
@@ -551,9 +554,13 @@ fn unshown<C: Container>(comp: &mut C, ui: &Ui) -> Option<C::Output> {
     if !crate::contract::body::unshown(comp, ui.ctx(), id, &props, sizing) {
         return None;
     }
-    steps::id(ui, &source, !sizing, true, facts.style_key, facts.name);
+    steps::id(ui, &source, false, true, facts.style_key, facts.name);
     if !sizing {
+        steps::claim_id(ui, id, facts.name);
+    }
+    if !sizing && crate::runtime::memory::owner_pass(ui.ctx(), id).is_some() {
         crate::contract::overlay::forget_layer(ui.ctx(), id, id);
+        crate::runtime::memory::end_shown(ui.ctx(), id);
     }
     Some(output)
 }
@@ -671,7 +678,7 @@ pub(crate) fn paint_face<C: Show>(ui: &mut Ui, env: &Env, source: &super::FaceSo
             enabled: step1.enabled && source.enabled,
             size: step1.size,
             selections: &[],
-            unfaded: None,
+            fade: None,
             kids: None,
         };
         face.paint(&mut pui, &cx);
@@ -684,7 +691,18 @@ pub(crate) fn paint_face<C: Show>(ui: &mut Ui, env: &Env, source: &super::FaceSo
     // The face's own `access` adds its facts; the composite's step 16 fills the part's sub-node from the record.
     let mut access = Access::default();
     face.access(&mut access, &cx);
-    FaceRecord { part, name, flags, role: C::ROLE, numeric: access.numeric, expanded: access.expanded, enabled: step1.enabled, baseline }
+    FaceRecord {
+        part,
+        name,
+        flags,
+        role: C::ROLE,
+        numeric: access.numeric,
+        expanded: access.expanded,
+        enabled: step1.enabled,
+        baseline,
+        value: access.value,
+        color: access.color,
+    }
 }
 
 /// A member of a collection's run (`Collection::MEMBERS`) after steps 1, 2, 4 (read only) and 7: what the batch join
@@ -729,6 +747,7 @@ pub(crate) fn member_prepare<C: Show>(ui: &Ui, env: &Env, id: Id, row: Rect, hov
             scrolls: &mut parts.scrolls,
             text: &mut parts.text,
             last_state: (hovered, false),
+            gesture_running: false,
             measure: steps::measure_cx::<C>(&input, &style, &resolved, shown.as_deref()),
             items: None,
         };
@@ -813,12 +832,16 @@ pub(crate) fn member_show<C: Show>(
     cx.core.stated = true;
     cx.core.ink = steps::surface_ink(StyleView::surface(&*style), &state, env.ink);
     item.update(&mut cx);
-    let unfaded = steps::fade(ui, &mut cx.core);
+    // Paint stays inside the row grown by the type's declared outset, as a run's does; a faded member's veil fills it.
+    let outer_clip = ui.clip_rect();
+    ui.set_clip_rect(row.expand(C::paint_outset(&env.tokens)).intersect(outer_clip));
+    let fade = steps::fade(ui, env, &mut cx.core);
     steps::paint_surface(ui, env, &cx.core, &*style);
     steps::paint_part_layers(ui, env, &cx.core);
     item.paint(&mut super::paint_ui(ui, env, &cx.core, &*style), &cx);
     item.paint_over(&mut super::paint_ui(ui, env, &cx.core, &*style), &cx);
-    ui.set_opacity(unfaded);
+    steps::unfade(ui, &mut cx.core, fade);
+    ui.set_clip_rect(outer_clip);
     let mut access = Access::default();
     item.access(&mut access, &cx);
     let member_node = report_member(&cx.core, &access, node, C::ROLE);

@@ -7,7 +7,7 @@ mod registry;
 
 pub use clipboard::{ClipContent, ClipError, ClipItem, ClipboardHandle};
 pub use craft_behavior::EditCommand;
-pub use craft_keymap::{Binding, CommandDef, CommandKind, CommandRef, CommandScope, ModalRule, Platform};
+pub use craft_keymap::{Binding, CommandDef, CommandKind, CommandRef, CommandScope, ModalRule, Platform, Scope};
 pub use library::ChromeCommand;
 pub(crate) use library::WindowShortcut;
 pub use library::{EditCommands, NavCommand, WindowCommand};
@@ -19,13 +19,16 @@ pub use registry::{SetEntry, sets};
 pub use board::declare_child;
 #[doc(hidden)]
 pub use board::focus_within;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub use board::keymap_builds;
 pub(crate) use board::publish as publish_for;
 pub(crate) use board::take as take_for_instance;
-#[doc(hidden)]
-pub use board::take_around;
 pub(crate) use board::{
     begin, binds_scoped, edit_chords, end, install, note_focus, platform, register_instance, set_input, take_delivered, take_fired, window_shortcuts,
 };
+#[doc(hidden)]
+pub use board::{bound_around, take_around};
 pub(crate) use board::{fire_bound, fire_resolved, resolve_bound, resolve_scoped};
 
 use craft_behavior::CommandFlags;
@@ -33,7 +36,47 @@ use craft_behavior::edit_history::Step;
 use craft_keymap::{Chord, Overrides};
 use egui::{Context, Id, ViewportId};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Commands an app defines at run time (plug-ins, its tool list), all in the app scope ([`Scope::app`]). They join
+/// the linked command sets: their chords fire them into `FrameOutput.fired`, and surfaces resolve their label, icon,
+/// kind and chord. An id a linked set already defines stays that set's.
+#[derive(Clone)]
+pub struct AppCatalog {
+    defs: Arc<[CommandDef]>,
+    index: Arc<HashMap<String, usize>>,
+    generation: u64,
+}
+
+impl AppCatalog {
+    /// A catalog of `defs`; `generation` changes when the app's rows do. Refuses two defs with one id (`Duplicate`) and a
+    /// def in another scope (`NotApp`).
+    pub fn new(defs: Vec<CommandDef>, generation: u64) -> Result<Self, CommandDefError> {
+        let mut index = HashMap::with_capacity(defs.len());
+        for (at, def) in defs.iter().enumerate() {
+            if !def.scope.is_app() {
+                return Err(CommandDefError::NotApp { command: def.command.id.clone() });
+            }
+            registry::index_id(&mut index, &def.command.id, at)?;
+        }
+        Ok(AppCatalog { defs: defs.into(), index: Arc::new(index), generation })
+    }
+
+    /// The app's version of the catalog. The board rebuilds the keymap when it differs from the last frame's, and never
+    /// compares the definitions, so an app gives a new generation exactly when its rows change.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn defs(&self) -> &[CommandDef] {
+        &self.defs
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<&CommandDef> {
+        self.index.get(id).and_then(|&at| self.defs.get(at))
+    }
+}
 
 /// A typed set of commands, written by `#[derive(CommandSet)]`.
 pub trait CommandSet: Copy + Send + Sync + 'static {
@@ -82,6 +125,13 @@ pub struct Fired {
     pub alt_variant: bool,
 }
 
+impl Fired {
+    /// `command` fired from `source` in `phase`, for the app scope (no target), without a group cycle or the Alt variant.
+    pub fn new(command: CommandRef, source: FireSource, phase: FirePhase) -> Fired {
+        Fired { command, target: None, source, phase, cycle: false, alt_variant: false }
+    }
+}
+
 /// Where a fired command came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -107,7 +157,8 @@ pub enum FirePhase {
     Press,
     /// A repeat of a held key.
     Repeat,
-    /// The release; momentary tools act here.
+    /// The release of a momentary command's or a tool's key: a momentary command ends here, and a spring-loaded tool
+    /// gives back the previous one.
     Release,
 }
 
@@ -163,6 +214,11 @@ impl CommandState {
         self
     }
 
+    /// Whether the command can fire, as [`enabled`](Self::enabled) set it.
+    pub fn is_enabled(&self) -> bool {
+        self.flags.enabled
+    }
+
     pub(crate) fn is_marked(&self) -> bool {
         self.marked
     }
@@ -188,7 +244,7 @@ pub struct ResolvedCommand {
     pub label: Arc<str>,
     /// The icon name.
     pub icon: Option<Cow<'static, str>>,
-    /// The first single-press binding.
+    /// The chord surfaces show: the first single-press binding that runs the command ([`chord`]).
     pub chord: Option<Chord>,
     /// The state ANDed with the gate, the modal rule and the instance's liveness.
     pub enabled: bool,
@@ -228,6 +284,7 @@ pub struct CommandInput {
     pub(crate) states: Vec<(CommandRef, CommandState)>,
     pub(crate) overrides: Option<Arc<Overrides>>,
     pub(crate) gate: Option<CommandGate>,
+    pub(crate) catalog: Option<AppCatalog>,
 }
 
 impl CommandInput {
@@ -250,6 +307,13 @@ impl CommandInput {
         self
     }
 
+    /// The frame's app catalog; the keymap is rebuilt when the platform, the overrides or the catalog's generation change.
+    #[must_use]
+    pub fn catalog(mut self, catalog: AppCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
     /// The one gate over commands.
     #[must_use]
     pub fn gate(mut self, gate: CommandGate) -> Self {
@@ -261,7 +325,7 @@ impl CommandInput {
 /// The chain of container instances that receive scoped commands, innermost last. A private inherited field of
 /// the env.
 #[doc(hidden)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CommandChain(Arc<[(CommandScope, Id)]>);
 
 impl CommandChain {
@@ -377,6 +441,26 @@ pub fn fire(ctx: &Context, command: impl Into<CommandRef>, source: FireSource) -
 /// resolves disabled.
 pub fn resolve(ctx: &Context, command: impl Into<CommandRef>) -> ResolvedCommand {
     board::resolve_global(ctx, &command.into())
+}
+
+/// The keys `command` has in the runtime's keymap: its defaults under the user's overrides (`CommandInput`), on the
+/// window's platform, double presses included. Empty before the first frame.
+pub fn bindings(ctx: &Context, command: &CommandRef) -> Vec<Binding> {
+    board::bindings(ctx, command)
+}
+
+/// The chord a surface shows for `command`: its first single-press binding in the runtime's keymap that runs it
+/// where the binding applies, so a binding another command wins (a nearer scope, else catalog order) is never shown.
+/// [`ResolvedCommand::chord`] is the same. `None` before the first frame.
+pub fn chord(ctx: &Context, command: &CommandRef) -> Option<Chord> {
+    board::chord(ctx, command)
+}
+
+/// The command a key `chord` belongs to for a surface that takes it whatever has focus, such as a system menu item:
+/// the command a press runs with no panel focused, else one that binds it in a panel or context scope. `None` before
+/// the first frame.
+pub fn holder(ctx: &Context, chord: &Chord) -> Option<CommandRef> {
+    board::holder(ctx, chord)
 }
 
 /// `command` as [`resolve`] shows it, from the window under the modal layer whose body is running, as that window is

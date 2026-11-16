@@ -2,13 +2,15 @@
 
 use crate::runtime::egui::{input, plugin};
 use crate::runtime::env::{SystemReader, system};
-use crate::runtime::{commands, frame, windows};
+use crate::runtime::pen::PenSource;
+use crate::runtime::{commands, frame, pen, windows};
 use crate::style::{DuplicateStyle, StyleReplacements};
 use craft_host::target::ShellInfo;
 use craft_window::policy::Decision;
 use craft_window::restore::Store;
 use craft_window::system::WindowSystem;
 use egui::Context;
+
 use std::sync::{Arc, Mutex};
 
 /// What `install` takes.
@@ -31,6 +33,30 @@ pub struct InstallSpec {
     /// Where the root's `System` choices read the OS's appearance. `new` gives a reader with no desktop watcher,
     /// which answers only the colour scheme egui's integration reports; a host passes one it started.
     pub system: SystemReader,
+    /// The modifiers the wheel zooms and scrolls sideways with, written to egui's input options at install.
+    pub wheel: WheelModifiers,
+    /// The app id every OS window carries (dock icon, Wayland compositor rules); empty carries none.
+    pub app_id: String,
+    /// The tablet readings the pointer feed pairs with each pointer move; none reports no pen.
+    pub pen: Option<PenSource>,
+    /// Whether the stories' command sets (`#[command(story)]`) load: the gallery and the story fixtures show
+    /// stories, an app does not, so a story's keys never reach an app's keymap.
+    pub stories: bool,
+}
+
+/// The modifiers the mouse wheel zooms and scrolls sideways with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WheelModifiers {
+    /// Held with the wheel, the wheel zooms.
+    pub zoom: egui::Modifiers,
+    /// Held with the wheel, a vertical wheel scrolls sideways.
+    pub sideways: egui::Modifiers,
+}
+
+impl Default for WheelModifiers {
+    fn default() -> Self {
+        WheelModifiers { zoom: egui::Modifiers::COMMAND, sideways: egui::Modifiers::SHIFT }
+    }
 }
 
 impl InstallSpec {
@@ -44,7 +70,17 @@ impl InstallSpec {
             looks: StyleReplacements::new(),
             frame: None,
             system: SystemReader::unwatched(),
+            wheel: WheelModifiers::default(),
+            app_id: String::new(),
+            pen: None,
+            stories: false,
         }
+    }
+
+    /// Loads the stories' command sets too, for an install that shows stories.
+    pub fn stories(mut self) -> Self {
+        self.stories = true;
+        self
     }
 
     /// Sets the store viewport mounts save their window placement in.
@@ -65,9 +101,27 @@ impl InstallSpec {
         self
     }
 
+    /// Sets the modifiers the wheel zooms and scrolls sideways with.
+    pub fn wheel(mut self, modifiers: WheelModifiers) -> Self {
+        self.wheel = modifiers;
+        self
+    }
+
     /// Sets the root window's decided frame (`craft_window::policy::decide_for`).
     pub fn frame(mut self, decision: Decision) -> Self {
         self.frame = Some(decision);
+        self
+    }
+
+    /// Sets the app id every OS window carries (dock icon, Wayland compositor rules).
+    pub fn app_id(mut self, id: impl Into<String>) -> Self {
+        self.app_id = id.into();
+        self
+    }
+
+    /// Sets the tablet source the pointer feed reads.
+    pub fn pen(mut self, source: PenSource) -> Self {
+        self.pen = Some(source);
         self
     }
 
@@ -88,6 +142,8 @@ pub enum InstallError {
     DuplicateStyle(DuplicateStyle),
     /// A command set's definitions are unusable, or two commands share an id.
     Commands(commands::CommandDefError),
+    /// `install` ran inside a pass: install the runtime before the first pass.
+    DuringPass,
 }
 
 impl std::fmt::Display for InstallError {
@@ -96,24 +152,48 @@ impl std::fmt::Display for InstallError {
             InstallError::AlreadyInstalled => f.write_str("the runtime is already installed on this context"),
             InstallError::DuplicateStyle(DuplicateStyle(key)) => write!(f, "two style replacements for the style key {key}"),
             InstallError::Commands(error) => write!(f, "command registry: {error}"),
+            InstallError::DuringPass => f.write_str("install the runtime before the first pass"),
         }
     }
 }
 
 impl std::error::Error for InstallError {}
 
-/// Adds the runtime plugin to `ctx` and sets the egui options the runtime owns: interface scale is a command, and
-/// quit goes through the close guard. A second call on the same context is an error.
+/// The shell with what the running browser offers: a browser build captures a screen colour only where the browser
+/// has the EyeDropper, so `Caps::SCREEN_CAPTURE` is read here, once for every app. Native capabilities are the
+/// build's own (`Caps::native`).
+fn with_browser_caps(shell: ShellInfo) -> ShellInfo {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut shell = shell;
+        if craft_platform::screen::available() {
+            shell.caps.insert(craft_host::target::Caps::SCREEN_CAPTURE);
+        }
+        shell
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    shell
+}
+
+/// Adds the runtime plugin to `ctx` and sets the egui options the runtime owns: interface scale is a command, quit goes
+/// through the close guard, and the wheel's modifiers are the spec's. A second call on the same context is an error,
+/// checked first so an app that installs again (a language change) gets that answer; a call inside a pass is one too.
 pub fn install(ctx: &Context, spec: InstallSpec) -> Result<(), InstallError> {
     if plugin::is_registered(ctx) {
         return Err(InstallError::AlreadyInstalled);
     }
+    // The hooks of a pass that is running would see a runtime that was never there at its begin.
+    if frame::in_pass(ctx) {
+        return Err(InstallError::DuringPass);
+    }
     let looks = spec.looks.freeze().map_err(InstallError::DuplicateStyle)?;
-    commands::install(ctx).map_err(InstallError::Commands)?;
+    commands::install(ctx, spec.stories).map_err(InstallError::Commands)?;
     looks.store(ctx);
     input::clear_shortcuts(ctx);
+    input::set_wheel_modifiers(ctx, spec.wheel.zoom, spec.wheel.sideways);
     system::install(ctx, spec.system);
-    windows::install(ctx, spec.shell_info, spec.window_system, spec.placement, spec.frame);
+    pen::install(ctx, spec.pen);
+    windows::install(ctx, with_browser_caps(spec.shell_info), spec.window_system, spec.placement, spec.frame, spec.app_id);
     frame::set_frame_layers(ctx, spec.frame_layers);
     frame::seed_hooked_passes(ctx);
     plugin::register(ctx);

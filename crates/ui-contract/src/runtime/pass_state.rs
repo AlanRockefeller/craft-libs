@@ -92,6 +92,7 @@ pass_state! {
         least_reports: crate::layout::body::LeastReports,
         bar_rules: crate::contract::BarRules,
         fill_counts: crate::layout::body::FillCounts,
+        held_widths: crate::layout::body::HeldWidths,
         first_lines: crate::layout::body::FirstLines,
         row_lines: crate::layout::body::RowLines,
         cursors: crate::layout::body::Cursors,
@@ -104,6 +105,7 @@ pass_state! {
         commands: crate::runtime::commands::board::Board,
         inspect: crate::runtime::inspect::Log,
         recorder: crate::runtime::replay::Recorder,
+        pen: crate::runtime::pen::InstalledPen,
         #[cfg(feature = "testing")]
         noted: crate::runtime::egui::widgets::noted::Noted,
         #[cfg(feature = "testing")]
@@ -127,6 +129,7 @@ pass_state! {
         drop_targets: crate::runtime::drag::Targets,
         keys: crate::runtime::keys::Stage,
         window_records: crate::runtime::windows::Record,
+        raw_input: crate::runtime::egui::input::RawState,
     }
     stamped {
         reads: crate::runtime::reads::Reads,

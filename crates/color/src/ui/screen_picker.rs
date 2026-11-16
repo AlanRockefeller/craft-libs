@@ -28,7 +28,7 @@ use craft_ui::bars::StatusMessage;
 use craft_ui::contract::{Pattern, Props as _, Show as _, ShowContainer as _};
 use craft_ui::runtime::env::{Env, Label};
 use craft_ui::runtime::windows::{ScreenshotSlot, WindowHost};
-use egui::{Color32, Context, Pos2, Rect, Ui, ViewportId, pos2, vec2};
+use egui::{Color32, Context, Pos2, Rect, Ui, pos2, vec2};
 
 use super::ScreenPickGesture;
 
@@ -440,7 +440,12 @@ impl ScreenPick {
             }
         };
         let windows = WindowHost::of(ctx);
-        let size = windows.screenshot_facts();
+        // The frame is measured and shot in the same viewport, so a pick inside a child window samples that window.
+        let viewport = windows.current();
+        let Some(size) = windows.screenshot_facts(viewport) else {
+            self.hold = None;
+            return None;
+        };
         let inside = at.x >= 0.0 && at.y >= 0.0 && at.x < size.size_points.x && at.y < size.size_points.y;
         let back = self.monitor.as_ref().and_then(|(_, back)| back.clone());
         let hold = self.hold.get_or_insert_with(|| Hold { owner: key, slot: None, frame: None });
@@ -454,7 +459,7 @@ impl ScreenPick {
         let sampled = hold.frame.as_ref().filter(|_| inside).and_then(|frame| sample_frame(frame, size.pixels_per_point, at, back.as_deref()));
         if !released {
             if hold.slot.is_none() {
-                hold.slot = Some(windows.screenshot(ViewportId::ROOT, FRAME_BYTES));
+                hold.slot = Some(windows.screenshot(viewport, FRAME_BYTES));
             }
             ctx.request_repaint();
             return sampled;

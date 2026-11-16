@@ -10,6 +10,7 @@ use std::fmt;
 use egui::{Context, Ui};
 use serde_json::Value;
 
+use super::held::HeldOk;
 use super::stack::{DialogId, DialogStack};
 use crate::contract::{Pattern, PatternKind, PatternProbe};
 
@@ -69,8 +70,15 @@ pub trait StackDialog: Any + Send {
     /// Answers OK as a click on the default button would, without drawing: runs what OK runs
     /// (storing remembered values) and returns the answer. `None` when OK is disabled, the answer
     /// is one the dialog offers no enabled button for (a prompt's choice), or the dialog has no
-    /// programmatic OK (the default). Used by [`DialogHost::confirm`].
+    /// programmatic OK (the default). A dialog that holds its OK files the answer as its button
+    /// does and returns `None` ([`held_state`](StackDialog::held_state) is then `Waiting`); once the app
+    /// accepted the held OK, it returns the held answer. Used by [`DialogHost::confirm`].
     fn confirm(&mut self, _ctx: &Context) -> Option<Self::Result> {
+        None
+    }
+
+    /// Where the dialog's held OK stands; `None` (the default) for a dialog whose OK holds nothing now.
+    fn held_state(&self) -> Option<HeldOk> {
         None
     }
 
@@ -83,9 +91,9 @@ pub trait StackDialog: Any + Send {
     /// Sets the value `field` names, as the user editing that control would (`ui.dialog.set`); a prompt's answer
     /// is its `choice` field, one of the answers it has an enabled button for. `Err` says why the dialog refused:
     /// no such field, a control that takes no input now, or a value the control can't hold. Refuses everything by
-    /// default.
+    /// default. The host asks for the pass that shows the change; an implementation asks for none.
     fn set_json_field(&mut self, _ctx: &Context, field: &str, _value: Value) -> Result<(), String> {
-        Err(format!("unknown field `{field}`: this dialog has no fields"))
+        Err(FieldRefusal::NoFields.message(field))
     }
 
     /// The facts a story reports about the dialog's last pass, as [`Outcome::story_facts`](crate::contract::Outcome)
@@ -101,6 +109,42 @@ pub trait StackDialog: Any + Send {
     /// so it can release what it holds: a pick ticket (`Files::forget`), an armed dropper. The
     /// dialog's own Cancel button does this itself before it returns. Does nothing by default.
     fn cancelled(&mut self, _ctx: &Context) {}
+
+    /// Shows `color` live in the dialog's colour row `key` while a child picker edits it (`None` ends the preview).
+    /// Hosted dialogs with colour rows override it; does nothing by default.
+    fn preview_color(&mut self, key: &str, color: Option<craft_theme::Srgba>) {
+        let _ = (key, color);
+    }
+}
+
+/// Why a dialog refused `ui.dialog.set`; each has one wording, which every dialog's
+/// [`set_json_field`](StackDialog::set_json_field) returns through [`message`](FieldRefusal::message).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum FieldRefusal<'a> {
+    /// The dialog has no fields.
+    NoFields,
+    /// The dialog has no field of that name.
+    Unknown,
+    /// The field's row is hidden or disabled.
+    Inactive,
+    /// A field automation reads but cannot set.
+    ReadOnly,
+    /// The field cannot hold this value.
+    Rejects(&'a serde_json::Value),
+}
+
+impl FieldRefusal<'_> {
+    /// The refusal's wording for `field`.
+    pub fn message(&self, field: &str) -> String {
+        match self {
+            FieldRefusal::NoFields => format!("unknown field `{field}`: this dialog has no fields"),
+            FieldRefusal::Unknown => format!("unknown field `{field}`"),
+            FieldRefusal::Inactive => format!("`{field}` takes no input now: its row is hidden or disabled"),
+            FieldRefusal::ReadOnly => format!("`{field}` is read only"),
+            FieldRefusal::Rejects(value) => format!("`{field}` can't take {value}"),
+        }
+    }
 }
 
 /// The suite's probe of the stack dialog `T`: `#[pattern(dialog)]` registers through it, so only a `StackDialog`
@@ -138,6 +182,7 @@ trait AnyStackDialog: Send {
     fn key(&self) -> Option<String>;
     fn instance(&self) -> Option<DialogId>;
     fn confirm_erased(&mut self, ctx: &Context) -> Option<Box<dyn Any + Send>>;
+    fn held_state(&self) -> Option<HeldOk>;
     fn json_fields(&self) -> Option<Value>;
     fn set_json_field(&mut self, ctx: &Context, field: &str, value: Value) -> Result<(), String>;
     fn show_erased(&mut self, ui: &mut Ui, stack: &DialogStack) -> Option<Box<dyn Any + Send>>;
@@ -145,6 +190,7 @@ trait AnyStackDialog: Send {
     fn cancelled(&self) -> Box<dyn Any + Send>;
     /// [`StackDialog::cancelled`].
     fn release(&mut self, ctx: &Context);
+    fn preview_color(&mut self, key: &str, color: Option<craft_theme::Srgba>);
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -170,6 +216,10 @@ impl<D: StackDialog> AnyStackDialog for D {
         self.confirm(ctx).map(|result| Box::new(DialogResult::Ok(result)) as Box<dyn Any + Send>)
     }
 
+    fn held_state(&self) -> Option<HeldOk> {
+        StackDialog::held_state(self)
+    }
+
     fn json_fields(&self) -> Option<Value> {
         StackDialog::json_fields(self)
     }
@@ -188,6 +238,10 @@ impl<D: StackDialog> AnyStackDialog for D {
 
     fn cancelled(&self) -> Box<dyn Any + Send> {
         Box::new(DialogResult::<D::Result>::Cancel)
+    }
+
+    fn preview_color(&mut self, key: &str, color: Option<craft_theme::Srgba>) {
+        StackDialog::preview_color(self, key, color);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -228,13 +282,8 @@ impl<D: StackDialog> AnyStackDialog for D {
 ///   one of them; the per-type calls reach the most recently opened `D`.
 ///   [`open_unless_open`](DialogHost::open_unless_open) refuses while any `D` is open and leaves
 ///   it alone (PhotoCraft's `confirmationPending`).
-/// - Dialogs the app still shows itself share the stack: [`open_beside`](DialogHost::open_beside) and
-///   [`close_beside`](DialogHost::close_beside), called where they open and close, give them their place in the
-///   one opening order, so the top dialog and the startup queue count them too. Such an app shows every dialog in
-///   one walk of the stack instead of [`run`](DialogHost::run): [`walk`](DialogHost::walk), then
-///   [`next_beside`](DialogHost::next_beside) until it returns `None`, drawing each [`BesideStep`] it returns
-///   through [`BesideStep::at_place`] and [`show_beside_modal`](crate::contract::overlay::show_beside_modal). Each
-///   dialog then draws and takes input at its place on the stack.
+/// - Every dialog on the stack is one the host holds: [`run`](DialogHost::run) shows each at its place on the
+///   stack, so it draws and takes input there.
 /// - Automation: [`get`](DialogHost::get) and [`get_mut`](DialogHost::get_mut) reach the open
 ///   dialog's value for code that knows its type. A script that doesn't goes by id:
 ///   [`open_dialogs`](DialogHost::open_dialogs) lists every open dialog with its
@@ -250,32 +299,10 @@ pub struct DialogHost {
     /// Dialogs another of their type replaced, waiting for the pass's `run` to run their
     /// [`StackDialog::cancelled`] (`open` has no `Context`).
     replaced: Vec<Box<dyn AnyStackDialog>>,
-    /// The app's dialogs that left the stack without a `Context`, waiting for the next walk to close the layers
-    /// opened from inside them.
-    left_beside: Vec<DialogId>,
-}
-
-/// One pass over the [`DialogHost`]'s stack, bottom first, from [`DialogHost::walk`].
-#[derive(Debug)]
-pub struct StackWalk {
-    ids: Vec<DialogId>,
-    at: usize,
-}
-
-/// A dialog the app shows itself, at its place in a [`StackWalk`].
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub struct BesideStep {
-    /// The dialog's id on the stack.
-    pub id: DialogId,
-    place: usize,
-}
-
-impl BesideStep {
-    /// Runs `show`, which draws the dialog, at the dialog's place on the stack: the layers it shows stack there.
-    pub fn at_place<R>(self, ctx: &Context, show: impl FnOnce() -> R) -> R {
-        crate::runtime::overlay::stack_place(ctx, self.place, show)
-    }
+    /// The number the last open got ([`open_serial`](DialogHost::open_serial)).
+    opens: u64,
+    /// The number of each dialog's last open, by id; read only while the dialog is open.
+    serials: Vec<(DialogId, u64)>,
 }
 
 /// One open dialog as automation sees it ([`DialogHost::open_dialogs`]).
@@ -313,25 +340,9 @@ impl DialogHost {
         Self::default()
     }
 
-    /// The routing stack: every open dialog in opening order, the host's and the ones the app
-    /// shows beside them ([`open_beside`](DialogHost::open_beside)). The top one takes the input.
+    /// The routing stack: every open dialog in opening order. The top one takes the input.
     pub fn stack(&self) -> &DialogStack {
         &self.stack
-    }
-
-    /// Puts a dialog the app shows itself beside the host's on the stack when it opens: on top, over `parent` for a
-    /// child. From then on the top dialog, the startup queue and automation count it as one of the stack's.
-    pub fn open_beside(&mut self, id: DialogId, parent: Option<DialogId>) {
-        self.stack.push(id, parent);
-    }
-
-    /// Takes the dialog the app showed beside the host's off the stack when it closes, with every dialog opened over
-    /// it: the host's among them close with `Cancel`.
-    pub fn close_beside(&mut self, id: DialogId) {
-        if self.stack.contains(id) {
-            self.remove_tree(id, None);
-            self.cancel_orphans(None);
-        }
     }
 
     /// Opens `dialog` on top. Its id goes on the stack now; the dialog shows from the next
@@ -362,65 +373,38 @@ impl DialogHost {
 
     /// Runs every open dialog of the host for this pass in stack order, each at its place on the stack; removes the
     /// ones that finished and stores their results; opens the next queued startup modal when the stack is empty.
-    /// Call once per pass, after the app's own UI. An app with dialogs of its own on the stack walks it instead
-    /// ([`walk`](DialogHost::walk)), so they show at their places too.
+    /// Call once per pass, after the app's own UI. Each pass of a frame shows every dialog again and applies only its
+    /// own input. A dialog opened during the run shows from the next pass. A dialog the host removes, here or by a
+    /// confirm, cancel or replacing open, ends its shown life at once, so its next open is a first pass.
     pub fn run(&mut self, ui: &mut Ui) {
-        let mut walk = self.walk(ui.ctx());
-        while self.next_beside(ui, &mut walk).is_some() {}
-    }
-
-    /// Starts this pass's walk of the stack, for an app that shows dialogs of its own beside the host's: runs the
-    /// closes that waited for a `Context` and opens the next queued startup modal when the stack is empty. Follow it
-    /// with [`next_beside`](DialogHost::next_beside) until it returns `None`. A dialog opened during the walk shows
-    /// from the next pass.
-    pub fn walk(&mut self, ctx: &Context) -> StackWalk {
-        self.release_replaced(ctx);
-        for id in std::mem::take(&mut self.left_beside) {
-            crate::contract::overlay::close_beside_modal(ctx, id);
-        }
-        self.open_next_queued();
-        StackWalk { ids: self.stack.ids().collect(), at: 0 }
-    }
-
-    /// Shows the host's dialogs of `walk` in stack order, each at its place on the stack, up to the next dialog the
-    /// app shows itself, which it returns for the app to show at its place. A dialog that finished leaves the stack
-    /// with the dialogs opened over it. `None` once the walk is done; the next queued startup modal opens then if the
-    /// stack is empty.
-    pub fn next_beside(&mut self, ui: &mut Ui, walk: &mut StackWalk) -> Option<BesideStep> {
         let ctx = ui.ctx().clone();
-        while let Some(&id) = walk.ids.get(walk.at) {
-            let place = walk.at;
-            walk.at += 1;
+        self.release_replaced(&ctx);
+        self.open_next_queued();
+        let ids: Vec<DialogId> = self.stack.ids().collect();
+        for (place, id) in ids.into_iter().enumerate() {
+            // A dialog that finished earlier in the run took the dialogs over it off the stack.
             if !self.stack.contains(id) {
                 continue;
             }
-            let Some(at) = self.open.iter().position(|dialog| dialog.id() == id) else {
-                return Some(BesideStep { id, place });
-            };
+            let Some(at) = self.position_by_id(id) else { continue };
             let stack = &self.stack;
             let dialog = &mut self.open[at];
-            let Some(result) = crate::runtime::overlay::stack_place(&ctx, place, || dialog.show_erased(ui, stack)) else { continue };
-            self.remove_tree(id, Some(&ctx));
+            let Some(result) = crate::runtime::overlay::stack_place(&ctx, place, id, || dialog.show_erased(ui, stack)) else { continue };
+            self.remove_tree(id);
             let dialog = self.open.remove(at);
+            crate::runtime::overlay::end_stack_dialog(&ctx, id);
             self.store_result(dialog.as_ref(), result);
             self.cancel_orphans(Some(&ctx));
         }
         if self.open_next_queued() {
             crate::runtime::frame::request_repaint(&ctx);
         }
-        None
     }
 
-    /// Takes `id` and the dialogs opened over it off the stack, before the host's among them leave `open`. The app's
-    /// dialogs among them close the layers opened from inside them, now with a `Context`, else at the next walk.
-    fn remove_tree(&mut self, id: DialogId, ctx: Option<&Context>) {
-        let before: Vec<DialogId> = self.stack.ids().collect();
+    /// Takes `id` and the dialogs opened over it off the stack; [`cancel_orphans`](DialogHost::cancel_orphans) then
+    /// closes the ones over it.
+    fn remove_tree(&mut self, id: DialogId) {
         self.stack.remove_tree(id);
-        let left = before.into_iter().filter(|gone| !self.stack.contains(*gone) && !self.open.iter().any(|dialog| dialog.id() == *gone));
-        match ctx {
-            Some(ctx) => left.for_each(|gone| crate::contract::overlay::close_beside_modal(ctx, gone)),
-            None => self.left_beside.extend(left),
-        }
     }
 
     /// The result of the last `D` that finished or was cancelled, once. `None` when no result
@@ -428,16 +412,18 @@ impl DialogHost {
     /// of the type; if that `open` replaced a `D` that was still open, the replaced one's
     /// `Cancel` waits instead. Results are per type, so the app tells two `D` apart by what the
     /// result carries (a key, a tag). A `D` opened with an instance ([`StackDialog::instance`])
-    /// keeps its result apart, for [`take_by_id`](DialogHost::take_by_id) only.
+    /// keeps its result apart, for [`take_keyed`](DialogHost::take_keyed) and
+    /// [`take_by_id`](DialogHost::take_by_id).
     pub fn take<D: StackDialog>(&mut self) -> Option<DialogResult<D::Result>> {
-        self.take_keyed::<D>().map(|(result, _)| result)
+        let at = self.results.iter().rposition(|stored| stored.type_id == TypeId::of::<D>() && stored.instance.is_none())?;
+        self.take_at::<D>(at).map(|(result, _)| result)
     }
 
-    /// [`take`](DialogHost::take) with the key the dialog had ([`StackDialog::key`]): what a
-    /// `Cancel` after a replace-by-open needs to tell which command it was. `None` key for a
-    /// dialog without one.
+    /// The result of the last `D` that finished or was cancelled, whatever its instance, with the
+    /// key the dialog had ([`StackDialog::key`]), once: the key tells which command it was, a
+    /// `Cancel` after a replace-by-open included. `None` key for a dialog without one.
     pub fn take_keyed<D: StackDialog>(&mut self) -> Option<(DialogResult<D::Result>, Option<String>)> {
-        let at = self.results.iter().rposition(|stored| stored.type_id == TypeId::of::<D>() && stored.instance.is_none())?;
+        let at = self.results.iter().rposition(|stored| stored.type_id == TypeId::of::<D>())?;
         self.take_at::<D>(at)
     }
 
@@ -456,13 +442,21 @@ impl DialogHost {
 
     /// Answers the open `D` with OK, as its default button would (for automation: no pointer, no
     /// pass): runs what OK runs, closes the dialog and its children, and keeps the answer for
-    /// [`take`](DialogHost::take). `false` when no `D` is open, OK is disabled, or `D` has no
-    /// programmatic OK.
+    /// [`take`](DialogHost::take). `false` when no `D` is open, OK is disabled, `D` has no
+    /// programmatic OK, or `D` holds its OK: the answer is filed for the app
+    /// ([`held_state`](DialogHost::held_state) says `Waiting`), and a `confirm` after the app accepted it
+    /// closes the dialog with it.
     pub fn confirm<D: StackDialog>(&mut self, ctx: &Context) -> bool {
         match self.position::<D>() {
             Some(at) => self.confirm_at(ctx, at),
             None => false,
         }
+    }
+
+    /// Where the held OK of the open dialog `id` names stands ([`StackDialog::held_state`]); `None` when no such dialog
+    /// is open or its OK holds nothing now.
+    pub fn held_state(&self, id: DialogId) -> Option<HeldOk> {
+        self.open.iter().find(|dialog| dialog.id() == id)?.held_state()
     }
 
     /// [`confirm`](DialogHost::confirm) for the open dialog `id` names, whatever its type.
@@ -473,11 +467,17 @@ impl DialogHost {
         }
     }
 
+    /// Refuses (returns `false`) while a child is open over the dialog: the child's answer comes first, as the
+    /// disabled parent shows on screen.
     fn confirm_at(&mut self, ctx: &Context, at: usize) -> bool {
+        if self.stack.has_child(self.open[at].id()) {
+            return false;
+        }
         let Some(result) = self.open[at].confirm_erased(ctx) else { return false };
         let id = self.open[at].id();
-        self.remove_tree(id, Some(ctx));
+        self.remove_tree(id);
         let dialog = self.open.remove(at);
+        crate::runtime::overlay::end_stack_dialog(ctx, id);
         self.store_result(dialog.as_ref(), result);
         self.cancel_orphans(Some(ctx));
         true
@@ -492,6 +492,14 @@ impl DialogHost {
         }
     }
 
+    /// Passes a child picker's live colour to the open dialog `id` names ([`StackDialog::preview_color`]); does
+    /// nothing when no dialog has that id.
+    pub fn preview_color(&mut self, id: DialogId, key: &str, color: Option<craft_theme::Srgba>) {
+        if let Some(dialog) = self.open.iter_mut().find(|dialog| dialog.id() == id) {
+            dialog.preview_color(key, color);
+        }
+    }
+
     /// [`cancel`](DialogHost::cancel) for the open dialog `id` names, whatever its type.
     pub fn cancel_by_id(&mut self, ctx: &Context, id: DialogId) -> bool {
         match self.position_by_id(id) {
@@ -502,8 +510,9 @@ impl DialogHost {
 
     fn cancel_at(&mut self, ctx: &Context, at: usize) -> bool {
         let id = self.open[at].id();
-        self.remove_tree(id, Some(ctx));
+        self.remove_tree(id);
         let mut dialog = self.open.remove(at);
+        crate::runtime::overlay::end_stack_dialog(ctx, id);
         dialog.release(ctx);
         self.store_result(dialog.as_ref(), dialog.cancelled());
         self.cancel_orphans(Some(ctx));
@@ -521,7 +530,13 @@ impl DialogHost {
     /// Sets `field` of the open dialog `id` names ([`StackDialog::set_json_field`]), whatever its type.
     pub fn set_json_field(&mut self, ctx: &Context, id: DialogId, field: &str, value: Value) -> Result<(), String> {
         match self.open.iter_mut().find(|dialog| dialog.id() == id) {
-            Some(dialog) => dialog.set_json_field(ctx, field, value),
+            Some(dialog) => {
+                let answer = dialog.set_json_field(ctx, field, value);
+                if answer.is_ok() {
+                    ctx.request_repaint();
+                }
+                answer
+            }
             None => Err("no such dialog".to_owned()),
         }
     }
@@ -573,17 +588,29 @@ impl DialogHost {
         self.results.push(StoredResult { type_id, id: dialog.id(), instance, key: dialog.key(), result });
     }
 
+    /// Which open of the dialog `id` this is: a number distinct for every open on this host, the same while the
+    /// dialog stays open. A dialog's id is the same at every open of its key; this tells one open from the next (a
+    /// preview cached for a cancelled open is not the reopened dialog's). `None` when `id` is not open.
+    pub fn open_serial(&self, id: DialogId) -> Option<u64> {
+        self.position_by_id(id)?;
+        self.serials.iter().find(|(open, _)| *open == id).map(|(_, serial)| *serial)
+    }
+
     fn open_with_parent(&mut self, dialog: Box<dyn AnyStackDialog>, parent: Option<DialogId>) -> DialogId {
         let (type_id, instance) = (dialog.result_type(), dialog.instance());
         self.results.retain(|stored| stored.type_id != type_id || stored.instance != instance);
         if let Some(at) = self.open.iter().position(|open| open.result_type() == type_id && open.instance() == instance) {
-            self.remove_tree(self.open[at].id(), None);
+            self.remove_tree(self.open[at].id());
             let old = self.open.remove(at);
             self.store_result(old.as_ref(), old.cancelled());
             self.replaced.push(old);
             self.cancel_orphans(None);
         }
         let id = dialog.id();
+        self.opens += 1;
+        let open = &self.open;
+        self.serials.retain(|(serial_of, _)| *serial_of != id && open.iter().any(|dialog| dialog.id() == *serial_of));
+        self.serials.push((id, self.opens));
         self.stack.push(id, parent);
         self.open.push(dialog);
         id
@@ -597,7 +624,10 @@ impl DialogHost {
         for mut dialog in orphans {
             self.store_result(dialog.as_ref(), dialog.cancelled());
             match ctx {
-                Some(ctx) => dialog.release(ctx),
+                Some(ctx) => {
+                    crate::runtime::overlay::end_stack_dialog(ctx, dialog.id());
+                    dialog.release(ctx);
+                }
                 None => self.replaced.push(dialog),
             }
         }
@@ -606,6 +636,7 @@ impl DialogHost {
     /// Runs [`StackDialog::cancelled`] on the dialogs `open` closed without a `Context`.
     fn release_replaced(&mut self, ctx: &Context) {
         for mut dialog in std::mem::take(&mut self.replaced) {
+            crate::runtime::overlay::end_stack_dialog(ctx, dialog.id());
             dialog.release(ctx);
         }
     }

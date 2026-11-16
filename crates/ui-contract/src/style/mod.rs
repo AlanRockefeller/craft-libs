@@ -10,6 +10,7 @@ mod replacements;
 mod span;
 mod state;
 mod surface;
+mod surround;
 pub(crate) mod text_measure;
 mod tokens;
 
@@ -32,6 +33,7 @@ pub use replacements::{DuplicateStyle, StyleReplacements};
 pub use span::Span;
 pub use state::StateSet;
 pub use surface::{BandFill, SurfaceEdge, SurfaceStyle};
+pub use surround::{SurroundLook, paint_surround};
 pub use tokens::UiTokens;
 
 #[doc(hidden)]

@@ -233,6 +233,16 @@ impl PartBuilder<'_> {
         self
     }
 
+    /// The part's area keeps a focused text draft unapplied on a press. A press holds when any part under its point on
+    /// the press's layer declares it, sensing or not, whatever part wins the press.
+    pub fn holds_drafts(self) -> Self {
+        // A sizing pass has no window and records nothing, as for `exclusive`.
+        if let Some((ctx, owner)) = self.window {
+            crate::runtime::focus::note_holds_drafts(ctx, owner, PartRef { key: self.decl.key, index: self.decl.index });
+        }
+        self
+    }
+
     /// The part opens and closes the component's popup `popup` (the name given to `cx.popup`): a press on it toggles
     /// the popup, so press, drag and release over a row picks it, and a click leaves it open (`on_click` acts on the
     /// release instead), AccessKit Expand and Collapse on its sub-node open and close it, Alt+Down from the part (or from
@@ -262,6 +272,7 @@ pub struct PartsCx<'a, C: Component> {
     pub(crate) scrolls: &'a mut Vec<ScrollDecl>,
     pub(crate) text: &'a mut crate::contract::text::TextStep,
     pub(crate) last_state: (bool, bool),
+    pub(crate) gesture_running: bool,
     pub(crate) measure: MeasureCx<'a, C>,
     /// What the shape laid out before `parts`: a collection's rows as the item step places them this pass, a
     /// container's header slots.
@@ -329,6 +340,12 @@ impl<C: Component> PartsCx<'_, C> {
     /// Last pass's focus-visible state of this component.
     pub fn focus_visible(&self) -> bool {
         self.last_state.1
+    }
+
+    /// The component's value gesture runs: begun in an earlier pass and not yet committed or cancelled. A part that
+    /// only a gesture keeps declared reads it.
+    pub fn gesture_running(&self) -> bool {
+        self.gesture_running
     }
 
     /// Declares a part; a repeated part is named with its index: `cx.part(POINT.at(id), shape)`.

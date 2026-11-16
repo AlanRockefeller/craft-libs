@@ -1,4 +1,6 @@
-//! The editor's own commands: Photoshop's type formatting keys and the commit chord. The editor reads them with
+//! The editor's own commands: Photoshop's type formatting keys, the commit and cancel chords and the Character panel
+//! toggle. They sit in the `textEditor` scope, so they reach the editor before an app's shortcut on the same chord
+//! (Cmd+T is Free Transform elsewhere) while the editor holds the keys. The editor reads them with
 //! `take_command`, so the keymap rebinds them like any command; the editor reads no raw keys.
 
 use craft_behavior::{Granularity, MoveMods, NavMove};
@@ -75,15 +77,22 @@ pub enum TextEditorCommand {
     /// Loosen the tracking or kerning in large steps.
     #[command(label = "Loosen Tracking More", default = "Cmd+Alt+Right")]
     TrackingMoreFar,
+    /// End the session without its edits, whatever `esc_commits` says; nothing while an IME composition is open.
+    #[command(label = "Cancel Text", default = "Cmd+.")]
+    Cancel,
+    /// Show or hide the Character panel (the host reads `TextEditorOutput::character_panel`).
+    #[command(label = "Character Panel", default = "Cmd+T")]
+    CharacterPanel,
 }
 
 impl TextEditorCommand {
-    /// The formatting key the command stands for; `None` for `Commit`. Tracking at a caret is kerning.
+    /// The formatting key the command stands for; `None` for `Commit`, `Cancel` and `CharacterPanel`. Tracking at a
+    /// caret is kerning.
     pub(super) fn style_key(self, selection_is_empty: bool) -> Option<StyleKey> {
         use TextEditorCommand as C;
         let tracking = |by: f32| if selection_is_empty { StyleKey::Kern(by) } else { StyleKey::Tracking(by) };
         Some(match self {
-            C::Commit => return None,
+            C::Commit | C::Cancel | C::CharacterPanel => return None,
             C::AllCaps => StyleKey::Toggle(CharToggle::AllCaps),
             C::Underline => StyleKey::Toggle(CharToggle::Underline),
             C::FauxBold => StyleKey::Toggle(CharToggle::FauxBold),

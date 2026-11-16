@@ -25,6 +25,12 @@ impl SettingsDraft {
         }
     }
 
+    /// Removes the value at `key`, for a row whose off state stores no value (an `Option` that is `None`); Apply then
+    /// reports the key with no value. A missing key removes nothing.
+    pub fn remove(&mut self, key: &str) {
+        remove(&mut self.table, key);
+    }
+
     /// Writes the colour row `key` (the `#rrggbb` text a [`SettingRule::color`] row holds), for the colour a picker
     /// opened from [`CustomSettings::nested`] returned.
     pub fn set_color(&mut self, key: &str, color: Srgba) {
@@ -55,6 +61,20 @@ pub(super) fn insert(table: &mut toml::Table, key: &str, value: toml::Value) {
         Some((head, rest)) => {
             if let toml::Value::Table(inner) = table.entry(head).or_insert_with(|| toml::Value::Table(toml::Table::new())) {
                 insert(inner, rest, value);
+            }
+        }
+    }
+}
+
+/// Removes the value at the dotted `key`; a missing path removes nothing.
+pub(super) fn remove(table: &mut toml::Table, key: &str) {
+    match key.split_once('.') {
+        None => {
+            table.remove(key);
+        }
+        Some((head, rest)) => {
+            if let Some(toml::Value::Table(inner)) = table.get_mut(head) {
+                remove(inner, rest);
             }
         }
     }

@@ -23,7 +23,10 @@ pub(crate) const WHEEL_LINE_POINTS: f32 = 40.0;
 /// Points one wheel page adds to `PointerFrame.scroll`.
 pub(crate) const WHEEL_PAGE_POINTS: f32 = 400.0;
 
-/// The pointer input of one pass of one viewport, egui-converted.
+/// The pointer input of one pass of one viewport, egui-converted. Input enters a frame's first pass only (egui hands
+/// the frame's events to it, and injected steps and held-back presses follow the frame): a rerun pass of the
+/// frame carries no events, so its `delta`, `press`, `release` and `scroll` are empty while the held facts (`pos`,
+/// `buttons`) persist. A consumer applies what its pass hands it and never turns a held fact into an event.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PointerFrame {
@@ -37,7 +40,8 @@ pub struct PointerFrame {
     pub press: Option<PressStart>,
     /// The button released in the pass.
     pub release: Option<PointerButton>,
-    /// The modifiers held.
+    /// The modifiers held, with the ones the app latches for the user (a Modifier Keys panel) added: the app holds
+    /// them down for every press and drag. Key chords read the keyboard's own modifiers instead.
     pub mods: Mods,
     /// The pass's time in seconds.
     pub time: f64,
@@ -51,6 +55,8 @@ pub struct PointerFrame {
     pub scroll: Vec2,
     /// Pinch and Ctrl or Cmd with the wheel, folded into one factor.
     pub zoom: f32,
+    /// The pass's summed `Event::Rotate` radians.
+    pub rotation: f32,
     /// The movement that turns a press into a drag.
     pub slop: f32,
     /// The least hit size across for this pointer kind.
@@ -65,7 +71,8 @@ pub struct PressTargets {
     pub drag: Option<Id>,
 }
 
-/// What the begin hook read of the pass, for the sensing core and the services.
+/// What the begin hook read of the pass, for the sensing core and the services. Built from the pass's own events,
+/// so a rerun pass of a frame (see [`PointerFrame`]) reads none.
 #[derive(Clone, Debug, Default)]
 #[doc(hidden)]
 pub struct PassPointer {
@@ -82,12 +89,15 @@ pub struct PassPointer {
 
 #[derive(Default)]
 pub(crate) struct Memory {
-    last_press: Option<(Pos2, f64, u32)>,
+    /// The latest primary press: where, when, its click count and the modifiers held with it.
+    last_press: Option<(Pos2, f64, u32, Mods)>,
     press_targets: PressTargets,
     /// A cancel a service requested for the running pass.
     requested: Option<(u64, PressCancel)>,
     /// Whether any arena of the viewport holds an open press; sensing registers it, as the layer above.
     press_probe: Option<fn(&Context) -> bool>,
+    /// The arena roots whose members the next pass resolves without (`withhold_members`), with the pass that asked.
+    withheld: HashMap<Id, u64>,
 }
 
 /// What one root registered on one layer: its shapes and its egui widgets.
@@ -109,10 +119,13 @@ pub(crate) struct Shapes {
 }
 
 /// The begin hook (H5): converts the pass's pointer input.
-pub(crate) fn begin(ctx: &Context, hit: HitSizes) {
+pub(crate) fn begin(ctx: &Context, hit: HitSizes, latched: craft_keymap::Mods) {
     let viewport = pass::current_viewport(ctx);
     let pass_nr = pass::pass_nr(ctx, viewport);
     let mut read = input::pointer_read(ctx);
+    // Every pass reads its own input and the frame's latches, so a second pass of a frame builds the same
+    // modifiers from its own (event-free) input and counts no press twice.
+    let mods = with_latched(read.mods, latched);
     // A drag that started in another window reaches this one through the desktop pointer (8.4).
     if read.pos.is_none() {
         read.pos = drag::cross_window_pointer(ctx, viewport);
@@ -125,8 +138,8 @@ pub(crate) fn begin(ctx: &Context, hit: HitSizes) {
         let mut events = read.events.clone();
         for event in &mut events {
             if let PointerEvent::Pressed { button: PointerButton::Primary, pos, time, clicks, .. } = event {
-                *clicks = count_clicks(memory.last_press, *pos, *time, hit.slop);
-                memory.last_press = Some((*pos, *time, *clicks));
+                *clicks = count_clicks(memory.last_press, *pos, *time, mods, hit.slop);
+                memory.last_press = Some((*pos, *time, *clicks, mods));
             }
         }
         if read.primary_pressed || other_pressed {
@@ -146,13 +159,14 @@ pub(crate) fn begin(ctx: &Context, hit: HitSizes) {
         buttons: read.buttons,
         press,
         release: read.release,
-        mods: read.mods,
+        mods,
         time: read.time,
         kind: read.kind,
         sample: read.sample,
         multi_touch: read.multi_touch.map(|(translation, zoom, rotation, center)| MultiTouch::new(translation, zoom, rotation, center)),
         scroll,
         zoom: wheel_zoom,
+        rotation: read.rotation,
         slop: hit.slop,
         target: hit.target,
     };
@@ -167,6 +181,11 @@ pub(crate) fn begin(ctx: &Context, hit: HitSizes) {
     };
     PerViewport::<Stamped<Arc<PassPointer>>>::with_pass(ctx, viewport, pass_nr, |_, _| {}, |record| *record = Arc::new(pass_pointer));
     PerViewport::<Shapes>::with(ctx, viewport, |shapes| shapes.last = std::mem::take(&mut shapes.this));
+}
+
+/// The modifiers `held` with the app's `latched` ones added, field by field: `Mods` has no operator for it.
+fn with_latched(held: Mods, latched: Mods) -> Mods {
+    Mods { cmd: held.cmd || latched.cmd, ctrl: held.ctrl || latched.ctrl, alt: held.alt || latched.alt, shift: held.shift || latched.shift }
 }
 
 /// The running viewport's pass number.
@@ -219,6 +238,7 @@ pub fn frame(ctx: &Context) -> PointerFrame {
         multi_touch: None,
         scroll: Vec2::ZERO,
         zoom: 1.0,
+        rotation: 0.0,
         slop: 0.0,
         target: 0.0,
     })
@@ -230,6 +250,31 @@ pub(crate) fn cancel_press(ctx: &Context, reason: PressCancel) {
     let viewport = pass::current_viewport(ctx);
     let pass_nr = pass::pass_nr(ctx, viewport);
     PerViewport::<Memory>::with(ctx, viewport, |memory| memory.requested = Some((pass_nr, reason)));
+}
+
+/// Whether the arena of `root` resolves the presses and hover of the next pass without its members' shapes. A canvas
+/// host sets it each pass from the tool it runs: while a momentary tool (the Hand of a held Space, the Zoom of a held
+/// Command) is in effect, a press anywhere on the canvas lands on the canvas itself, over the session members on its
+/// body (a transform box, a crop frame), and the host gives it to that tool. A press already open keeps its target.
+pub fn withhold_members(ctx: &Context, root: Id, withheld: bool) {
+    if !crate::runtime::measure::effect(ctx, "pointer::withhold_members") {
+        return;
+    }
+    let viewport = pass::current_viewport(ctx);
+    let pass_nr = pass::pass_nr(ctx, viewport);
+    PerViewport::<Memory>::with(ctx, viewport, |memory| {
+        if withheld {
+            memory.withheld.insert(root, pass_nr);
+        } else {
+            memory.withheld.remove(&root);
+        }
+    });
+}
+
+/// Whether the arena of `root` resolves the running pass of `viewport` (`pass_nr`) without its members: its host
+/// asked so in this pass or the one before, the pass whose shapes this one resolves over.
+pub(crate) fn members_withheld(ctx: &Context, viewport: ViewportId, pass_nr: u64, root: Id) -> bool {
+    PerViewport::<Memory>::with(ctx, viewport, |memory| memory.withheld.get(&root).is_some_and(|asked| asked + 1 >= pass_nr))
 }
 
 /// Registers how the viewport tells that a press is captured. Sensing owns the arenas' machines.
@@ -455,6 +500,26 @@ pub(crate) fn press_winner(ctx: &Context, at: Pos2, targets: PressTargets) -> Op
     });
     let at = areas::layer_map(ctx, layer).map_or(at, |map| map.to_layer(at));
     candidates.into_iter().find_map(|(root, shapes)| resolve(&shapes, at, ResolveFor::Press).map(|winner| (winner, root)))
+}
+
+/// Every shape of the last pass on the topmost layer at `at` (screen points) whose area contains it, as
+/// `(owner, part)`, sensing or not, in no particular order; empty where no layer is. The hit record a press is
+/// classified on, for rules that ask what lies under a point rather than who wins it.
+pub fn shapes_at(ctx: &Context, at: Pos2) -> Vec<(Id, Option<PartRef>)> {
+    let Some(layer) = areas::layer_at(ctx, at) else { return Vec::new() };
+    // Every shape recorded on a layer lies in that layer's space, as in `press_winner`.
+    let at = areas::layer_map(ctx, layer).map_or(at, |map| map.to_layer(at));
+    PerViewport::<Shapes>::with(ctx, pass::current_viewport(ctx), |record| {
+        record
+            .last
+            .get(&layer)
+            .into_iter()
+            .flat_map(|roots| roots.values())
+            .flat_map(|root| root.shapes.iter())
+            .filter(|shape| shape.hits(at))
+            .map(|shape| (shape.owner, shape.part))
+            .collect()
+    })
 }
 
 /// The screen bounds of the root `root` from its shape record, with the viewport and layer they were recorded in: the

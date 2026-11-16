@@ -24,7 +24,10 @@ craft_ui::words! {
         seconds: unit "units.seconds" = "{n} s";
         pixels_per_inch: unit "units.pixelsPerInch" = "{n} ppi";
         pixels_per_centimetre: unit "units.pixelsPerCentimetre" = "{n} ppcm";
+        lines_per_inch: unit "units.linesPerInch" = "{n} lpi";
+        lines_per_centimetre: unit "units.linesPerCentimetre" = "{n} lpcm";
         minutes: unit "units.minutes" = "{n} min";
+        columns: unit "units.columns" = "{n} col";
     }
 }
 
@@ -89,6 +92,12 @@ pub enum UnitKind {
     PixelsPerCentimetre,
     /// `{n} min`.
     Minutes,
+    /// `{n} col`: a width in columns of a column size (`ColumnSize`), an affine rule no unit factor expresses.
+    Columns,
+    /// `{n} lpi`: a halftone screen's frequency.
+    LinesPerInch,
+    /// `{n} lpcm`: a halftone screen's frequency.
+    LinesPerCentimetre,
 }
 
 impl UnitKind {
@@ -101,7 +110,7 @@ impl UnitKind {
         Self::ALL.get(tag as usize).copied()
     }
 
-    const ALL: [UnitKind; 12] = [
+    const ALL: [UnitKind; 15] = [
         UnitKind::Pixels,
         UnitKind::Percent,
         UnitKind::Degrees,
@@ -114,6 +123,9 @@ impl UnitKind {
         UnitKind::PixelsPerInch,
         UnitKind::PixelsPerCentimetre,
         UnitKind::Minutes,
+        UnitKind::Columns,
+        UnitKind::LinesPerInch,
+        UnitKind::LinesPerCentimetre,
     ];
 
     /// The digits after the decimal mark a number of this kind shows by default, at most.
@@ -126,8 +138,10 @@ impl UnitKind {
             | UnitKind::Millimetres
             | UnitKind::Picas
             | UnitKind::PixelsPerInch
-            | UnitKind::PixelsPerCentimetre => 0..=2,
-            UnitKind::Inches => 0..=3,
+            | UnitKind::PixelsPerCentimetre
+            | UnitKind::LinesPerInch
+            | UnitKind::LinesPerCentimetre => 0..=2,
+            UnitKind::Inches | UnitKind::Columns => 0..=3,
         }
     }
 
@@ -187,6 +201,56 @@ impl UnitKind {
     }
 }
 
+/// The column size of a document: `n` columns are `n·(width + gutter) − gutter` points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnSize {
+    /// The width of one column, in points; a value that is not a finite number above 0 counts as 180.
+    pub width: f64,
+    /// The gutter between columns, in points; a value that is not finite counts as 12, a negative one as 0.
+    pub gutter: f64,
+}
+
+impl ColumnSize {
+    /// The column width used when the given one is not a finite number above 0.
+    const FALLBACK_WIDTH: f64 = 180.0;
+    /// The gutter used when the given one is not finite.
+    const FALLBACK_GUTTER: f64 = 12.0;
+
+    /// The width and gutter the conversion uses: the fallbacks the field docs name, so a degenerate preference
+    /// never divides by zero.
+    fn sane(self) -> (f64, f64) {
+        let width = if self.width.is_finite() && self.width > 0.0 { self.width } else { Self::FALLBACK_WIDTH };
+        let gutter = if self.gutter.is_finite() { self.gutter.max(0.0) } else { Self::FALLBACK_GUTTER };
+        (width, gutter)
+    }
+
+    /// `columns` columns as points; a `relative` change converts the span of `|columns|` with its sign, and 0 stays 0.
+    pub fn points(self, columns: f64, relative: bool) -> f64 {
+        let (width, gutter) = self.sane();
+        let span = |n: f64| n * (width + gutter) - gutter;
+        if !relative {
+            return span(columns);
+        }
+        if columns == 0.0 {
+            return 0.0;
+        }
+        columns.signum() * span(columns.abs()).max(0.0)
+    }
+
+    /// `points` as columns; the inverse of [`points`](Self::points).
+    pub fn columns(self, points: f64, relative: bool) -> f64 {
+        let (width, gutter) = self.sane();
+        let count = |p: f64| (p + gutter) / (width + gutter);
+        if !relative {
+            return count(points);
+        }
+        if points == 0.0 {
+            return 0.0;
+        }
+        points.signum() * count(points.abs())
+    }
+}
+
 /// A length kept in one unit and shown in another: what a length field reads and writes (`stored`, the document's
 /// unit) and what it shows and parses bare numbers in (`shown`, the user's unit). Both are `UnitKind::Pixels` or one
 /// of [`UnitKind::LENGTHS`]; the document's resolution sizes pixels.
@@ -230,9 +294,10 @@ pub struct Units {
 
 impl Units {
     /// The codec of a zoom field in percent: the percent reader, up to two decimals (the zoom ladder has rungs such as
-    /// 66.67 %).
+    /// 66.67 %), with zoom typing (`a/b` as a ratio, a second separator cutting the text), so every zoom field reads
+    /// typed text by the same rules.
     pub fn zoom_codec(&self) -> NumberCodec {
-        NumberCodec::new(self.reader(Some(UnitKind::Percent)), ZOOM_DECIMALS)
+        NumberCodec::new(self.reader(Some(UnitKind::Percent)), ZOOM_DECIMALS).zoom_typing()
     }
 }
 
@@ -265,6 +330,9 @@ impl Units {
             UnitKind::PixelsPerInch => words.pixels_per_inch.as_str(),
             UnitKind::PixelsPerCentimetre => words.pixels_per_centimetre.as_str(),
             UnitKind::Minutes => words.minutes.as_str(),
+            UnitKind::Columns => words.columns.as_str(),
+            UnitKind::LinesPerInch => words.lines_per_inch.as_str(),
+            UnitKind::LinesPerCentimetre => words.lines_per_centimetre.as_str(),
         }
     }
 

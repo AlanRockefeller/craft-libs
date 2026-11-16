@@ -10,7 +10,8 @@ use crate::primitives::{ContentPainterCx, Draw};
 use crate::runtime::env::{Direction, Env, Label, MotionPolicy, PointSize, UnitWords, Units, WordSet, Words};
 use crate::runtime::motion::loop_phase;
 use crate::style::StyleCx;
-use craft_behavior::kurbo::Point;
+use craft_behavior::geometry::{SnapKinds, SnapLine};
+use craft_behavior::kurbo::{self, Point};
 use craft_behavior::{Axis, CancelReason, CanvasView, Cursor, CursorIcon, GestureId, PointerButton, PointerSample};
 use craft_i18n::{Digits, Format, Region};
 use craft_keymap::{Chord, Key, Mods, Platform};
@@ -215,6 +216,12 @@ pub(crate) struct ToolRequests {
     pub(crate) repaint: bool,
     pub(crate) view: Option<CanvasView>,
     pub(crate) ease: Option<ViewEase>,
+    pub(crate) snapped: Vec<SnapLine>,
+    pub(crate) autoscroll_at: Option<Pos2>,
+    /// The pan's scroll-all-windows choice, from [`ToolContext::pan_view`].
+    pub(crate) pan: Option<bool>,
+    /// Rows the Show Transformation Values gate never silences, from [`ToolContext::hud`].
+    pub(crate) hud: Option<Vec<(Label, String)>>,
 }
 
 /// What a tool sees and may ask for during a call.
@@ -234,6 +241,7 @@ pub struct ToolContext<'a> {
     /// Whether Caps Lock is on now (a brush shows its precise cursor): the platform's toggle state, read once per
     /// pass, not a count of key presses.
     pub caps_lock: bool,
+    precise_cursors: bool,
     space: Option<CanvasSpace>,
     gesture: Option<GestureId>,
     down: &'a [Key],
@@ -266,6 +274,7 @@ impl<'a> ToolContext<'a> {
             gesture: None,
             down: &[],
             caps_lock: false,
+            precise_cursors: false,
             painter: None,
             style: None,
             env: None,
@@ -315,6 +324,18 @@ impl<'a> ToolContext<'a> {
     pub fn caps_lock(mut self, on: bool) -> Self {
         self.caps_lock = on;
         self
+    }
+
+    /// Whether Preferences > Cursors > Other Cursors is Precise.
+    #[must_use]
+    pub fn precise_cursors(mut self, on: bool) -> Self {
+        self.precise_cursors = on;
+        self
+    }
+
+    /// Whether the tool shows its precise cursor now: `precise_cursors` differs from Caps Lock.
+    pub fn precise(&self) -> bool {
+        self.precise_cursors != self.caps_lock
     }
 
     /// The press arena's slop.
@@ -389,7 +410,7 @@ impl<'a> ToolContext<'a> {
 
     /// `point`, a document point under the pointer, moved to what the canvas snaps it to (View > Snap To) with the
     /// modifiers held now; the point itself when the canvas has no snapping or the Control key suspends it
-    /// ([`snap_suspended`](super::snap_suspended)). The tool builds no snapping of its own.
+    /// ([`Snap::apply`] decides). The tool builds no snapping of its own.
     pub fn snap(&self, point: Point) -> Point {
         Point::new(self.snap_along(Axis::Y, point.x), self.snap_along(Axis::X, point.y))
     }
@@ -397,10 +418,39 @@ impl<'a> ToolContext<'a> {
     /// The coordinate `position` across a guide that would run along `along`, snapped as [`snap`](Self::snap) does:
     /// an x coordinate is across `Axis::Y`.
     pub fn snap_along(&self, along: Axis, position: f64) -> f64 {
-        match self.snap {
-            Some(snap) if !super::snap_suspended(self.mods, self.os(), false) => snap.apply(along, position, self.mods),
-            _ => position,
-        }
+        self.snap.map_or(position, |snap| snap.apply(along, position, self.mods))
+    }
+
+    /// The offset that moves `rect` (document units) onto a View > Snap To target with the modifiers held now; zero
+    /// when Control suspends snapping or the canvas has no snap.
+    pub fn snap_rect(&mut self, rect: kurbo::Rect) -> kurbo::Vec2 {
+        self.snap_rect_of(rect, SnapKinds::ALL)
+    }
+
+    /// [`snap_rect`](Self::snap_rect) to the targets of a kind in `kinds` only: moving a selection leaves out the
+    /// selection's own edges.
+    pub fn snap_rect_of(&mut self, rect: kurbo::Rect, kinds: SnapKinds) -> kurbo::Vec2 {
+        let Some(snap) = self.snap else { return kurbo::Vec2::ZERO };
+        let (offset, lines) = snap.rect_of(rect, self.mods, kinds);
+        self.requests.snapped.extend(lines);
+        offset
+    }
+
+    /// Adds the snap lines a canvas control the tool shows snapped this pass, handed to the host in the same pass.
+    pub fn add_snapped(&mut self, lines: impl IntoIterator<Item = SnapLine>) {
+        self.requests.snapped.extend(lines);
+    }
+
+    /// Sets the view for a pan (as [`set_view`](Self::set_view)); the host reports it as [`ViewPan`].
+    pub fn pan_view(&mut self, view: CanvasView, scroll_all: bool) {
+        self.set_view(view);
+        self.requests.pan = Some(scroll_all);
+    }
+
+    /// A canvas control the tool shows asks the app to scroll: the host reports `past_edge` for `pointer` through the
+    /// tool's drag rule.
+    pub fn autoscroll_at(&mut self, pointer: Pos2) {
+        self.requests.autoscroll_at = Some(pointer);
     }
 
     /// The OS the pass runs on: the env's; the build's for a context built without an env.
@@ -434,7 +484,7 @@ impl<'a> ToolContext<'a> {
     /// without an env.
     pub fn reach(&self) -> f32 {
         match self.env {
-            Some(env) => env.tokens.size.hit.target,
+            Some(env) => env.hit_reach(),
             None => crate::runtime::frame::resolved_hit(&craft_theme::AppSizes::default()).target,
         }
     }
@@ -479,6 +529,12 @@ impl<'a> ToolContext<'a> {
         self.requests.readout = Some(rows);
     }
 
+    /// Labelled values to show beside the pointer this pass, never gated by Show Transformation Values (brush size
+    /// readouts). The last request of a pass wins. A hud asked for in the same pass as a readout replaces it.
+    pub fn hud(&mut self, rows: Vec<(Label, String)>) {
+        self.requests.hud = Some(rows);
+    }
+
     /// Asks for another pass (an animation, a held key that repeats).
     pub fn request_repaint(&mut self) {
         self.requests.repaint = true;
@@ -513,11 +569,20 @@ pub struct ToolClaims {
     /// Decrement on the tool's node and turns them into [`ToolKey::Nudge`], so a tool that claims the nudges
     /// describes what they move in [`CanvasTool::access`]. The arrows reach [`CanvasTool::key`] either way.
     pub nudges: bool,
+    /// Single chords the tool takes while the rest of the keyboard stays the app's, delivered as [`ToolKey::Kept`].
+    pub keys: &'static [Chord],
 }
 
 impl ToolClaims {
     /// No keys: every key stays the app's.
-    pub const NONE: ToolClaims = ToolClaims { keyboard: false, deletes: false, nudges: false };
+    pub const NONE: ToolClaims = ToolClaims { keyboard: false, deletes: false, nudges: false, keys: &[] };
+
+    /// The same claims with the single chords `keys`.
+    #[must_use]
+    pub const fn keys(mut self, keys: &'static [Chord]) -> Self {
+        self.keys = keys;
+        self
+    }
 
     /// The same claims with the canvas's plain keys.
     #[must_use]
@@ -611,6 +676,24 @@ pub trait CanvasTool {
         false
     }
 
+    /// Whether the tool changes only the view: its primary gestures pass under a modal that keeps the canvas.
+    /// Default: `false`.
+    fn view_only(&self) -> bool {
+        false
+    }
+
+    /// Whether, in its state after the press, the host calls `drag` once per pointer move from the press on, the moves
+    /// inside the click distance included, instead of once at the latest position past it: the freehand family, and a
+    /// gesture that moves content (a selection drag, a layer move), so a move of a pixel or two moves. The host's click
+    /// distance does not apply to such a gesture and the tool never reads the release's click: it decides its click
+    /// itself, and only there. A brush has none (it paints from where it went down); a content move is a click while
+    /// its pointer never left the press ([`MoveGesture::left_press`](craft_behavior::geometry::MoveGesture::left_press)).
+    /// `each_pass` runs before the pass's `drag` calls, so a tool that takes every move updates its live stroke once
+    /// per pass after `run` returns, never per `drag` call. Default: `false`.
+    fn takes_every_move(&self) -> bool {
+        false
+    }
+
     /// What the tool is to assistive technology this pass: its drawing as one object with its anchors (a rectangle
     /// being dragged: `Rectangle 120 x 80 px`), or `None` for a tool with nothing to describe. The host emits it
     /// after [`paint`](Self::paint), with the same context. Default: `None`.
@@ -621,6 +704,78 @@ pub trait CanvasTool {
     /// How the tool is reached without a pointer: a tool that creates or selects geometry names the command whose
     /// form takes the same numbers; a freehand tool is `ToolPath::Freehand` with its reason.
     fn command_form(&self) -> ToolPath;
+}
+
+/// A borrowed tool is the tool: an app hands a tool it keeps (`&mut tool`) to the host with no wrapper. Every method
+/// forwards, the defaults included, so the tool's own overrides hold.
+impl<T: CanvasTool + ?Sized> CanvasTool for &mut T {
+    fn each_pass(&mut self, cx: &mut ToolContext<'_>) {
+        (**self).each_pass(cx);
+    }
+
+    fn press(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) -> ToolAction {
+        (**self).press(pointer, cx)
+    }
+
+    fn drag(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
+        (**self).drag(pointer, cx);
+    }
+
+    fn release(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
+        (**self).release(pointer, cx);
+    }
+
+    fn hover(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
+        (**self).hover(pointer, cx);
+    }
+
+    fn cancel(&mut self, reason: CancelReason, cx: &mut ToolContext<'_>) {
+        (**self).cancel(reason, cx);
+    }
+
+    fn claims(&self) -> ToolClaims {
+        (**self).claims()
+    }
+
+    fn key(&mut self, key: &ToolKey, cx: &mut ToolContext<'_>) -> bool {
+        (**self).key(key, cx)
+    }
+
+    fn paint(&self, draw: &Draw<'_>, cx: &ToolContext<'_>) {
+        (**self).paint(draw, cx);
+    }
+
+    fn cursor(&self, cx: &ToolContext<'_>) -> Cursor {
+        (**self).cursor(cx)
+    }
+
+    fn takes(&self, button: PointerButton, mods: Mods) -> bool {
+        (**self).takes(button, mods)
+    }
+
+    fn autoscrolls(&self) -> bool {
+        (**self).autoscrolls()
+    }
+
+    fn autoscrolls_on_hover(&self) -> bool {
+        (**self).autoscrolls_on_hover()
+    }
+
+    fn view_only(&self) -> bool {
+        (**self).view_only()
+    }
+
+    fn takes_every_move(&self) -> bool {
+        (**self).takes_every_move()
+    }
+
+    fn access(&self, cx: &ToolContext<'_>) -> Option<ToolAccess> {
+        (**self).access(cx)
+    }
+
+    fn command_form(&self) -> ToolPath {
+        (**self).command_form()
+    }
 }
 
 /// The suite's probe of the canvas tool `T`: `#[pattern(tool)]` registers through it, so only a `CanvasTool` takes

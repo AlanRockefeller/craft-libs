@@ -3,7 +3,7 @@
 use super::Frames;
 use super::story::{Story, StoryData, StoryOutput};
 use crate::runtime::access::Role;
-use crate::runtime::commands::{CommandInput, CommandRef, CommandState};
+use crate::runtime::commands::{CommandGate, CommandInput, CommandRef, CommandState};
 use crate::runtime::egui::access::{AccessTree, NodeKey};
 use crate::runtime::egui::fixture::{self, AccessActionKind};
 use crate::runtime::egui::injected;
@@ -19,6 +19,9 @@ use std::rc::Rc;
 
 /// The most frames [`Fixture::settle`] runs.
 const SETTLE_FRAMES: usize = 4;
+
+/// The most frames [`Fixture::run_injected`] runs.
+const INJECTED_FRAMES: usize = 64;
 
 /// A node of the AccessKit tree, as input addresses it.
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +203,8 @@ impl Fixture {
         fixture.data = data;
         fixture.outputs = outputs;
         fixture.root_id = root_id;
+        fixture.commands = Story::command_input([story]);
+        fixture.frames.commands(fixture.commands.clone());
         fixture
     }
 
@@ -228,6 +233,13 @@ impl Fixture {
         let command = command.into();
         self.commands.states.retain(|(held, _)| *held != command);
         self.commands.states.push((command, state));
+        self.frames.commands(self.commands.clone());
+        self
+    }
+
+    /// Sets the app's one gate over commands for every following pass, as an app's `FrameInput.commands` does.
+    pub fn gate(&mut self, gate: CommandGate) -> &mut Self {
+        self.commands.gate = Some(gate);
         self.frames.commands(self.commands.clone());
         self
     }
@@ -292,7 +304,6 @@ impl Fixture {
     /// text editing.
     pub fn os(&mut self, os: Os) -> &mut Self {
         crate::runtime::windows::set_os(&self.frames.ctx, os);
-        fixture::set_os(&self.frames.ctx, os);
         self
     }
 
@@ -425,6 +436,21 @@ impl Fixture {
         for _ in 0..n {
             self.frame(Vec::new());
         }
+        self
+    }
+
+    /// Frames with no events until every injected step has run its pass
+    /// ([`WindowHost::injected_idle`](crate::runtime::windows::WindowHost::injected_idle)); injected input runs one
+    /// step per pass. Panics when it has not after 64 frames.
+    pub fn run_injected(&mut self) -> &mut Self {
+        let host = crate::runtime::windows::WindowHost::of(self.ctx());
+        for _ in 0..INJECTED_FRAMES {
+            if host.injected_idle() {
+                return self;
+            }
+            self.frame(Vec::new());
+        }
+        assert!(host.injected_idle(), "the injected input ran within {INJECTED_FRAMES} frames");
         self
     }
 

@@ -6,7 +6,7 @@ use super::placement::placement_of;
 use super::shell::{base_shell, shell_of, window_info};
 use super::spec::frame_of;
 use super::{Record, shared};
-use crate::runtime::egui::injected::{self, Released};
+use crate::runtime::egui::injected::{self, InjectedPointer, Released};
 use crate::runtime::egui::input_filter;
 use crate::runtime::egui::screenshot::{ScreenshotFacts, ScreenshotSlot};
 use crate::runtime::egui::{pass, screenshot, viewports};
@@ -15,6 +15,7 @@ use craft_behavior::placement::Placement;
 use craft_behavior::{Monitor, PointerButton};
 use craft_host::target::{Caps, ShellInfo, WindowState};
 use craft_keymap::{Chord, Key, Mods};
+use craft_window::desktop::Desktop;
 use craft_window::policy::Frame;
 use egui::{Context, Id, Pos2, Rect, Vec2, ViewportId};
 
@@ -99,14 +100,21 @@ impl WindowHost {
         screenshot::issue(&self.ctx, viewport, max_image_bytes)
     }
 
-    /// What a screenshot of the running viewport measures this pass.
-    pub fn screenshot_facts(&self) -> ScreenshotFacts {
-        screenshot::facts(&self.ctx)
+    /// Whether `viewport`'s window is open this pass, measured or not.
+    pub fn is_open(&self, viewport: ViewportId) -> bool {
+        viewports::reported(&self.ctx).iter().any(|(id, _)| *id == viewport)
     }
 
-    /// Queues a pointer move to `at` in `viewport` with `mods` held, delivered on a pass of its own; the modifiers
-    /// stay held after it, and a button held by earlier injected input stays down, so the move drags. With `rest`
-    /// (seconds) the input counts as processed only once the pointer has rested that long.
+    /// What a screenshot of `viewport` measures this pass; `None` when the viewport is not running.
+    pub fn screenshot_facts(&self, viewport: ViewportId) -> Option<ScreenshotFacts> {
+        screenshot::facts(&self.ctx, viewport)
+    }
+
+    /// Queues a pointer move to `at` in `viewport` with `mods` held, delivered on a pass of its own; the modifiers stay
+    /// held after it, and a button held by earlier injected input stays down, so the move drags. With `rest` (seconds)
+    /// the input counts as processed only once the pointer has rested that long. As a window never reports a NaN or
+    /// infinite pointer, a non-finite `at` here and in every `inject_*` below queues nothing; a release there releases
+    /// where the injected pointer is.
     pub fn inject_move(&self, viewport: ViewportId, at: Pos2, mods: Mods, rest: f64) {
         injected::inject_move(&self.ctx, viewport, at, mods, rest);
     }
@@ -123,7 +131,7 @@ impl WindowHost {
         injected::inject_key(&self.ctx, viewport, key, mods, hold);
     }
 
-    /// Queues a move to `at`, then a wheel turn of `delta` points with `mods` held.
+    /// Queues a move to `at`, then a wheel turn of `delta` points with `mods` held. A non-finite `delta` queues nothing.
     pub fn inject_wheel(&self, viewport: ViewportId, at: Pos2, delta: Vec2, mods: Mods) {
         injected::inject_wheel(&self.ctx, viewport, at, delta, mods);
     }
@@ -131,6 +139,29 @@ impl WindowHost {
     /// Queues the release of what `released` names, at `at` or where the injected pointer is.
     pub fn inject_release(&self, viewport: ViewportId, at: Option<Pos2>, released: Released) {
         injected::inject_release(&self.ctx, viewport, at, released);
+    }
+
+    /// Queues one pointer step in `viewport` as a device would send it, one pass per event, with the pen's reading
+    /// for a pen: its pass reads the reading in place of the tablet's.
+    pub fn inject_pointer(&self, viewport: ViewportId, step: InjectedPointer) {
+        injected::inject_pointer(&self.ctx, viewport, step);
+    }
+
+    /// Queues `key` held down in `viewport` with no key event, on a pass of its own: no shortcut or key stage sees it,
+    /// only [`injected_holds`](Self::injected_holds), until [`inject_let_go`](Self::inject_let_go). It ends where
+    /// injected input is dropped: a withdrawal, a window focus loss, a cancel, the end of the injection session.
+    pub fn inject_hold(&self, viewport: ViewportId, key: Key) {
+        injected::inject_hold(&self.ctx, viewport, key, true);
+    }
+
+    /// Queues the release of a key [`inject_hold`](Self::inject_hold) holds, on a pass of its own.
+    pub fn inject_let_go(&self, viewport: ViewportId, key: Key) {
+        injected::inject_hold(&self.ctx, viewport, key, false);
+    }
+
+    /// The keys [`inject_hold`](Self::inject_hold) holds in `viewport`, as of its running pass.
+    pub fn injected_holds(&self, viewport: ViewportId) -> Vec<Key> {
+        injected::holds(&self.ctx, viewport)
     }
 
     /// Holds Caps Lock on or off in place of the platform's state; `None` returns to the platform's.
@@ -170,6 +201,12 @@ impl WindowHost {
         injected::inject_text(&self.ctx, viewport, text);
     }
 
+    /// Queues `event` as the platform's input method would deliver it (a preedit or a commit), behind earlier
+    /// injected input.
+    pub fn inject_ime(&self, viewport: ViewportId, event: egui::ImeEvent) {
+        injected::inject_ime(&self.ctx, viewport, event);
+    }
+
     /// Withdraws the injected input of `viewport` (the document changed) at its next input hook: a step whose pass
     /// has not run and the queue behind it; what is dropped counts as withdrawn
     /// ([`take_injected_withdrawn`](Self::take_injected_withdrawn)). Called from the raw input hook, so every
@@ -178,9 +215,17 @@ impl WindowHost {
         injected::withdraw(&self.ctx, viewport);
     }
 
-    /// Drops every injected queue and step in flight; true when anything was pending.
+    /// Drops every injected queue and step in flight, and the keys [`inject_hold`](Self::inject_hold) holds; true
+    /// when anything was pending.
     pub fn cancel_injected(&self) -> bool {
         injected::cancel(&self.ctx)
+    }
+
+    /// Ends the injection session: the automation connection that fed it is gone. Drops every queue and step in
+    /// flight, queues the release of every button, key and modifier injected input holds (they run on each
+    /// viewport's next pass), and returns Caps Lock to the platform's state.
+    pub fn end_injection(&self) {
+        injected::end(&self.ctx);
     }
 
     /// Whether no injected step is queued or awaits its pass: the application may answer its waiters.
@@ -223,6 +268,18 @@ impl WindowHost {
         let facts = PerViewport::<Record>::with(&self.ctx, viewport, |record| record.facts)?;
         let info = window_info(&self.ctx, viewport, &base_shell(&self.ctx));
         Some(WindowFacts { inner: facts.inner?, outer: facts.outer, scale: scale_of(&self.ctx, &facts), state: info.state, focused: facts.focused })
+    }
+
+    /// The window that has the keys: the one the platform reports focused, else the main window. A key the platform
+    /// takes from the windows (a native menu's key equivalent) belongs to it.
+    pub fn key_window(&self) -> ViewportId {
+        viewports::key_window(&self.ctx)
+    }
+
+    /// Whether a text field has the keys in [`key_window`](Self::key_window), as its last pass ended: the focused
+    /// stop types text, or egui focus is on a text edit the app drew itself.
+    pub fn typing(&self) -> bool {
+        crate::runtime::focus::typing(&self.ctx, self.key_window())
     }
 
     /// `previous` (or a new record) updated to where `viewport`'s window is, recorded as an app window's saved
@@ -288,6 +345,12 @@ impl WindowHost {
         }
         let captions = PerViewport::<Record>::with(&self.ctx, viewport, |record| record.captions.clone());
         frame_of(window_info(&self.ctx, viewport, &base_shell(&self.ctx)).chrome, captions)
+    }
+
+    /// The desktop the app's windows open on, as the installed frame decision detected it; `None` when the app
+    /// installed no decision (an embedded shell, a trial). The caption buttons take the desktop's icon theme from it.
+    pub fn desktop(&self) -> Option<Desktop> {
+        shared(&self.ctx, |shared| shared.desktop.clone())
     }
 
     /// Where the exclusive parts of `viewport`'s window lay in its last complete pass: the caption buttons, the edge

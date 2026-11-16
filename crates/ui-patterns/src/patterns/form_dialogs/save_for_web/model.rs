@@ -7,10 +7,12 @@ use super::{SaveForWebDialog, four_up_variants};
 use crate::patterns::form_dialogs::host_requests::PreviewRequest;
 use crate::patterns::form_dialogs::sizing::Resample;
 use crate::runtime::env::Label;
-use crate::runtime::memory::{MemoryStage, SaveKey, unique};
-use egui::Ui;
+use crate::runtime::memory::SaveKey;
+use craft_behavior::{Selection, SelectionChange, SelectionModel};
+use egui::Context;
 use egui::load::SizedTexture;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The formats of Save for Web.
@@ -179,6 +181,62 @@ pub struct SaveForWebOptions {
     pub percent: f64,
     /// How the pixels are made when the size differs from the document's.
     pub resample: Resample,
+    /// The palette colours the user edited, by index, as red, green and blue.
+    #[serde(default)]
+    pub palette_edits: BTreeMap<u16, [u8; 3]>,
+    /// Which slices of the document the file holds.
+    #[serde(default)]
+    pub slices: WebSlices,
+    /// Whether the export writes an HTML file beside the images.
+    #[serde(default = "html_default")]
+    pub html: bool,
+}
+
+/// The serde default of [`SaveForWebOptions::html`]: on.
+fn html_default() -> bool {
+    true
+}
+
+/// Which slices of the document Save for Web writes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum WebSlices {
+    /// The whole image as one file.
+    #[default]
+    All,
+    /// The user slices.
+    User,
+    /// The slices with these numbers.
+    Selected(Vec<u32>),
+}
+
+impl WebSlices {
+    /// The numbers of the selected slices; none unless the choice is `Selected`.
+    pub(super) fn selected(&self) -> &[u32] {
+        match self {
+            WebSlices::Selected(numbers) => numbers,
+            _ => &[],
+        }
+    }
+
+    /// A click on slice `number`: it becomes the one selected slice, or with `add` (Shift) it is added to the
+    /// selection or, when already selected, removed from it.
+    pub(super) fn select(&mut self, number: u32, add: bool) {
+        let items = self.selected().to_vec();
+        let last = items.last().copied();
+        let mut selection = Selection::new(items, last, last);
+        selection.apply(if add { SelectionChange::Toggle(number) } else { SelectionChange::Set(vec![number]) });
+        *self = WebSlices::Selected(selection.items);
+    }
+}
+
+/// A slice of the document: its number and its rectangle in document pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WebSlice {
+    /// The slice's number.
+    pub number: u32,
+    /// The slice's rectangle in document pixels.
+    pub rect: egui::Rect,
 }
 
 impl Default for SaveForWebOptions {
@@ -204,11 +262,20 @@ impl Default for SaveForWebOptions {
             metadata: WebMetadata::Copyright,
             percent: 100.0,
             resample: Resample::Bicubic,
+            palette_edits: BTreeMap::new(),
+            slices: WebSlices::All,
+            html: true,
         }
     }
 }
 
 impl SaveForWebOptions {
+    /// The options as the next open remembers them: the slices and palette edits belong to one document, so they
+    /// are left at their defaults.
+    pub(super) fn without_document_fields(&self) -> Self {
+        SaveForWebOptions { slices: WebSlices::default(), palette_edits: BTreeMap::new(), ..self.clone() }
+    }
+
     /// Whether the matte row shows: the matte fills the transparency of formats that cannot keep it.
     pub fn has_matte(&self) -> bool {
         !matches!(self.format, WebFormat::Png24 | WebFormat::WebP) || !self.transparency
@@ -240,9 +307,10 @@ impl WebPreset {
         WebPreset { name: name.into(), options }
     }
 
-    /// Whether the preset is what `current` shows apart from the size.
+    /// Whether the preset is what `current` shows apart from the size, the slices and the palette edits.
     pub fn is_set_in(&self, current: &SaveForWebOptions) -> bool {
-        self.options == SaveForWebOptions { percent: self.options.percent, ..current.clone() }
+        let own = &self.options;
+        own == &SaveForWebOptions { percent: own.percent, slices: own.slices.clone(), palette_edits: own.palette_edits.clone(), ..current.clone() }
     }
 }
 
@@ -263,23 +331,32 @@ pub struct WebVariant {
     pub colors: Option<u16>,
     /// The texture is a reduced proxy (the long side is capped at 2048 px).
     pub proxy: bool,
+    /// The palette the encode used, as red, green and blue, when it is an indexed format.
+    pub palette: Option<Vec<[u8; 3]>>,
 }
 
 impl WebVariant {
     /// The encoded pane `index` of `revision`, shown from `texture`.
     pub fn new(index: usize, revision: u64, texture: SizedTexture, bytes: u64) -> Self {
-        WebVariant { index, revision, picture: Ok(texture), bytes, colors: None, proxy: false }
+        WebVariant { index, revision, picture: Ok(texture), bytes, colors: None, proxy: false, palette: None }
     }
 
     /// The pane `index` of `revision` whose encode failed with `message`.
     pub fn failed(index: usize, revision: u64, message: impl Into<Label>) -> Self {
-        WebVariant { index, revision, picture: Err(message.into()), bytes: 0, colors: None, proxy: false }
+        WebVariant { index, revision, picture: Err(message.into()), bytes: 0, colors: None, proxy: false, palette: None }
     }
 
     /// The palette size of an indexed format.
     #[must_use]
     pub fn colors(mut self, colors: u16) -> Self {
         self.colors = Some(colors);
+        self
+    }
+
+    /// The palette the encode used.
+    #[must_use]
+    pub fn palette(mut self, palette: Vec<[u8; 3]>) -> Self {
+        self.palette = Some(palette);
         self
     }
 
@@ -320,11 +397,9 @@ impl SaveForWebResult {
     /// Stores the settings and the view for the next open of a dialog built with
     /// [`SaveForWebDialog::remember`]. The app calls it after the file is written; without a remember key it does
     /// nothing.
-    pub fn remember(&self, ui: &Ui) {
+    pub fn remember(&self, ctx: &Context) {
         if let Some((key, last)) = &self.remember {
-            let mut stage = MemoryStage::open(ui.ctx(), unique(("craft_ui::save_for_web_result", key.as_str())));
-            *stage.saved::<Option<Last>>(key) = Some(last.clone());
-            stage.write_back();
+            crate::runtime::memory::set_saved_value(ctx, key, Some(last.clone()));
         }
     }
 }

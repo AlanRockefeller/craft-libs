@@ -19,17 +19,15 @@ use craft_ui::patterns::presets::{
 use craft_ui::primitives::IconSpec;
 use craft_ui::runtime::env::{Env, Label, UnitKind};
 use craft_ui::runtime::overlay::CloseReason;
-use craft_ui::tile_grid::TileZoom;
 use egui::{Pos2, Response, Ui};
 
+use super::panel::{BRUSH_THUMBS, picks_of};
 use super::settings::{BrushCardPart, BrushCardParts, BrushPickerSettings};
 use super::words::BrushPresetWords;
 use crate::ui::brush_settings::{BrushSizeField, TipAngle, TipEllipse};
 
 /// The largest diameter the picker's Size row allows until the app sets its engine's limit.
 const DEFAULT_MAX_DIAMETER: f64 = 5000.0;
-/// How far one key press changes the thumbnail scale.
-const SCALE_STEP: f64 = 0.05;
 
 /// The brush values the picker's head edits, given by the app each pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -67,7 +65,8 @@ pub enum BrushPick<K> {
     /// A double click or Enter on a preset: the binding holds it and the picker closes.
     Activate(K),
     /// A browser event: `Rename` (also from the gear's Rename Brush…, which opens the name field on the current
-    /// preset), `Delete` (also from the gear), `Reorder`, `MoveTo` and the footer's buttons.
+    /// preset), `Delete` (also from the gear), `Reorder`, `MoveTo` and the footer's buttons other than New, which
+    /// arrives as `NewPreset`.
     List(PresetEvent<K>),
     /// Brush Settings…: open the Brush Settings panel.
     OpenSettings,
@@ -242,6 +241,8 @@ impl Opened {
 /// - **Presets.** The browser, with the scale slider (0.15 to 2.0) in its footer. The tip alone is a grid with the
 ///   size as each caption; the name or the stroke is a list, with the stroke band while the stroke shows. A click
 ///   picks and keeps the picker open; a double click or Enter picks and closes it.
+/// - **Compact form.** [`compact`](Self::compact) leaves out the search row, the gear and the browser and keeps the
+///   field, the popover with its head, the revert and the chip; [`rows`](Self::rows) draws the app's rows under the head.
 /// - **Opening.** The closed field, or the app at a point with [`open_at`](Self::open_at) (a right-click on the
 ///   canvas), without the field. With [`resizable`](Self::resizable) the popover's grips resize it and the size is
 ///   saved.
@@ -269,6 +270,9 @@ pub struct BrushPresetPicker<'a, K: Value + Eq + Hash> {
     #[prop]
     resizable: Option<SaveKey>,
     opened_at: Option<(Pos2, Bind<'a, bool>)>,
+    compact: bool,
+    enabled: bool,
+    app_rows: Option<Box<dyn FnOnce(&mut Ui) + 'a>>,
 }
 
 impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
@@ -292,7 +296,29 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
             gear_rows: None,
             resizable: None,
             opened_at: None,
+            compact: false,
+            enabled: true,
+            app_rows: None,
         }
+    }
+
+    /// The compact form: the popover shows only the head (Size, Hardness for round tips, the tip widget), without the
+    /// search row, the gear or the browser.
+    pub fn compact(mut self, on: bool) -> Self {
+        self.compact = on;
+        self
+    }
+
+    /// Whether the picker takes input: off disables its field, its head and its popover. It is enabled by default.
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    /// App rows drawn under the head.
+    pub fn rows(mut self, rows: impl FnOnce(&mut Ui) + 'a) -> Self {
+        self.app_rows = Some(Box::new(rows));
+        self
     }
 
     /// Opens the popover at `at`, a point in the parent's layer space, while `open` is true, and shows no field: the
@@ -304,11 +330,25 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
 
     /// Shows the picker and returns this pass's edits and picks, in order.
     pub fn show(self, ui: &mut Ui) -> BrushPresetPickerOutput<K> {
-        let BrushPresetPicker { label, mut current, rows, mut state, values, max_diameter, import, mut gear_rows, resizable, mut opened_at } = self;
+        let BrushPresetPicker {
+            label,
+            mut current,
+            rows,
+            mut state,
+            values,
+            max_diameter,
+            import,
+            mut gear_rows,
+            resizable,
+            mut opened_at,
+            compact,
+            enabled,
+            mut app_rows,
+        } = self;
         let env = Env::of(ui);
         let words = env.words::<BrushPresetWords>();
         let name: std::sync::Arc<str> = std::sync::Arc::from(label.as_str());
-        let shown = Stack::new().label(label.clone()).show(ui, |ui, cx| {
+        let shown = Stack::new().label(label.clone()).enabled(enabled).show(ui, |ui, cx| {
             let before = match state.reborrow().read(cx) {
                 Some(Mixed::Same(held)) => held,
                 _ => BrushPickerState::new(),
@@ -346,6 +386,9 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
                     });
                 });
                 Divider::horizontal().show(ui);
+                if let Some(rows) = app_rows.take() {
+                    rows(ui);
+                }
             };
             // The buttons and the gear at the reading end of the browser's search row.
             let tools = |ui: &mut Ui| {
@@ -429,15 +472,11 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
                 .caption(env.units().number(values.diameter.round(), 0..=0))
                 .cell_shape(CellShape::Square)
                 .view(if parts.tip_only() { PresetView::Grid } else { PresetView::List })
+                .browser(!compact)
                 .toolbar(true)
                 .search(before.search)
                 .keep_open()
-                .thumb_range(TileZoom::bounded(
-                    f64::from(*BrushPickerSettings::SCALE_RANGE.start()),
-                    f64::from(*BrushPickerSettings::SCALE_RANGE.end()),
-                    SCALE_STEP,
-                    1.0,
-                ))
+                .thumb_range(BRUSH_THUMBS)
                 .footer(PresetFooterOptions::new().new_group(false))
                 .browser_id(browser_id)
                 .head(head)
@@ -453,7 +492,7 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
             if let Some(key) = out.picked.clone() {
                 picks.insert(0, if out.closed { BrushPick::Activate(key) } else { BrushPick::Select(key) });
             }
-            picks.extend(std::mem::take(&mut out.events).into_iter().map(BrushPick::List));
+            picks.extend(picks_of(std::mem::take(&mut out.events)));
             let after = BrushPickerState { browser, parts: next_parts.get(), search: next_search.get() };
             let mut settings = None;
             if after != before {

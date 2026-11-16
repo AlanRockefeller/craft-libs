@@ -20,6 +20,10 @@ pub struct Knot {
     pub smooth: bool,
 }
 
+/// How close a handle lies to its anchor and still counts as retracted, in document units: PhotoCraft's straightness
+/// tolerance, so a segment whose handles sit a hair off their anchors is straight for every reader.
+const RETRACTED: f64 = 1e-9;
+
 impl Knot {
     /// A knot with its anchor, both handles and whether it is smooth.
     pub fn new(anchor: Point, in_ctrl: Point, out_ctrl: Point, smooth: bool) -> Self {
@@ -44,9 +48,9 @@ impl Knot {
         }
     }
 
-    /// Whether the handle on `side` lies on the anchor.
+    /// Whether the handle on `side` lies on the anchor, within 1e-9 document units.
     pub fn retracted(&self, side: HandleSide) -> bool {
-        self.handle(side) == self.anchor
+        self.handle(side).distance(self.anchor) < RETRACTED
     }
 }
 
@@ -285,6 +289,18 @@ pub enum PathEdit {
         /// The move of the new anchor, in document units.
         by: Vec2,
     },
+    /// Add an anchor to the segment leaving `segment` at `t`, then move it by `by`.
+    #[non_exhaustive]
+    InsertAnchor {
+        /// The path's host key.
+        path: u64,
+        /// The anchor the segment leaves.
+        segment: KnotRef,
+        /// Position along the segment, 0..=1.
+        t: f64,
+        /// The move of the new anchor, in document units.
+        by: Vec2,
+    },
     /// The Curvature tool's double-click or Enter on an anchor: a smooth knot becomes a corner
     /// with retracted handles and a corner becomes smooth, then the subpath reflows.
     #[non_exhaustive]
@@ -294,6 +310,25 @@ pub enum PathEdit {
         /// The toggled anchor.
         knot: KnotRef,
     },
+}
+
+/// A request to delete anchors of a path.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct AnchorDelete {
+    /// The path's host key.
+    pub path: u64,
+    /// The selected anchors.
+    pub anchors: Vec<KnotRef>,
+    /// Segments are selected too (the live-shape prompt applies).
+    pub segments: bool,
+}
+
+impl AnchorDelete {
+    /// A delete of `anchors` of the path keyed `path`; `segments` is whether segments are selected too.
+    pub fn new(path: u64, anchors: Vec<KnotRef>, segments: bool) -> Self {
+        AnchorDelete { path, anchors, segments }
+    }
 }
 
 impl PathEdit {
@@ -327,6 +362,11 @@ impl PathEdit {
         PathEdit::InsertCurvature { path, segment, t, by }
     }
 
+    /// The insert of an anchor into the segment leaving `segment` at `t`, moved by `by`.
+    pub fn insert_anchor(path: u64, segment: KnotRef, t: f64, by: Vec2) -> Self {
+        PathEdit::InsertAnchor { path, segment, t, by }
+    }
+
     /// The Curvature tool's toggle of `knot` between smooth and corner.
     pub fn toggle_curvature(path: u64, knot: KnotRef) -> Self {
         PathEdit::ToggleCurvature { path, knot }
@@ -341,6 +381,7 @@ impl PathEdit {
             | PathEdit::Convert { path, .. }
             | PathEdit::MoveCurvature { path, .. }
             | PathEdit::InsertCurvature { path, .. }
+            | PathEdit::InsertAnchor { path, .. }
             | PathEdit::ToggleCurvature { path, .. } => path,
         }
     }

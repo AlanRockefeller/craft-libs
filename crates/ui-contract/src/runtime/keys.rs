@@ -32,6 +32,8 @@ pub(crate) use input::{input_hook, queue_nav, take_menu_keys, take_nav};
 pub use intents::Intents;
 #[doc(hidden)]
 pub use intents::intents_of;
+#[doc(hidden)]
+pub use intents::leave_to_window;
 #[cfg(feature = "testing")]
 pub(crate) use intents::lent_taken;
 #[doc(hidden)]
@@ -138,6 +140,8 @@ struct Batch {
     /// The bare Tab presses the input hook took from egui: each toggles the window's panels or moves focus, which
     /// `take_nav` decides once this pass's root env is installed.
     tabs: Vec<TabPress>,
+    /// A lone Alt in a field that holds drafts was refused: the input hook calls `frame::refuse`.
+    refused: bool,
 }
 
 /// A bare Tab or Shift+Tab press.

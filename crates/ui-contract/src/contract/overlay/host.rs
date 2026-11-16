@@ -148,7 +148,7 @@ pub(crate) fn host(ctx: &Context, layer: &Layer<'_>, body: &mut dyn FnMut(&mut U
     }
     let size = layer.size.or_else(|| areas::layer_rect(ctx, area).map(|rect| rect.size()));
     let placed = placement(ctx, layer, size, bounds, anchor);
-    let tier = overlay.rank.tier();
+    let tier = overlay::layer_tier(ctx, overlay.rank);
     if sized && areas::layer_rect(ctx, area).is_none() {
         areas::seed_area(ctx, areas::layer_of(tier, area), placed.at, placed.room);
     }
@@ -181,7 +181,7 @@ pub(crate) fn host(ctx: &Context, layer: &Layer<'_>, body: &mut dyn FnMut(&mut U
         let recorded = overlay.opener.as_ref().and_then(|first| focus::stop_rec(ctx, (first.id, None))).map(|rec| rec.stop.key());
         owned.map(|rec| rec.stop.key()).or(pressed).or(recorded).or_else(|| focus::focused_stop(ctx))
     });
-    overlay::begin_layer(ctx, layer.id, layer.exiting, placed.side);
+    overlay::begin_layer(ctx, layer.id, tier, layer.exiting, placed.side);
     let shown = areas::show_layer(ctx, &spec, |ui| {
         if let Some(region) = layer.region {
             ui.set_clip_rect(ui.clip_rect().intersect(region));
@@ -235,7 +235,8 @@ pub(crate) fn host_window(ctx: &Context, layer: &Layer<'_>, rect: Rect) -> Layer
     let overlay = layer.overlay;
     let mut memory = recall(layer, ctx);
     let scope = (overlay.focus != FocusPolicy::NONE).then_some(overlay.focus);
-    let mut entry = OpenEntry::new(layer.id, overlay.rank, overlay.keys, rect, areas::layer_of(overlay.rank.tier(), area_id(layer.id)));
+    let mut entry =
+        OpenEntry::new(layer.id, overlay.rank, overlay.keys, rect, areas::layer_of(overlay::layer_tier(ctx, overlay.rank), area_id(layer.id)));
     entry.scoped = scope.is_some();
     entry.window = true;
     overlay::record(ctx, entry);
@@ -243,43 +244,6 @@ pub(crate) fn host_window(ctx: &Context, layer: &Layer<'_>, rect: Rect) -> Layer
     close_family(ctx, layer, dismissed.is_some(), &mut memory);
     remember(layer, ctx, memory);
     LayerOut { dismissed }
-}
-
-/// The focus scope of a modal the app draws itself: Tab stays inside, focus stays where it is when it opens, and
-/// Escape and Enter go on to the app, which answers them for its dialog and the egui popups in it.
-const BESIDE: FocusPolicy = FocusPolicy { kind: craft_behavior::ScopeKind::Dialog, trap: true, initial: focus::Initial::Keep, ..FocusPolicy::NONE };
-
-/// Shows `modal`, a modal dialog the app draws itself beside a dialog host's, as a modal layer of the layer stack:
-/// its place in the order (inside a dialog host's `stack_place`, the stack's), the top modal and egui's modal
-/// layer when it is on top, the keys of the framework controls inside it and below it, and the parent of the layers
-/// opened from inside it. `id` names the layer: the dialog's id on the stack. The app answers its own Escape and
-/// Enter; [`close_beside_modal`] closes the layers opened from inside it when the dialog closes.
-pub fn show_beside_modal<T>(ctx: &Context, id: Id, modal: egui::Modal, body: impl FnOnce(&mut Ui) -> T) -> egui::ModalResponse<T> {
-    let parent = overlay::drawing_parent(ctx);
-    let response = modal.show(ctx, |ui| {
-        let real = !ui.is_sizing_pass();
-        if real {
-            focus::push_scope(ctx, id, BESIDE, None);
-            overlay::begin_layer(ctx, id, false, None);
-        }
-        let out = body(ui);
-        if real {
-            overlay::end_layer(ctx);
-            focus::pop_scope(ctx);
-        }
-        out
-    });
-    let shown = &response.response;
-    let mut entry = OpenEntry::new(id, Rank::modal(Backdrop::None), craft_behavior::OwnerClass::Dialog, shown.rect, shown.layer_id);
-    entry.parent = parent;
-    entry.scoped = true;
-    overlay::record(ctx, entry);
-    response
-}
-
-/// The modal the app drew with [`show_beside_modal`] as `id` closed: the layers opened from inside it close too.
-pub fn close_beside_modal(ctx: &Context, id: Id) {
-    overlay::close_descendants(ctx, id);
 }
 
 /// Paints the ghost egui layer from runtime data: the drag preview and drop mark, and the painted cursor the cursor

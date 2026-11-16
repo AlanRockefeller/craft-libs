@@ -51,6 +51,8 @@ pub enum NoticeEnd {
     Closed(ToastId),
     /// The timeout passed.
     Expired(ToastId),
+    /// The window's card limit removed the notice to make room for a newer one.
+    Dropped(ToastId),
     /// "Don't Show Again": the app stores `key` as silenced.
     #[non_exhaustive]
     Silenced {
@@ -87,10 +89,12 @@ fn posted_slot() -> egui::Id {
     unique("craft_ui.notice_center")
 }
 
-/// The app's way to post notices to a window. It holds only the window and its timeout: the queue, the timers, the cap
-/// of three cards, the hover pause and the announcement are the toast service's. A body posts to its shell's window
-/// (`BodyCx::shell`). A notice with a dismiss key shows a "Don't Show Again"
-/// action; `show` reports how posted notices ended.
+/// The app's way to post notices to a window. It holds only the window and its timeout: the queue, the timers, the
+/// hover pause and the announcement are the toast service's. So is the cap of `toast::MAX_CARDS` cards: a new notice
+/// always shows, and makes room by dropping the oldest earlier card that would leave by itself (no action, a timeout),
+/// else the oldest; `show` reports a dropped notice as `NoticeEnd::Dropped`. A body posts to its shell's window
+/// (`BodyCx::shell`). A notice with a dismiss key shows a "Don't Show Again" action; `show` reports how posted notices
+/// ended.
 #[derive(Clone, Debug, PartialEq, crate::contract::Pattern, crate::contract::Props)]
 pub struct NoticeCenter {
     /// The window whose toasts show the notices.
@@ -156,6 +160,7 @@ impl NoticeCenter {
                     (ToastEnd::Action(_), Some(key)) => NoticeEnd::Silenced { id: *id, key: key.clone() },
                     (ToastEnd::Action(_) | ToastEnd::Dismissed, _) => NoticeEnd::Closed(*id),
                     (ToastEnd::Expired, _) => NoticeEnd::Expired(*id),
+                    (ToastEnd::Dropped, _) => NoticeEnd::Dropped(*id),
                 });
                 false
             });

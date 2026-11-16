@@ -13,6 +13,7 @@ mod group;
 
 mod floating;
 mod panels;
+mod rail;
 mod root;
 mod spec;
 mod splitter;
@@ -37,7 +38,9 @@ pub use event::{DockEvent, FloatSpace, HidePanels};
 pub use group::{DockGroup, DockGroupOutput, DockGroupStyle, GroupGrip, GroupGripOutput, GroupGripStyle, HeaderHook};
 
 pub use floating::{FloatingGroup, FloatingGroupOutput, FloatingGroupStyle};
-pub use panels::DockPanels;
+pub use panels::{DockPanels, request_actions};
+#[doc(hidden)]
+pub use panels::{close_requests, open_requests};
 pub use root::{DockRoot, DockRootOutput, DockRootStyle};
 pub use spec::{DockHeights, PanelSpec};
 pub use splitter::{Splitter, SplitterStyle};
@@ -56,8 +59,9 @@ mod iconic;
 pub use dock_column::{
     DockColumn, DockColumnOutput, DockColumnStyle, GroupSize, GroupView, fit_widths, group_heights, scale_widths, stacked, width_bounds,
 };
-pub use flyout::{Flyout, GroupAt};
-pub use iconic::{IconicColumn, IconicColumnOutput, IconicColumnStyle, IconicSizes};
+pub use flyout::{Flyout, FlyoutOutput, FlyoutShown, FlyoutStyle, GroupAt};
+pub use iconic::{FlyoutResize, IconicColumn, IconicColumnOutput, IconicColumnStyle, IconicSizes};
+pub use rail::{rail_actions, rail_lit};
 pub use window_menu::{WindowMenuRows, WindowMenuRowsOutput};
 
 use crate::contract::{

@@ -1,5 +1,7 @@
-//! `SwatchesPanel`: the Swatches panel on a [`SwatchLibrary`]: groups of flat touching squares, click to use, the panel
-//! menu for new swatches, groups and swatch files.
+//! `SwatchesPanel`: the Swatches panel on the groups of a [`SwatchLibrary`]: groups of flat touching squares, click to
+//! use, the panel menu for new swatches, groups and swatch files. The panel never writes the library: it reports each
+//! change as a resolved [`SwatchEdit`] (new, rename, delete, move, group edits, import) that the host runs, with
+//! [`SwatchLibrary::apply`] for an in-memory host.
 
 mod library;
 mod menu;
@@ -7,7 +9,7 @@ mod panel;
 #[cfg(feature = "screen-testing")]
 mod stories;
 
-pub use library::{SwatchAt, SwatchKey, SwatchLibrary, SwatchesState};
+pub use library::{SwatchAt, SwatchEdit, SwatchKey, SwatchLibrary, SwatchesState, swatch_rows};
 pub use menu::{SwatchesCommand, SwatchesFileOutput, SwatchesMenu, SwatchesMenuOutput};
 pub use panel::{SwatchesPanel, SwatchesPanelOutput};
 
@@ -43,6 +45,7 @@ craft_ui::words! {
         converted: count "swatches.converted" = "{n} color was converted to RGB." | "{n} colors were converted to RGB.";
         kinds_dropped: count "swatches.kindsDropped" = "{n} spot or global color was written as a process color." | "{n} spot or global colors were written as process colors.";
         truncated: count "swatches.truncated" = "{n} color past the 256 the format holds was left out." | "{n} colors past the 256 the format holds were left out.";
+        transparent_kept: count "swatches.transparentKept" = "{n} color was kept transparent." | "{n} colors were kept transparent.";
         names_cut: count "swatches.namesCut" = "{n} name was cut to the length the format holds." | "{n} names were cut to the length the format holds.";
         /// The value read for a colour-book colour, which the panel cannot show.
         book_color: "swatches.bookColor" = "Color book color";

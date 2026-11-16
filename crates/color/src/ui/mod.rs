@@ -2,8 +2,9 @@
 //!
 //! - Fields and strips of a colour model: [`ColorArea`], [`ColorStrip`], [`ColorRamp`], [`ColorDisc`], [`ColorWheel`].
 //! - The picker: [`ColorPicker`], its popover and dialog, the hex and readout fields, the choice list and the droppers.
-//! - Wells and paints: [`SwatchPair`], [`PaintChip`], [`PaintList`], [`SwatchPalette`], [`SwatchTable`].
-//! - Panels: [`ColorPanel`], [`HarmonyPanel`], [`SwatchesPanel`].
+//! - Wells and paints: [`SwatchPair`], [`PaintChip`], [`PaintList`], [`SwatchPalette`], `craft_ui::choice::SwatchTable`.
+//! - Panels: [`ColorPanel`], [`HarmonyPanel`], [`SwatchesPanel`], [`InfoPanel`]; over a canvas: [`ColorHud`].
+//! - Gradients: the [`gradient`] module (`GradientEditor`, `GradientStops`, the stop rules, `GradientRamp`).
 //! - Sampling: the eyedropper, colour samplers and the screen picker.
 //! - Imaging prompts: [`LutPicker`] and [`ProfileMismatchDialog`].
 //!
@@ -16,8 +17,11 @@ mod choice;
 mod disc;
 mod droppers;
 mod eyedropper;
+pub mod gradient;
 mod harmony;
 mod hex;
+mod hud;
+mod info;
 mod lut_picker;
 mod paint_chip;
 mod pair;
@@ -29,6 +33,7 @@ mod popover;
 mod profile_prompts;
 mod ramp;
 mod readout;
+mod sample_size;
 mod samplers;
 mod screen_picker;
 mod strip;
@@ -52,13 +57,15 @@ pub use harmony::{
     HarmonyWheelOutput, HarmonyWords,
 };
 pub use hex::{HexPair, HexPairField, PairCodec};
+pub use hud::{ColorHud, ColorHudOutput};
+pub use info::{InfoColor, InfoPanel, InfoReadings, InfoWords};
 pub use lut_picker::{LutChoice, LutPicker, LutPickerOutput, LutWords};
 pub use paint_chip::{
     FillKind, GradientPreview, ImagePreview, Paint, PaintChip, PaintChipOutput, PaintEditor, PaintLink, PaintLinkKind, PaintList, PaintListEvent,
     PaintListOptions, PaintListOutput, PaintRow, PaintWords,
 };
 pub use pair::{PairWell, SwatchPair, SwatchPairOutput, Well};
-pub use palette::{SwatchPalette, SwatchPaletteOutput, SwatchRows, SwatchTable, SwatchTableOutput, SwatchTableStyle};
+pub use palette::{SwatchPalette, SwatchPaletteOutput};
 pub use panel::{
     ColorPanel, ColorPanelCommand, ColorPanelMenu, ColorPanelMode, ColorPanelOutput, ColorPanelRamp, ColorPanelState, ColorPanelWords, PanelTarget,
 };
@@ -71,15 +78,16 @@ pub use popover::{ColorPopover, ColorPopoverOutput};
 pub use profile_prompts::{ProfileAction, ProfileAnswer, ProfileMismatchDialog, ProfileMode, ProfileQuestion, ProfileStatus, ProfileWords};
 pub use ramp::{ColorRamp, ColorRampOutput, ColorRampStyle, ColorRampWords, Gamut, RampKind, RampPick};
 pub use readout::{ChannelEdit, ColorReadout, ColorReadoutOutput, ColorReadoutWords, ReadoutChannel};
+pub use sample_size::SampleSizeSelect;
 pub use samplers::{
-    ColorSamplerCommand, ColorSamplerMarks, ColorSamplerTool, ColorSamplers, MAX_SAMPLERS, SamplerCache, SamplerError, SamplerOptions,
-    SamplerOptionsOutput, SamplerReadout, SamplerReadouts, SamplerWords,
+    ColorSamplerCommand, ColorSamplerMarks, ColorSamplerPass, ColorSamplerTool, ColorSamplers, MAX_SAMPLERS, SamplerCache, SamplerCarry,
+    SamplerError, SamplerEvent, SamplerOptions, SamplerOptionsOutput, SamplerReadout, SamplerReadouts, SamplerWords,
 };
 pub use screen_picker::{CaptureResult, CaptureSource, LOUPE_PIXELS, LOUPE_ZOOM, ScreenColorPicker, ScreenPick, ScreenPickerWords, StillCapture};
 pub use strip::{ColorStrip, ColorStripStyle};
 pub use swatches::{
-    MAX_GROUPS, MAX_SWATCHES, SwatchAt, SwatchKey, SwatchLibrary, SwatchesCommand, SwatchesFileOutput, SwatchesMenu, SwatchesMenuOutput,
-    SwatchesPanel, SwatchesPanelOutput, SwatchesState, SwatchesWords,
+    MAX_GROUPS, MAX_SWATCHES, SwatchAt, SwatchEdit, SwatchKey, SwatchLibrary, SwatchesCommand, SwatchesFileOutput, SwatchesMenu, SwatchesMenuOutput,
+    SwatchesPanel, SwatchesPanelOutput, SwatchesState, SwatchesWords, swatch_rows,
 };
 pub use wheel::{
     ColorWheel, ColorWheelStyle, ColorWheelWords, WheelGeometry, WheelPart, hue_at, hue_direction, triangle_corners, triangle_point, triangle_sv,

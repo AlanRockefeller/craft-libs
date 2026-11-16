@@ -5,7 +5,7 @@
 //! |---|---|
 //! | The model | [`Action`], [`ActionStep`], [`ActionColor`], [`ActionInclude`] |
 //! | The list and its edits | [`ActionList`], [`ActionListError`], [`moved_index`] |
-//! | The file | [`ActionsFile`] (PhotoCraft's `actions.json`) |
+//! | The file | [`ActionsFile`] (PhotoCraft's `actions.json`), [`ActionsFileError`] |
 //! | Playback | [`ActionPlayer`], [`ActionRunner`], [`StepOutcome`], [`PlaybackBudget`], [`PlaybackReport`], [`StepFailure`], [`PlaybackRefusal`], [`MAX_PLAYBACK_STEPS`], [`MAX_PLAYBACK_DEPTH`] |
 //! | Recording | [`Recording`], [`ActionList::begin_recording`], [`ActionList::append_recorded`] |
 //!
@@ -22,8 +22,8 @@ mod recording;
 #[cfg(test)]
 mod tests;
 
-pub use file::ActionsFile;
-pub use list::{ActionList, ActionListError, moved_index};
+pub use file::{ActionsFile, ActionsFileError};
+pub use list::{ActionList, ActionListError, MergedFile, moved_index};
 pub use model::{Action, ActionColor, ActionInclude, ActionStep};
 pub use player::{
     ActionPlayer, ActionRunner, MAX_PLAYBACK_DEPTH, MAX_PLAYBACK_STEPS, PlaybackBudget, PlaybackRefusal, PlaybackReport, StepFailure, StepOutcome,

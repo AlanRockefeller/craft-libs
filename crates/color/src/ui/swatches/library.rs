@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use craft_ui::contract::ReorderMove;
-use craft_ui::patterns::presets::PresetState;
+use craft_ui::patterns::presets::{PresetRow, PresetState};
 
 use super::{MAX_GROUPS, MAX_SWATCHES, SwatchesWords};
 use crate::palette::{SwatchColor, SwatchEntry, SwatchGroup, SwatchReport};
@@ -75,6 +75,148 @@ impl SwatchAt {
     }
 }
 
+/// The swatch named `name` among `groups`.
+pub(super) fn find_swatch(groups: &[SwatchGroup], name: &str) -> Option<SwatchAt> {
+    groups.iter().enumerate().find_map(|(group, g)| g.entries.iter().position(|e| e.name == name).map(|index| SwatchAt { group, index }))
+}
+
+/// The first name of `template` (numbered from 1) no swatch of `groups` has.
+pub(super) fn free_name(groups: &[SwatchGroup], template: &str) -> String {
+    let taken: HashSet<&str> = groups.iter().flat_map(|g| g.entries.iter().map(|e| e.name.as_str())).collect();
+    (1..).map(|n| craft_i18n::fmt_plain(template, &[("n", &n.to_string())])).find(|name| !taken.contains(name.as_str())).unwrap_or_default()
+}
+
+/// `base`, or `base 1`, `base 2`… when a group of `groups` has it.
+pub(super) fn unique_group_name(groups: &[SwatchGroup], base: &str) -> String {
+    let taken = |n: &str| groups.iter().any(|g| g.name == n);
+    if !taken(base) { base.to_owned() } else { (1..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_default() }
+}
+
+/// The index of the group `key` is, or is in.
+pub(super) fn group_of(groups: &[SwatchGroup], key: &SwatchKey) -> Option<usize> {
+    match key {
+        SwatchKey::Swatch(name) => find_swatch(groups, name).map(|at| at.group),
+        SwatchKey::Group(name) => groups.iter().position(|g| g.name == *name),
+    }
+}
+
+/// Whether `key` names a row of `groups`.
+pub(super) fn has(groups: &[SwatchGroup], key: &SwatchKey) -> bool {
+    group_of(groups, key).is_some()
+}
+
+/// Whether the groups hold the most swatches a library may.
+pub(super) fn swatches_full(groups: &[SwatchGroup]) -> bool {
+    groups.iter().map(|g| g.entries.len()).sum::<usize>() >= MAX_SWATCHES
+}
+
+/// The name the swatch at `at` takes when renamed to `text`; `None` when `at` names nothing, the name is empty or
+/// another swatch has it.
+pub(super) fn swatch_rename(groups: &[SwatchGroup], at: SwatchAt, text: &str) -> Option<String> {
+    let name = text.trim();
+    groups.get(at.group)?.entries.get(at.index)?;
+    (!name.is_empty() && find_swatch(groups, name).is_none_or(|other| other == at)).then(|| name.to_owned())
+}
+
+/// The name group `index` takes when renamed to `text`; `None` when there is no such group, the name is empty or
+/// another group has it.
+pub(super) fn group_rename(groups: &[SwatchGroup], index: usize, text: &str) -> Option<String> {
+    let name = text.trim();
+    groups.get(index)?;
+    (!name.is_empty() && !groups.iter().enumerate().any(|(i, g)| i != index && g.name == name)).then(|| name.to_owned())
+}
+
+/// The flat rows of the browser: each group's header, then its swatches.
+fn flat<'a>(groups: impl IntoIterator<Item = &'a SwatchGroup>) -> Vec<SwatchKey> {
+    let mut rows = Vec::new();
+    for group in groups {
+        rows.push(SwatchKey::Group(group.name.clone()));
+        rows.extend(group.entries.iter().map(|e| SwatchKey::Swatch(e.name.clone())));
+    }
+    rows
+}
+
+/// The group and the slot swatches `names` land in when dropped at flat row `to` (counted over the rows that remain
+/// once they are out). The slot counts the entries that stay, so it survives taking the moved ones out.
+fn resolve_move(groups: &[SwatchGroup], names: &[&str], to: usize, parent: Option<&SwatchKey>) -> Option<(usize, usize)> {
+    let moved = |e: &SwatchEntry| names.contains(&e.name.as_str());
+    let remaining: Vec<SwatchKey> = flat(groups).into_iter().filter(|k| !matches!(k, SwatchKey::Swatch(n) if names.contains(&n.as_str()))).collect();
+    let before = &remaining[..to.min(remaining.len())];
+    let (group, slot) = match before.last() {
+        Some(SwatchKey::Swatch(n)) => {
+            let at = find_swatch(groups, n)?;
+            let slot = groups[at.group].entries[..=at.index].iter().filter(|e| !moved(e)).count();
+            match parent {
+                Some(SwatchKey::Group(g)) if groups[at.group].name != *g => (groups.iter().position(|x| x.name == *g)?, 0),
+                _ => (at.group, slot),
+            }
+        }
+        Some(SwatchKey::Group(g)) => (groups.iter().position(|x| x.name == *g)?, 0),
+        None => (0, 0),
+    };
+    (group < groups.len()).then_some((group, slot))
+}
+
+/// The slot groups `names` land in when dropped at flat row `to`, counted in the groups that stay.
+fn group_slot(groups: &[SwatchGroup], names: &[&str], to: usize) -> usize {
+    let remaining = flat(groups.iter().filter(|g| !names.contains(&g.name.as_str())));
+    remaining[..to.min(remaining.len())].iter().filter(|k| matches!(k, SwatchKey::Group(_))).count()
+}
+
+/// The `at` of each edit that moves `moved` (in library order) one by one within `order`, so that they end up together
+/// at `slot` among the names that stay. Edits run in turn, so each index treats the moved names still waiting in the
+/// list as absent: only the staying names and the ones already placed count.
+fn move_slots(order: &[&str], moved: &[&str], slot: usize) -> Vec<usize> {
+    let mut list: Vec<&str> = order.to_vec();
+    let mut slots = Vec::with_capacity(moved.len());
+    for (i, name) in moved.iter().enumerate() {
+        list.retain(|n| n != name);
+        let anchors = slot + i;
+        let mut at = if anchors == 0 { 0 } else { list.len() };
+        let mut seen = 0;
+        if anchors > 0 {
+            for (index, n) in list.iter().enumerate() {
+                if !moved[i + 1..].contains(n) {
+                    seen += 1;
+                    if seen == anchors {
+                        at = index + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        list.insert(at, *name);
+        slots.push(at);
+    }
+    slots
+}
+
+/// The edits a reorder of the browser makes, one per moved swatch or group in library order; each `at` counts the
+/// edits before it, so the host keeps their order. Anything the library cannot do gives none.
+pub(super) fn reorder_edits(groups: &[SwatchGroup], mv: &ReorderMove<SwatchKey>) -> Vec<SwatchEdit> {
+    if mv.copy {
+        return Vec::new();
+    }
+    let swatches: Option<Vec<&str>> = mv.keys.iter().map(|k| if let SwatchKey::Swatch(n) = k { Some(n.as_str()) } else { None }).collect();
+    let group_names: Option<Vec<&str>> = mv.keys.iter().map(|k| if let SwatchKey::Group(n) = k { Some(n.as_str()) } else { None }).collect();
+    if let Some(names) = swatches {
+        let Some((group, slot)) = resolve_move(groups, &names, mv.to, mv.parent.as_ref()) else { return Vec::new() };
+        let target = &groups[group];
+        let order: Vec<&str> = target.entries.iter().map(|e| e.name.as_str()).collect();
+        let moved: Vec<&str> = groups.iter().flat_map(|g| g.entries.iter()).map(|e| e.name.as_str()).filter(|n| names.contains(n)).collect();
+        return move_slots(&order, &moved, slot)
+            .into_iter()
+            .zip(&moved)
+            .map(|(at, name)| SwatchEdit::MoveTo { swatch: (*name).to_owned(), group: target.name.clone(), at })
+            .collect();
+    }
+    let Some(names) = group_names else { return Vec::new() };
+    let slot = group_slot(groups, &names, mv.to);
+    let order: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+    let moved: Vec<&str> = order.iter().copied().filter(|n| names.contains(n)).collect();
+    move_slots(&order, &moved, slot).into_iter().zip(&moved).map(|(to, name)| SwatchEdit::MoveGroup { group: (*name).to_owned(), to }).collect()
+}
+
 impl SwatchLibrary {
     /// A library of `groups`.
     pub fn new(groups: Vec<SwatchGroup>) -> Self {
@@ -88,7 +230,7 @@ impl SwatchLibrary {
 
     /// The swatch named `name`.
     pub fn find(&self, name: &str) -> Option<SwatchAt> {
-        self.groups.iter().enumerate().find_map(|(group, g)| g.entries.iter().position(|e| e.name == name).map(|index| SwatchAt { group, index }))
+        find_swatch(&self.groups, name)
     }
 
     /// The swatch at `at`, or `None` when out of range.
@@ -101,15 +243,13 @@ impl SwatchLibrary {
     /// where it went, or `None` when the library holds [`MAX_SWATCHES`].
     // pc: crates/engine/src/cmd/swatch_cmds.rs:150-171 (`swatches.add`: the cap, the name, group 0).
     pub fn add(&mut self, color: SwatchColor, name: Option<&str>, group: Option<usize>) -> Option<SwatchAt> {
-        self.add_numbered(color, name, group, SwatchesWords::default().swatch_n.as_str())
-    }
-
-    /// [`add`](SwatchLibrary::add) with the template (`{n}`) that names a swatch left without one.
-    pub(super) fn add_numbered(&mut self, color: SwatchColor, name: Option<&str>, group: Option<usize>, template: &str) -> Option<SwatchAt> {
-        if self.groups.iter().map(|g| g.entries.len()).sum::<usize>() >= MAX_SWATCHES {
+        if swatches_full(&self.groups) {
             return None;
         }
-        let name = name.map(str::trim).filter(|n| !n.is_empty() && self.find(n).is_none()).map_or_else(|| self.free_name(template), str::to_owned);
+        let name = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && self.find(n).is_none())
+            .map_or_else(|| free_name(&self.groups, SwatchesWords::default().swatch_n.as_str()), str::to_owned);
         if self.groups.is_empty() {
             self.groups.push(SwatchGroup { name: "Swatches".to_owned(), entries: Vec::new() });
         }
@@ -117,12 +257,6 @@ impl SwatchLibrary {
         let entries = &mut self.groups[group].entries;
         entries.push(SwatchEntry::new(name, color));
         Some(SwatchAt { group, index: entries.len() - 1 })
-    }
-
-    /// The first free name of `template`, numbered from 1.
-    fn free_name(&self, template: &str) -> String {
-        let taken: HashSet<&str> = self.groups.iter().flat_map(|g| g.entries.iter().map(|e| e.name.as_str())).collect();
-        (1..).map(|n| craft_i18n::fmt_plain(template, &[("n", &n.to_string())])).find(|name| !taken.contains(name.as_str())).unwrap_or_default()
     }
 
     /// Add to Swatches from the picker: in the model the user typed (CMYK inks or Lab values the
@@ -139,14 +273,8 @@ impl SwatchLibrary {
 
     /// Renames a swatch; `false` when the name is empty or taken.
     pub fn rename(&mut self, at: SwatchAt, name: &str) -> bool {
-        let name = name.trim();
-        if name.is_empty() || self.get(at).is_none() {
-            return false;
-        }
-        if self.find(name).is_some_and(|other| other != at) {
-            return false;
-        }
-        self.groups[at.group].entries[at.index].name = name.to_owned();
+        let Some(name) = swatch_rename(&self.groups, at, name) else { return false };
+        self.groups[at.group].entries[at.index].name = name;
         true
     }
 
@@ -172,24 +300,15 @@ impl SwatchLibrary {
         if self.groups.len() >= MAX_GROUPS {
             return None;
         }
-        let name = self.unique_group_name(name.trim());
+        let name = unique_group_name(&self.groups, name.trim());
         self.groups.push(SwatchGroup { name, entries: Vec::new() });
         Some(self.groups.len() - 1)
     }
 
-    /// `base`, or `base 1`, `base 2`… when a group has it.
-    fn unique_group_name(&self, base: &str) -> String {
-        let taken = |n: &str| self.groups.iter().any(|g| g.name == n);
-        if !taken(base) { base.to_owned() } else { (1..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_default() }
-    }
-
     /// Renames a group; `false` when the name is empty or another group has it.
-    pub(super) fn rename_group(&mut self, group: usize, name: &str) -> bool {
-        let name = name.trim();
-        if name.is_empty() || group >= self.groups.len() || self.groups.iter().enumerate().any(|(i, g)| i != group && g.name == name) {
-            return false;
-        }
-        self.groups[group].name = name.to_owned();
+    fn rename_group(&mut self, group: usize, name: &str) -> bool {
+        let Some(name) = group_rename(&self.groups, group, name) else { return false };
+        self.groups[group].name = name;
         true
     }
 
@@ -232,44 +351,9 @@ impl SwatchLibrary {
         groups.is_some_and(|names| self.move_groups(&names, mv.to))
     }
 
-    /// The flat rows of the browser: each group's header, then its swatches.
-    fn flat(&self) -> Vec<SwatchKey> {
-        let mut rows = Vec::new();
-        for group in &self.groups {
-            rows.push(SwatchKey::Group(group.name.clone()));
-            rows.extend(group.entries.iter().map(|e| SwatchKey::Swatch(e.name.clone())));
-        }
-        rows
-    }
-
     fn move_swatches(&mut self, names: &[&str], to: usize, parent: Option<&SwatchKey>) -> bool {
+        let Some((group, slot)) = resolve_move(&self.groups, names, to, parent) else { return false };
         let moved = |e: &SwatchEntry| names.contains(&e.name.as_str());
-        let remaining: Vec<SwatchKey> =
-            self.flat().into_iter().filter(|k| !matches!(k, SwatchKey::Swatch(n) if names.contains(&n.as_str()))).collect();
-        let before = &remaining[..to.min(remaining.len())];
-        // The slot is counted in the entries that stay, so it survives taking the moved ones out.
-        let (group, slot) = match before.last() {
-            Some(SwatchKey::Swatch(n)) => {
-                let Some(at) = self.find(n) else { return false };
-                let entries = &self.groups[at.group].entries;
-                let slot = entries[..=at.index].iter().filter(|e| !moved(e)).count();
-                match parent {
-                    Some(SwatchKey::Group(g)) if self.groups[at.group].name != *g => match self.groups.iter().position(|x| x.name == *g) {
-                        Some(group) => (group, 0),
-                        None => return false,
-                    },
-                    _ => (at.group, slot),
-                }
-            }
-            Some(SwatchKey::Group(g)) => match self.groups.iter().position(|x| x.name == *g) {
-                Some(group) => (group, 0),
-                None => return false,
-            },
-            None => (0, 0),
-        };
-        if group >= self.groups.len() {
-            return false;
-        }
         let mut taken = Vec::new();
         for g in &mut self.groups {
             let (out, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.entries).into_iter().partition(|e| moved(e));
@@ -286,17 +370,8 @@ impl SwatchLibrary {
     }
 
     fn move_groups(&mut self, names: &[&str], to: usize) -> bool {
-        let moved = |g: &SwatchGroup| names.contains(&g.name.as_str());
-        let remaining: Vec<SwatchKey> = {
-            let mut rows = Vec::new();
-            for group in self.groups.iter().filter(|g| !moved(g)) {
-                rows.push(SwatchKey::Group(group.name.clone()));
-                rows.extend(group.entries.iter().map(|e| SwatchKey::Swatch(e.name.clone())));
-            }
-            rows
-        };
-        let slot = remaining[..to.min(remaining.len())].iter().filter(|k| matches!(k, SwatchKey::Group(_))).count();
-        let (taken, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.groups).into_iter().partition(|g| moved(g));
+        let slot = group_slot(&self.groups, names, to);
+        let (taken, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.groups).into_iter().partition(|g| names.contains(&g.name.as_str()));
         self.groups = keep;
         if taken.is_empty() {
             return false;
@@ -304,24 +379,6 @@ impl SwatchLibrary {
         let slot = slot.min(self.groups.len());
         self.groups.splice(slot..slot, taken);
         true
-    }
-}
-
-impl SwatchLibrary {
-    /// The index of the group `key` is, or is in.
-    pub(super) fn group_of(&self, key: &SwatchKey) -> Option<usize> {
-        match key {
-            SwatchKey::Swatch(name) => self.find(name).map(|at| at.group),
-            SwatchKey::Group(name) => self.groups.iter().position(|g| g.name == *name),
-        }
-    }
-
-    /// Whether `key` names a row of the library.
-    pub(super) fn has(&self, key: &SwatchKey) -> bool {
-        match key {
-            SwatchKey::Swatch(name) => self.find(name).is_some(),
-            SwatchKey::Group(name) => self.groups.iter().any(|g| g.name == *name),
-        }
     }
 }
 
@@ -338,5 +395,180 @@ pub(super) fn value_text(color: &SwatchColor, book: &str) -> String {
         SwatchColor::Lab([l, a, b]) => format!("L {} a {} b {}", l.round(), a.round(), b.round()),
         SwatchColor::Gray(k) => format!("K {}%", pct(k)),
         SwatchColor::Book { .. } => book.to_owned(),
+    }
+}
+
+/// One resolved edit of the swatch library for the host to run.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum SwatchEdit {
+    /// Adds `color` named `name` to `group`, or the first group.
+    Add {
+        /// The group's name, `None` for the first group.
+        group: Option<String>,
+        /// The new swatch's name.
+        name: String,
+        /// The new swatch's colour.
+        color: SwatchColor,
+    },
+    /// Adds an empty group.
+    NewGroup {
+        /// The new group's name.
+        name: String,
+    },
+    /// Renames a swatch.
+    Rename {
+        /// The swatch's current name.
+        swatch: String,
+        /// Its new name.
+        name: String,
+    },
+    /// Renames a group.
+    RenameGroup {
+        /// The group's current name.
+        group: String,
+        /// Its new name.
+        name: String,
+    },
+    /// Deletes a swatch.
+    Delete {
+        /// The swatch's name.
+        swatch: String,
+    },
+    /// Deletes a group with its swatches.
+    DeleteGroup {
+        /// The group's name.
+        group: String,
+    },
+    /// Moves a swatch.
+    MoveTo {
+        /// The swatch's name.
+        swatch: String,
+        /// The group it goes to.
+        group: String,
+        /// Its index in `group` once it is taken out: the group's length for a drop on its header.
+        at: usize,
+    },
+    /// Moves a group.
+    MoveGroup {
+        /// The group's name.
+        group: String,
+        /// The group's new index.
+        to: usize,
+    },
+    /// Puts the default swatches back.
+    Reset,
+    /// Imports `groups`, replacing the library when `replace`.
+    Import {
+        /// The groups the file holds.
+        groups: Vec<SwatchGroup>,
+        /// Whether they replace the library.
+        replace: bool,
+    },
+}
+
+impl SwatchLibrary {
+    /// Runs `edit` on the library: the in-memory host's path (stories, tests). False when the edit names nothing in the
+    /// library.
+    pub fn apply(&mut self, edit: &SwatchEdit) -> bool {
+        match edit {
+            SwatchEdit::Add { group, name, color } => {
+                let group = match group {
+                    Some(g) => match self.groups.iter().position(|x| x.name == *g) {
+                        Some(index) => Some(index),
+                        None => return false,
+                    },
+                    None => None,
+                };
+                self.add(color.clone(), Some(name), group).is_some()
+            }
+            SwatchEdit::NewGroup { name } => self.new_group(name).is_some(),
+            SwatchEdit::Rename { swatch, name } => self.find(swatch).is_some_and(|at| self.rename(at, name)),
+            SwatchEdit::RenameGroup { group, name } => match self.groups.iter().position(|g| g.name == *group) {
+                Some(index) => self.rename_group(index, name),
+                None => false,
+            },
+            SwatchEdit::Delete { swatch } => match self.find(swatch) {
+                Some(at) => self.remove(at).is_some(),
+                None => false,
+            },
+            SwatchEdit::DeleteGroup { group } => match self.groups.iter().position(|g| g.name == *group) {
+                Some(index) => {
+                    self.groups.remove(index);
+                    true
+                }
+                None => false,
+            },
+            SwatchEdit::MoveTo { swatch, group, at } => {
+                let (Some(from), Some(to)) = (self.find(swatch), self.groups.iter().position(|g| g.name == *group)) else {
+                    return false;
+                };
+                let Some(entry) = self.remove(from) else { return false };
+                let entries = &mut self.groups[to].entries;
+                let slot = (*at).min(entries.len());
+                entries.insert(slot, entry);
+                true
+            }
+            SwatchEdit::MoveGroup { group, to } => {
+                let Some(from) = self.groups.iter().position(|g| g.name == *group) else { return false };
+                let moved = self.groups.remove(from);
+                let slot = (*to).min(self.groups.len());
+                self.groups.insert(slot, moved);
+                true
+            }
+            SwatchEdit::Reset => {
+                self.groups = crate::palette::default_swatches();
+                true
+            }
+            SwatchEdit::Import { groups, replace } => {
+                self.import(groups.clone(), *replace);
+                true
+            }
+        }
+    }
+}
+
+/// The rows of the swatch list: each group at depth 0 with its count, each swatch at depth 1 with "name, value" as its
+/// tooltip and accessible name. `SwatchesPanel` and `PaintChip`'s swatches list build their rows with it.
+pub fn swatch_rows(groups: &[SwatchGroup], words: &SwatchesWords) -> Vec<PresetRow<SwatchKey>> {
+    let mut rows = Vec::with_capacity(groups.len() + groups.iter().map(|g| g.entries.len()).sum::<usize>());
+    for group in groups {
+        rows.push(PresetRow::group(SwatchKey::Group(group.name.clone()), group.name.as_str(), 0).count(group.entries.len()));
+        for entry in &group.entries {
+            let named = format!("{}, {}", entry.name, value_text(&entry.color, words.book_color.as_str()));
+            rows.push(PresetRow::item(SwatchKey::Swatch(entry.name.clone()), entry.name.as_str(), 1).tooltip(named.clone()).accessible_name(named));
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(name: &str, entries: &[&str]) -> SwatchGroup {
+        SwatchGroup { name: name.to_owned(), entries: entries.iter().map(|n| SwatchEntry::new((*n).to_owned(), SwatchColor::Gray(0.5))).collect() }
+    }
+
+    /// Edits that move several items down or up give the order the browser's own reorder gives.
+    #[test]
+    fn multi_item_moves_apply_as_the_reorder_does() {
+        let library = SwatchLibrary::new(vec![group("G", &["A", "B", "C", "D"]), group("H", &["E"])]);
+        let swatch = |n: &str| SwatchKey::Swatch(n.to_owned());
+        let group_key = |n: &str| SwatchKey::Group(n.to_owned());
+        let moves = [
+            ReorderMove::new(swatch("A"), vec![swatch("A"), swatch("B")], 3, false),
+            ReorderMove::new(swatch("C"), vec![swatch("C"), swatch("D")], 1, false),
+            ReorderMove::new(group_key("G"), vec![group_key("G")], 2, false),
+        ];
+        for mv in moves {
+            let mut expected = library.clone();
+            assert!(expected.apply_reorder(&mv));
+            let mut applied = library.clone();
+            for edit in reorder_edits(&library.groups, &mv) {
+                assert!(applied.apply(&edit));
+            }
+            assert_eq!(applied, expected);
+        }
     }
 }

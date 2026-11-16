@@ -19,9 +19,14 @@ pub const MAX_PLAYBACK_DEPTH: usize = 16;
 pub enum StepOutcome {
     /// It ran; the command's result (a nested call's result is checked by the runner).
     Done(Value),
+    /// It ran and playback stops for the user to continue (Step by Step, Pause For): the step
+    /// counts as run, sets `paused_at` and `waiting`.
+    Wait(Value),
     /// It stopped for a dialog (a step with its dialog flag, an Insert Stop): playback stops here
     /// and the app resumes later with `from` = this step + 1.
     Paused,
+    /// It stopped playback with no failure (a Stop with its dialog off): sets `stopped_at`.
+    Stopped,
     /// It failed with this message: playback stops.
     Failed(String),
 }
@@ -33,6 +38,12 @@ pub enum StepOutcome {
 pub trait ActionRunner {
     /// Runs `step` (index `index` of `action`); `show_dialog` is the step's dialog flag.
     fn run_step(&mut self, action: &Action, index: usize, step: &ActionStep, show_dialog: bool, budget: &mut PlaybackBudget) -> StepOutcome;
+
+    /// Charges one step on `budget`; `false` stops playback with the step limit. A host whose
+    /// limit also counts scripts, batches and droplets charges that one counter here.
+    fn charge(&mut self, budget: &mut PlaybackBudget) -> bool {
+        budget.charge()
+    }
 
     /// The untrusted session's gate, asked before every step, nested ones included: an `Err`
     /// stops playback with that message before the step runs. Allows every step by default.
@@ -138,6 +149,10 @@ pub struct PlaybackReport {
     pub paused_at: Option<usize>,
     /// Playback did not start or stopped for a limit or a loop.
     pub refused: Option<PlaybackRefusal>,
+    /// A step returned [`StepOutcome::Wait`]: playback stopped for the user to continue.
+    pub waiting: bool,
+    /// The step that returned [`StepOutcome::Stopped`], if one did.
+    pub stopped_at: Option<usize>,
 }
 
 /// Plays recorded actions.
@@ -145,11 +160,13 @@ pub struct ActionPlayer;
 
 impl ActionPlayer {
     /// Plays the action at `index` of `list` from step `from`: enters it on `budget` (refusing a
-    /// loop or depth), then for each included step at or after `from`, in order: charges the
-    /// budget (stops with the step-limit failure when spent), asks
+    /// loop or depth), then for each included step at or after `from`, in order: charges it
+    /// through [`ActionRunner::charge`] (stops with the step-limit failure when refused), asks
     /// [`authorize`](ActionRunner::authorize) (a denial stops without running or pausing), counts
-    /// a [no-op](ActionRunner::is_noop) as run, else runs the step; stops at the first `Failed`
-    /// and at `Paused` (reporting `paused_at`). Skipped (disabled) steps are not charged. Leaves
+    /// a [no-op](ActionRunner::is_noop) as run, else runs the step; stops at the first `Failed`,
+    /// at `Paused` (reporting `paused_at`), at `Wait` (counted as run, reporting `paused_at` and
+    /// `waiting`) and at `Stopped` (reporting `stopped_at`, no failure). Skipped (disabled) steps
+    /// are not charged. Leaves
     /// the action on `budget` before returning. An index past the list reports
     /// `failed` with the message "no such action". Playing the action being recorded into is the
     /// app's to refuse (PhotoCraft's `playback_plan` does), since the list holds no recording.
@@ -165,7 +182,7 @@ impl ActionPlayer {
         }
         for (i, step) in action.enabled_steps().filter(|(i, _)| *i >= from) {
             let fail = |message: String| StepFailure { step: i, command: step.command.clone(), message };
-            if !budget.charge() {
+            if !runner.charge(budget) {
                 report.failed = Some(fail(format!("action playback exceeded the {}-step limit", budget.limit)));
                 report.refused = Some(PlaybackRefusal::StepLimit);
                 break;
@@ -180,6 +197,16 @@ impl ActionPlayer {
             }
             match runner.run_step(action, i, step, action.dialogs.contains(&i), budget) {
                 StepOutcome::Done(_) => report.ran += 1,
+                StepOutcome::Wait(_) => {
+                    report.ran += 1;
+                    report.paused_at = Some(i);
+                    report.waiting = true;
+                    break;
+                }
+                StepOutcome::Stopped => {
+                    report.stopped_at = Some(i);
+                    break;
+                }
                 StepOutcome::Paused => {
                     report.paused_at = Some(i);
                     break;

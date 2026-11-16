@@ -13,9 +13,13 @@ use craft_behavior::{Cursor, CursorPriority, PartRef, PressState};
 #[derive(Clone, Default)]
 struct BandDouble(bool);
 
-/// Whether the primary press of this pass went down on the container's own surface (`Sense::SURFACE`).
+/// Whether the primary press of this pass went down on the container's own surface (`Sense::SURFACE`), and whether it
+/// is the second of a double click.
 #[derive(Clone, Default)]
-struct SurfacePress(bool);
+struct SurfacePress {
+    pressed: bool,
+    double: bool,
+}
 
 impl BodyCx<'_> {
     /// Whether the second press of a double click went down on the container's move band in this pass. The body step
@@ -38,7 +42,15 @@ impl BodyCx<'_> {
     /// container decides what it means (a dock group focuses its panel, as Photoshop does); it is no click and moves
     /// no focus by itself.
     pub fn surface_pressed(&self) -> bool {
-        self.memory.recall::<SurfacePress>(sub(self.id, "surface_press")).0
+        self.memory.recall::<SurfacePress>(sub(self.id, "surface_press")).pressed
+    }
+
+    /// Whether the press of [`surface_pressed`](Self::surface_pressed) is the second press of a double click: no child
+    /// or part takes it and its click count is two or more. One own-surface signal for every container (an empty
+    /// workspace opens a file on it). A measuring run sees none, for the reason
+    /// [`band_double_pressed`](Self::band_double_pressed) gives.
+    pub fn surface_double_pressed(&self) -> bool {
+        !self.memory.is_peek() && self.memory.recall::<SurfacePress>(sub(self.id, "surface_press")).double
     }
 
     /// Requests `cursor` at `priority` for this pass, in the cursor service the parts' and components' requests go
@@ -55,22 +67,25 @@ impl BodyCx<'_> {
 impl BodyHooks<'_> {
     /// Records for the container's hooks whether this pass's primary press went down on its own surface
     /// (`BodyCx::surface_pressed`): no shape of last pass under the press takes it, and the press lies in the
-    /// container's rect on its layer.
+    /// container's rect on its layer; and whether that press is the second of a double click
+    /// (`BodyCx::surface_double_pressed`), read from the same press's click count.
     pub(super) fn surface_press<C: Container>(&self, sensed: bool, cx: &mut Cx<'_, C>) {
         let ctx = cx.core.ctx.clone();
-        let pressed = sensed && {
+        let surface = if sensed {
             let pass = pointer::pass_pointer(&ctx);
-            pass.frame.as_ref().and_then(|frame| frame.press).filter(|press| press.button == craft_behavior::PointerButton::Primary).is_some_and(
-                |press| {
-                    let layer = cx.core.response.layer_id;
-                    let at = areas::layer_map(&ctx, layer).map_or(press.origin, |map| map.to_layer(press.origin));
-                    areas::layer_at(&ctx, press.origin) == Some(layer)
-                        && cx.core.rect.contains(at)
-                        && pointer::press_winner(&ctx, press.origin, pass.press_targets).is_none()
-                },
-            )
+            pass.frame.as_ref().and_then(|frame| frame.press).filter(|press| press.button == craft_behavior::PointerButton::Primary).filter(|press| {
+                let layer = cx.core.response.layer_id;
+                let at = areas::layer_map(&ctx, layer).map_or(press.origin, |map| map.to_layer(press.origin));
+                areas::layer_at(&ctx, press.origin) == Some(layer)
+                    && cx.core.rect.contains(at)
+                    && pointer::press_winner(&ctx, press.origin, pass.press_targets).is_none()
+            })
+        } else {
+            None
         };
-        cx.core.memory.shown::<SurfacePress>(sub(sub(cx.core.id, "body"), "surface_press")).0 = pressed;
+        let shown = cx.core.memory.shown::<SurfacePress>(sub(sub(cx.core.id, "body"), "surface_press"));
+        shown.pressed = surface.is_some();
+        shown.double = surface.is_some_and(|press| press.clicks >= 2);
     }
 
     /// Records for the container's header hooks whether the second press of a double click went down on the move

@@ -15,6 +15,11 @@ pub(crate) fn base_shell(ctx: &Context) -> ShellInfo {
     shared(ctx, |shared| shared.shell.clone()).unwrap_or_default()
 }
 
+/// The app id the app installed, which every OS window carries; empty when it set none.
+pub(crate) fn app_id(ctx: &Context) -> String {
+    shared(ctx, |shared| shared.app_id.clone())
+}
+
 /// The operating system of the shell: the one source of the key table, the chords shown, the drop operation and
 /// the chrome. It does not differ between viewports.
 #[doc(hidden)]
@@ -23,9 +28,14 @@ pub fn os_of(ctx: &Context) -> Os {
 }
 
 /// Makes the shell run on `os`, as a test of the OS matrix does: the capabilities and the menu placement of a
-/// native build follow it. egui's own OS is the caller's to set.
+/// native build follow it, and so does egui's own OS (its text editing keys).
 #[cfg(feature = "testing")]
 pub(crate) fn set_os(ctx: &Context, os: Os) {
+    ctx.set_os(match os {
+        Os::Mac => egui::os::OperatingSystem::Mac,
+        Os::Windows => egui::os::OperatingSystem::Windows,
+        _ => egui::os::OperatingSystem::Nix,
+    });
     shared(ctx, |shared| {
         let root_chrome = shared.root_frame.as_ref().map(chrome_of);
         let shell = shared.shell.get_or_insert_with(ShellInfo::default);

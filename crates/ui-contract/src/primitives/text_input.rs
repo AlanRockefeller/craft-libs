@@ -91,6 +91,12 @@ pub struct TextOptions {
     /// The control's caller hangs a context menu of its own on it: a context request opens that menu, not the text
     /// part's edit menu.
     pub own_menu: bool,
+    /// Tab and Shift+Tab rewrite the draft (the text part selects it and refuses) instead of moving focus; with
+    /// `tab_inserts` it is a debug assertion.
+    pub tab_rewrites: bool,
+    /// A press on a part declared `holds_drafts`, or on a popup layer above the field, leaves the focused draft
+    /// unapplied.
+    pub holds_drafts: bool,
 }
 
 impl Default for TextOptions {
@@ -119,6 +125,8 @@ impl Default for TextOptions {
             arrows_from_end: false,
             unparsed: None,
             own_menu: false,
+            tab_rewrites: false,
+            holds_drafts: false,
         }
     }
 }
@@ -141,6 +149,8 @@ impl std::fmt::Debug for TextOptions {
             .field("lines", &self.lines)
             .field("live", &self.live)
             .field("complete", &self.complete.is_some())
+            .field("tab_rewrites", &self.tab_rewrites)
+            .field("holds_drafts", &self.holds_drafts)
             .finish_non_exhaustive()
     }
 }
