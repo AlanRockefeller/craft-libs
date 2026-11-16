@@ -2,7 +2,7 @@
 
 use crate::runtime::commands::CommandInput;
 use crate::runtime::egui::access::AccessTree;
-use crate::runtime::egui::{areas, fixture};
+use crate::runtime::egui::{areas, fixture, plugin};
 use crate::runtime::env::RootEnv;
 use crate::runtime::frame::{FrameInput, announce, set_input};
 use craft_host::Host;
@@ -18,12 +18,16 @@ pub struct Frames {
     /// The context the frames run on.
     pub ctx: Context,
     time: f64,
+    /// The time of the last frame these frames ran, to tell when another driver of the context has run it since.
+    given: f64,
     root: RootEnv,
     cursor: egui::CursorIcon,
     cursor_image: Option<egui::CustomCursorImage>,
     repaint_delay: Duration,
     host: Option<Arc<Host>>,
     commands: CommandInput,
+    /// The modifiers the app holds down for the user in every following frame.
+    latched: craft_keymap::Mods,
     tree: Option<AccessTree>,
     ime: Option<fixture::ImeSeen>,
     copied: Vec<String>,
@@ -83,17 +87,35 @@ impl Frames {
         self.paint.as_mut().map(std::mem::take)
     }
 
+    /// Frames on `ctx`, a context the caller made (an app's own, which its code reads outside the frames), with the
+    /// runtime installed on it unless it already is, as an app installs it: without the stories' command sets. The
+    /// context keeps its own fonts and options.
+    pub fn over(ctx: Context) -> Self {
+        let frames = Self::on(ctx);
+        if !plugin::is_registered(&frames.ctx) {
+            let installed = crate::install(&frames.ctx, crate::runtime::InstallSpec { stories: false, ..super::install_spec() });
+            debug_assert!(installed.is_ok(), "the context takes the runtime once");
+        }
+        frames
+    }
+
     /// A fresh context without the runtime, for frames that ran before `install`.
     pub fn uninstalled() -> Self {
+        Self::on(fixture::bare_context())
+    }
+
+    fn on(ctx: Context) -> Self {
         Frames {
-            ctx: fixture::bare_context(),
+            ctx,
             time: 0.0,
+            given: 0.0,
             root: RootEnv::default(),
             cursor: egui::CursorIcon::Default,
             cursor_image: None,
             repaint_delay: Duration::MAX,
             host: None,
             commands: CommandInput::new(),
+            latched: craft_keymap::Mods::NONE,
             tree: None,
             ime: None,
             copied: Vec::new(),
@@ -122,7 +144,7 @@ impl Frames {
     }
 
     fn input(&self) -> FrameInput {
-        let input = FrameInput::new(self.root.clone()).commands(self.commands.clone());
+        let input = FrameInput::new(self.root.clone()).commands(self.commands.clone()).latched(self.latched);
         match &self.host {
             Some(host) => input.host(host.clone()),
             None => input,
@@ -132,6 +154,11 @@ impl Frames {
     /// The root values every following frame is given.
     pub fn root(&mut self, root: RootEnv) {
         self.root = root;
+    }
+
+    /// The modifiers the app holds down for the user in every following frame.
+    pub fn latched(&mut self, mods: craft_keymap::Mods) {
+        self.latched = mods;
     }
 
     /// The command input every following frame is given.
@@ -165,7 +192,7 @@ impl Frames {
     /// One frame with no events; returns the shapes it painted, nested shapes flattened.
     pub fn frame_shapes(&mut self, mut ui: impl FnMut(&mut Ui)) -> Vec<egui::Shape> {
         set_input(&self.ctx, self.input());
-        self.time += DT;
+        self.tick();
         fixture::run_frame_shapes(&self.ctx, self.time, self.screen, &mut ui)
     }
 
@@ -213,8 +240,20 @@ impl Frames {
         }
     }
 
-    fn run(&mut self, viewport: egui::ViewportId, mut events: Vec<Event>, ui: impl FnMut(&mut Ui)) -> bool {
+    /// Moves the clock on one frame. When another driver of the context (an app's own harness) has run it past the
+    /// last frame these frames gave it, the clock first catches up with the context's, so it never takes its time
+    /// back; otherwise it keeps its own time, [`advance`](Self::advance) steps included.
+    fn tick(&mut self) {
+        let context = self.ctx.input(|i| i.time);
+        if context > self.given {
+            self.time = self.time.max(context);
+        }
         self.time += DT;
+        self.given = self.time;
+    }
+
+    fn run(&mut self, viewport: egui::ViewportId, mut events: Vec<Event>, ui: impl FnMut(&mut Ui)) -> bool {
+        self.tick();
         if self.told != self.modifiers {
             self.told = self.modifiers;
             events.insert(0, fixture::modifiers_changed(self.modifiers));

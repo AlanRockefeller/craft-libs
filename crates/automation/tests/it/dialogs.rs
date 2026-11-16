@@ -1,14 +1,12 @@
 //! `ui.dialog.*` on typed dialogs through one generic path.
 
-use craft_automation::dialogs::{dialog_method, inspect, inspect_stack, names_open_dialog};
+use craft_automation::dialogs::{dialog_method, inspect};
 use craft_ui::contract::{Bind, SaveKey};
-use craft_ui::dialog::{DialogHost, DialogResult, PromptChoice, PromptKind, StandardPrompt, StartupStage, dialog_id};
+use craft_ui::dialog::{DialogHost, DialogResult, PromptChoice, PromptKind, StandardPrompt};
 use craft_ui::patterns::form_dialogs::{DialogFields, HostedParamDialog, Param, ParamDialog, ParamKind};
-use craft_ui::testing::{Fixture, trial};
+use craft_ui::testing::trial;
 use egui::Context;
 use serde_json::{Value, json};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 fn call(host: &mut DialogHost, ctx: &Context, method: &str, params: Value) -> Result<Value, String> {
     dialog_method(host, ctx, method, &params).expect("a ui.dialog method")
@@ -20,13 +18,13 @@ fn call(host: &mut DialogHost, ctx: &Context, method: &str, params: Value) -> Re
 fn dialog_methods_read_set_and_answer_typed_dialogs() {
     let ctx = Context::default();
     let mut host = DialogHost::new();
-    host.open(HostedParamDialog::new("gaussianBlur", DialogFields::from_pairs([("radius", 1.0)]), |fields| {
+    host.open(HostedParamDialog::new(&ctx, "gaussianBlur", DialogFields::from_pairs([("radius", 1.0)]), |fields| {
         ParamDialog::new("gaussianBlur", "Gaussian Blur", Param::parse_list(r#"{"radius":0.1..1000=1,"method":"spin|zoom"}"#))
             .values(Bind::bound(fields))
     }));
     let listed = inspect(&host);
     assert_eq!(listed[0]["key"], "gaussianBlur");
-    assert_eq!(listed[0]["fields"], json!({"radius": 1.0}));
+    assert_eq!(listed[0]["fields"], json!({"radius": 1.0, "method": "spin"}), "the dialog lists its defaults from its open");
     let blur = listed[0]["id"].clone();
 
     assert_eq!(call(&mut host, &ctx, "ui.dialog.set", json!({"dialog": blur, "field": "radius", "value": 4.5})), Ok(Value::Null));
@@ -36,7 +34,9 @@ fn dialog_methods_read_set_and_answer_typed_dialogs() {
     );
     assert_eq!(inspect(&host)[0]["fields"]["radius"], 4.5);
     assert_eq!(call(&mut host, &ctx, "ui.dialog.confirm", json!({"dialog": blur})), Ok(Value::Null));
-    let Some(DialogResult::Ok(result)) = host.take::<HostedParamDialog>() else { panic!("the blur dialog answers OK") };
+    let Some(DialogResult::Ok(result)) = host.take_keyed::<HostedParamDialog>().map(|(result, _)| result) else {
+        panic!("the blur dialog answers OK")
+    };
     assert_eq!((result.fields.number("radius"), result.fields.text("method")), (Some(4.5), Some("spin")));
     assert_eq!(inspect(&host), json!([]));
 
@@ -52,9 +52,6 @@ fn dialog_methods_read_set_and_answer_typed_dialogs() {
     // can't be applied, so the default answer is refused too. The id may also come as a number.
     host.open(StandardPrompt::confirm_delete(["Layer 1"], 1));
     let delete: u64 = inspect(&host)[0]["id"].as_str().and_then(|id| id.parse().ok()).expect("a decimal id");
-    // An app with dialogs of its own beside the host's learns which ones a request names.
-    assert!(names_open_dialog(&host, &json!({"dialog": delete})) && names_open_dialog(&host, &json!({"dialog": delete.to_string()})));
-    assert!(!names_open_dialog(&host, &json!({"dialog": 7})) && !names_open_dialog(&host, &json!({"dialog": "shell"})));
     assert!(call(&mut host, &ctx, "ui.dialog.set", json!({"dialog": delete, "field": "choice", "value": "alternate"})).is_err());
     assert!(host.cancel::<StandardPrompt>(&ctx));
     host.take::<StandardPrompt>();
@@ -69,21 +66,22 @@ fn dialog_methods_read_set_and_answer_typed_dialogs() {
     host.open(StandardPrompt::new(PromptKind::TrashMask));
     let prompt = inspect(&host)[0]["id"].clone();
     assert_eq!(call(&mut host, &ctx, "ui.dialog.cancel", json!({"dialog": prompt})), Ok(Value::Null));
-    assert!(matches!(host.take::<StandardPrompt>(), Some(DialogResult::Cancel)));
+    let Some(DialogResult::Ok(answer)) = host.take::<StandardPrompt>() else { panic!("the prompt answers its Cancel, as Escape does") };
+    assert_eq!(answer.choice, PromptChoice::Cancel);
     assert!(call(&mut host, &ctx, "ui.dialog.cancel", json!({"dialog": prompt})).is_err());
 }
 
 const REMEMBERED: SaveKey = SaveKey::new("craft_automation.blur");
 
 /// A hosted parameter dialog's automation follows its rows as a user meets them: OK is refused while disabled, a
-/// disabled row takes no value, a value is read as its row's kind (three integers for a three-cell grid), and OK
-/// before the first pass answers with the remembered values the first pass would have loaded.
+/// disabled row takes no value, a value is read as its row's kind (three integers for a three-cell grid), and from its
+/// open, before any pass, the dialog lists and answers with the remembered values over the defaults.
 #[trial]
 fn param_dialog_automation_follows_its_rows() {
     let ctx = Context::default();
     let mut host = DialogHost::new();
     let blur = |ok: bool| {
-        HostedParamDialog::new("blur", DialogFields::new(), move |fields| {
+        HostedParamDialog::new(&ctx, "blur", DialogFields::new(), move |fields| {
             let mut params = Param::parse_list(r#"{"radius":0.1..1000=1,"method":"spin|zoom"}"#);
             params.push(Param::new("amount", "Amount", ParamKind::range(0.0, 100.0, 10.0, Default::default())).enabled_when("method", "zoom"));
             params.push(Param::new("cells", "Cells", ParamKind::grid(3, 0)));
@@ -94,7 +92,7 @@ fn param_dialog_automation_follows_its_rows() {
     host.open(blur(false));
     let id = inspect(&host)[0]["id"].clone();
     assert!(call(&mut host, &ctx, "ui.dialog.confirm", json!({"dialog": id})).is_err());
-    assert!(host.take::<HostedParamDialog>().is_none());
+    assert!(host.take_keyed::<HostedParamDialog>().map(|(result, _)| result).is_none());
     assert!(host.cancel::<HostedParamDialog>(&ctx));
 
     host.open(blur(true));
@@ -108,60 +106,55 @@ fn param_dialog_automation_follows_its_rows() {
     assert_eq!(set(&mut host, "radius", json!(7)), Ok(Value::Null));
     assert_eq!(inspect(&host)[0]["fields"]["cells"], json!([1, 2, 3]));
     assert_eq!(call(&mut host, &ctx, "ui.dialog.confirm", json!({"dialog": id})), Ok(Value::Null));
-    let Some(DialogResult::Ok(result)) = host.take::<HostedParamDialog>() else { panic!("the blur dialog answers OK") };
+    let Some(DialogResult::Ok(result)) = host.take_keyed::<HostedParamDialog>().map(|(result, _)| result) else {
+        panic!("the blur dialog answers OK")
+    };
     assert_eq!(result.fields.grid("cells"), Some(&[1, 2, 3][..]));
-    ctx.run_ui(Default::default(), |ui| result.remember(ui)).textures_delta.clear();
+    result.remember(&ctx);
 
     host.open(blur(true));
-    let id = inspect(&host)[0]["id"].clone();
+    let listed = inspect(&host);
+    let id = listed[0]["id"].clone();
+    let fields = &listed[0]["fields"];
+    assert_eq!((fields["radius"].as_f64(), &fields["method"], &fields["cells"]), (Some(7.0), &json!("zoom"), &json!([0, 1, 0])), "{fields}");
     assert_eq!(call(&mut host, &ctx, "ui.dialog.confirm", json!({"dialog": id})), Ok(Value::Null));
-    let Some(DialogResult::Ok(reopened)) = host.take::<HostedParamDialog>() else { panic!("the reopened dialog answers OK") };
+    let Some(DialogResult::Ok(reopened)) = host.take_keyed::<HostedParamDialog>().map(|(result, _)| result) else {
+        panic!("the reopened dialog answers OK")
+    };
     assert_eq!((reopened.fields.number("radius"), reopened.fields.text("method")), (Some(7.0), Some("zoom")));
 }
 
-/// Dialogs an app shows itself take their place on the host's stack when they open: listed in one opening order
-/// between the hosted ones, never answered by the host's methods, and closing the dialogs opened over them, the
-/// host's with `Cancel`, when they close.
+/// `"top"` names the top dialog of the stack: a child over its parent takes the field, the parent keeps its own; with
+/// nothing open the request says so.
 #[trial]
-fn beside_dialogs_share_the_hosts_stack() {
+fn top_names_the_top_hosted_dialog() {
     let ctx = Context::default();
     let mut host = DialogHost::new();
-    let (first, second, third) = (dialog_id(("app", 1)), dialog_id(("app", 2)), dialog_id(("app", 3)));
-    let own = |id| Some(json!({"id": if id == first { "first" } else { "second" }}));
-    host.open_beside(first, None);
-    let prompt = host.open(StandardPrompt::new(PromptKind::TrashMask));
-    host.open_beside(second, None);
-    let listed = inspect_stack(&host, own);
-    assert_eq!((listed[0]["id"].clone(), listed[2]["id"].clone()), (json!("first"), json!("second")));
-    assert_eq!(listed[1]["id"], prompt.value().to_string());
-    assert!(host.stack().is_top(second));
-    assert!(!names_open_dialog(&host, &json!({"dialog": first.value()})));
-    assert!(call(&mut host, &ctx, "ui.dialog.cancel", json!({"dialog": second.value()})).is_err());
-
-    host.close_beside(second);
-    assert!(host.stack().is_top(prompt), "an app dialog that closed leaves the stack");
-    assert!(host.cancel_by_id(&ctx, prompt));
-    host.take::<StandardPrompt>();
-    let child = host.open_child(StandardPrompt::confirm_delete(["Layer 1"], 1), first);
-    host.open_beside(third, Some(child));
-    assert!(host.stack().is_top(third));
-    host.close_beside(first);
-    assert!(matches!(host.take::<StandardPrompt>(), Some(DialogResult::Cancel)), "a child closes with its app dialog");
-    assert!(host.stack().is_empty() && host.is_empty(), "the app dialog over the child leaves with it");
+    assert!(
+        call(&mut host, &ctx, "ui.dialog.set", json!({"dialog": "top", "field": "choice", "value": "cancel"}))
+            .is_err_and(|e| e.contains("no hosted dialog is open"))
+    );
+    let parent = host.open(StandardPrompt::new(PromptKind::TrashMask));
+    host.open_child(StandardPrompt::confirm_delete(["Layer 1"], 1).instance("child"), parent);
+    assert_eq!(call(&mut host, &ctx, "ui.dialog.set", json!({"dialog": "top", "field": "choice", "value": "cancel"})), Ok(Value::Null));
+    let listed = inspect(&host);
+    assert_eq!(listed[0]["id"], parent.value().to_string());
+    assert_eq!((listed[0]["fields"]["choice"].clone(), listed[1]["fields"]["choice"].clone()), (json!("proceed"), json!("cancel")));
 }
 
-/// A startup modal waits while a dialog the app shows itself is open, and opens once it closes.
+/// `ui.dialog.cancel` on a prompt with a Cancel button answers that Cancel as Escape does, with the prompt's tag; a
+/// prompt without one closes from outside.
 #[trial]
-fn the_startup_queue_waits_for_beside_dialogs() {
-    let host = Rc::new(RefCell::new(DialogHost::new()));
-    let own = dialog_id(("app", 1));
-    host.borrow_mut().open_beside(own, None);
-    host.borrow_mut().enqueue(StartupStage::Warning, StandardPrompt::new(PromptKind::TrashMask));
-    let shown = Rc::clone(&host);
-    let mut fixture = Fixture::new(move |ui| shown.borrow_mut().run(ui));
-    fixture.idle(2);
-    assert!(!host.borrow().is_open::<StandardPrompt>(), "the startup modal waits for the app's dialog");
-    host.borrow_mut().close_beside(own);
-    fixture.idle(2);
-    assert!(host.borrow().is_open::<StandardPrompt>(), "the startup modal opens once the app's dialog closed");
+fn cancel_on_a_standard_prompt_answers_its_cancel_with_the_tag() {
+    let ctx = Context::default();
+    let mut host = DialogHost::new();
+    let prompt = host.open(StandardPrompt::new(PromptKind::TrashMask).tag(7_u32));
+    assert_eq!(call(&mut host, &ctx, "ui.dialog.cancel", json!({"dialog": prompt.value()})), Ok(Value::Null));
+    let Some(DialogResult::Ok(answer)) = host.take::<StandardPrompt>() else { panic!("the prompt answers its Cancel") };
+    assert_eq!((answer.choice, answer.tag::<u32>()), (PromptChoice::Cancel, Some(&7)));
+
+    let prompt = host.open(StandardPrompt::custom("Rasterize the type layer?").button(PromptChoice::Proceed, "Rasterize").tag(8_u32));
+    assert_eq!(call(&mut host, &ctx, "ui.dialog.cancel", json!({"dialog": prompt.value()})), Ok(Value::Null));
+    assert!(matches!(host.take::<StandardPrompt>(), Some(DialogResult::Cancel)), "a prompt without Cancel closes from outside");
+    assert!(host.is_empty());
 }

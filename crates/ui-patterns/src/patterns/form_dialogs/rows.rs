@@ -1,15 +1,19 @@
 //! `ParamRows`: a form with one `Field` per visible parameter of a [`Param`] list, over a [`DialogFields`] value.
 
 use super::fields::{DialogFields, FieldValue};
-use crate::runtime::requests::{ColorRequest, EyedropperRequest, PathRequest};
+use super::file_list::{FileList, FileListMode, FileListPicker};
+use crate::patterns::blend_keys::{BlendKeyEntry, BlendKeys, BlendShortcut, BlendStep, blend_entries};
+use crate::patterns::presets::{PresetKind, PresetPicker, PresetRow};
+use crate::runtime::commands::{CommandState, Commands as _};
+use crate::runtime::requests::{ColorRequest, EyedropperRequest, ListingRequest, PathRequest};
 
-use super::param::{CustomContext, Param, ParamKind, fill_defaults, rounded};
+use super::param::{CustomContext, Param, ParamKind, fill_defaults, path_list, rounded};
 use super::path_row::PathRow;
 use super::words::ParamWords;
 use crate::buttons::{Button, ToggleButton};
 use crate::choice::{Checkbox, Radio, RadioGroup, Swatch};
 use crate::contract::{
-    Bind, CanvasGesture, Entry, NoValue, Outcome, Props as _, Remember as _, Sampler as _, Show as _, ShowContainer as _, clicked,
+    Bind, BodyCx, CanvasGesture, Entry, NoValue, Outcome, Props as _, Remember as _, Sampler as _, Show as _, ShowContainer as _, clicked,
 };
 use crate::form::{Field, FieldGroup, SliderField, SliderFieldLayout};
 
@@ -25,11 +29,13 @@ use crate::text::{NumberField, SelectableText, TextField};
 use crate::value_drag::{AngleDial, PointPicker, SliderScale};
 
 use craft_behavior::{EditEvent, IconId, Mixed, NumberCodec};
+use craft_host::PickRequest;
 
 use craft_theme::Srgba;
 use egui::{Id, Response, Ui};
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "testing")]
@@ -66,6 +72,8 @@ pub struct ParamRowsOutput {
     /// The eyedropper toggle turned on this pass: the host answers with the colour the sampler picks for the request's
     /// key. While a toggle is on the rows arm the sampler for `ParamRows::canvas`; turning it off files nothing.
     pub eyedropper: Option<EyedropperRequest>,
+    /// The folder a files row asked the host to list this pass; the host answers with `HostAnswer::Listing`.
+    pub listing: Option<ListingRequest>,
 }
 
 impl Outcome for ParamRowsOutput {
@@ -97,12 +105,21 @@ pub struct ParamRows<'a> {
     seed: Option<Bind<'a, u64>>,
     read_only: bool,
     canvas: Option<Id>,
+    patterns: &'a [PresetRow<String>],
+    preview_colors: &'a [(String, Srgba)],
 }
 
 impl<'a> ParamRows<'a> {
     /// Rows for `params` over `fields`, the group named `label`.
     pub fn new(label: impl Into<Label>, params: &'a [Param], fields: Bind<'a, DialogFields>) -> Self {
-        ParamRows { label: label.into(), params, fields, seed: None, read_only: false, canvas: None }
+        ParamRows { label: label.into(), params, fields, seed: None, read_only: false, canvas: None, patterns: &[], preview_colors: &[] }
+    }
+
+    /// The colours child pickers preview, by colour row key: each such row draws its colour for the pass in place of
+    /// its value and writes nothing, so the values stay as they were when the picker closes.
+    pub fn preview_colors(mut self, colors: &'a [(String, Srgba)]) -> Self {
+        self.preview_colors = colors;
+        self
     }
 
     /// The state of the Random button's sequence: each press reads it and writes the next.
@@ -119,6 +136,12 @@ impl<'a> ParamRows<'a> {
         self
     }
 
+    /// The patterns a [`ParamKind::Pattern`] row offers, by id.
+    pub fn patterns(mut self, rows: &'a [PresetRow<String>]) -> Self {
+        self.patterns = rows;
+        self
+    }
+
     /// Whether the rows only show their values.
     pub fn read_only(mut self, on: bool) -> Self {
         self.read_only = on;
@@ -127,12 +150,13 @@ impl<'a> ParamRows<'a> {
 
     /// Shows the rows across the width offered.
     pub fn show(self, ui: &mut Ui) -> ParamRowsOutput {
-        let ParamRows { label, params, mut fields, mut seed, read_only, canvas } = self;
+        let ParamRows { label, params, mut fields, mut seed, read_only, canvas, patterns, preview_colors } = self;
         let env = Env::of(ui);
         let words = env.words::<ParamWords>();
         let units = env.units();
         let name: Arc<str> = label.as_str().into();
-        let mut pass = Pass::new(&words, &units);
+        let mut pass = Pass::new(&words, &units, patterns, canvas);
+        pass.previews = preview_colors;
         let mut changed = false;
         let mut values = None;
         let mut group = |ui: &mut Ui| {
@@ -148,6 +172,9 @@ impl<'a> ParamRows<'a> {
                     _ => None,
                 };
                 pass.begin(&filled, state, cx.keep::<Memo>().clone());
+                if !read_only {
+                    pass.blend_keys(cx, params);
+                }
                 pass.rows(ui, params);
                 if let Some(canvas) = canvas.filter(|_| pass.sampling && !read_only) {
                     cx.pass_canvas_gesture(canvas, CanvasGesture::PRIMARY);
@@ -166,8 +193,9 @@ impl<'a> ParamRows<'a> {
             })
         };
         let shown = if read_only { with_env(ui, |scope| scope.read_only = Some(true), group) } else { group(ui) };
-        let (pick_color, path, eyedropper) = if read_only { Default::default() } else { (pass.color, pass.path, pass.eyedropper) };
-        ParamRowsOutput { response: shown.output, changed, values, pick_color, path, eyedropper }
+        let (pick_color, path, eyedropper, listing) =
+            if read_only { Default::default() } else { (pass.color, pass.path, pass.eyedropper, pass.listing) };
+        ParamRowsOutput { response: shown.output, changed, values, pick_color, path, eyedropper, listing }
     }
 }
 
@@ -182,6 +210,8 @@ struct Memo {
     declared: BTreeMap<String, bool>,
     last: BTreeMap<String, f64>,
     sequence: Option<u64>,
+    /// The selected file of each files row: the selection belongs to the list's view, not to the row's values.
+    selected: BTreeMap<String, PathBuf>,
 }
 
 /// One pass over the rows: the working values, what the rows ask of the host, and what the pass reads.
@@ -197,8 +227,16 @@ struct Pass<'p> {
     color: Option<ColorRequest>,
     path: Option<PathRequest>,
     eyedropper: Option<EyedropperRequest>,
+    /// The folder a files row asked the host to list.
+    listing: Option<ListingRequest>,
     /// An eyedropper row is armed.
     sampling: bool,
+    /// The patterns a pattern row offers.
+    patterns: &'p [PresetRow<String>],
+    /// The canvas a custom row can ask about.
+    canvas: Option<Id>,
+    /// The colours shown in colour rows in place of their values (`ParamRows::preview_colors`).
+    previews: &'p [(String, Srgba)],
 }
 
 /// A parameter as the pass shows it: its key, its label without the colon, and whether it takes input.
@@ -230,7 +268,7 @@ impl Line<'_> {
 }
 
 impl<'p> Pass<'p> {
-    fn new(words: &'p ParamWords, units: &'p Units) -> Self {
+    fn new(words: &'p ParamWords, units: &'p Units, patterns: &'p [PresetRow<String>], canvas: Option<Id>) -> Self {
         Pass {
             words,
             units,
@@ -241,7 +279,11 @@ impl<'p> Pass<'p> {
             color: None,
             path: None,
             eyedropper: None,
+            listing: None,
             sampling: false,
+            patterns,
+            canvas,
+            previews: &[],
         }
     }
 
@@ -254,7 +296,44 @@ impl<'p> Pass<'p> {
         self.color = None;
         self.path = None;
         self.eyedropper = None;
+        self.listing = None;
         self.sampling = false;
+    }
+
+    /// The blend keys of the first visible Blend row: Shift+= and Shift+- step its mode, Shift+Alt and a letter pick
+    /// one. The commands are taken from the board once, so a second pass in the same frame applies none: a pass
+    /// applies only its own input. Later Blend rows publish nothing, so one key press never moves two rows.
+    fn blend_keys(&mut self, cx: &mut BodyCx<'_>, params: &[Param]) {
+        let Some(param) = params.iter().find(|param| matches!(param.kind, ParamKind::Blend { .. }) && param.visible(&self.work)) else {
+            return;
+        };
+        let ParamKind::Blend { modes, .. } = &param.kind else { return };
+        let enabled = param.enabled(&self.work);
+        let state = || CommandState::new().enabled(enabled);
+        let entries = blend_key_entries(modes);
+        for step in [BlendStep::Next, BlendStep::Previous] {
+            cx.publish(step, state());
+        }
+        for shortcut in entries.iter().filter_map(|entry| entry.shortcut) {
+            cx.publish(shortcut, state());
+        }
+        let mut fired = Vec::new();
+        while let Some((_, step)) = cx.take_command::<BlendStep>() {
+            fired.push(step);
+        }
+        while let Some((_, letter)) = cx.take_command::<BlendShortcut>() {
+            fired.push(letter);
+        }
+        let mut current = self.work.text(&param.key).map(str::to_owned).or_else(|| param.kind.default_value().and_then(text_of)).unwrap_or_default();
+        for fired in fired {
+            if let Some(pick) = BlendKeys::new(&entries).current(&current).fired(&fired) {
+                let id = pick.into_key();
+                if param.option_enabled(&id) {
+                    self.work.set(param.key.as_str(), FieldValue::Text(id.clone()));
+                    current = id;
+                }
+            }
+        }
     }
 
     /// The rows of `params`: those before the first section, then each section with the rows up to the next.
@@ -284,23 +363,34 @@ impl<'p> Pass<'p> {
             return;
         }
         let line = Line { param, key: param.key.as_str(), name: plain(&param.label), enabled: param.enabled(&self.work) };
+        let held = self.work.get(line.key).cloned();
+        self.show_row(ui, &line);
+        param.drop_dependents(held.as_ref(), &mut self.work);
+    }
+
+    /// Shows `line`'s control, chosen by its kind.
+    fn show_row(&mut self, ui: &mut Ui, line: &Line<'_>) {
+        let param = line.param;
         match &param.kind {
-            ParamKind::Range { min, max, scale, .. } => self.range(ui, &line, *min..=*max, *scale),
-            ParamKind::Number { .. } if param.option().units().is_some() => self.with_units(ui, &line),
-            ParamKind::Number { min, max, step, decimals, .. } => self.number(ui, &line, bounds(*min, *max), *step, *decimals),
-            ParamKind::Int { min, max, .. } => self.int(ui, &line, *min, *max),
-            ParamKind::Bool { default } => self.check(ui, &line, *default),
-            ParamKind::Choice { options, .. } => self.choice(ui, &line, options),
-            ParamKind::Radio { options, .. } => self.radio_options(ui, &line, options),
-            ParamKind::Angle { default } => self.angle(ui, &line, *default),
-            ParamKind::Color { .. } => self.color(ui, &line),
-            ParamKind::Grid { cells, .. } => self.grid(ui, &line, *cells),
-            ParamKind::Point { default } => self.point(ui, &line, *default),
-            ParamKind::Channel { names, default } => self.channel(ui, &line, names, *default),
-            ParamKind::Text { default } => self.text(ui, &line, default),
-            ParamKind::OptionalNumber { min, max, initial, decimals, .. } => self.optional(ui, &line, *min..=*max, *initial, *decimals),
-            ParamKind::ReadOnlyText { text } => read_only_text(ui, &line, text),
-            ParamKind::Custom(_) => self.custom(ui, &line),
+            ParamKind::Range { min, max, scale, .. } => self.range(ui, line, *min..=*max, *scale),
+            ParamKind::Number { .. } if param.option().units().is_some() => self.with_units(ui, line),
+            ParamKind::Number { min, max, step, decimals, .. } => self.number(ui, line, bounds(*min, *max), *step, *decimals),
+            ParamKind::Int { min, max, .. } => self.int(ui, line, *min, *max),
+            ParamKind::Bool { default } => self.check(ui, line, *default),
+            ParamKind::Choice { options, .. } => self.choice(ui, line, options),
+            ParamKind::Radio { options, .. } => self.radio_options(ui, line, options),
+            ParamKind::Angle { default } => self.angle(ui, line, *default),
+            ParamKind::Color { .. } => self.color(ui, line),
+            ParamKind::Grid { cells, .. } => self.grid(ui, line, *cells),
+            ParamKind::Point { default } => self.point(ui, line, *default),
+            ParamKind::Channel { names, default } => self.channel(ui, line, names, *default),
+            ParamKind::Text { default } => self.text(ui, line, default),
+            ParamKind::OptionalNumber { min, max, initial, decimals, .. } => self.optional(ui, line, *min..=*max, *initial, *decimals),
+            ParamKind::ReadOnlyText { text } => read_only_text(ui, line, text),
+            ParamKind::Custom(_) => self.custom(ui, line),
+            ParamKind::Blend { modes, .. } => self.blend(ui, line, modes),
+            ParamKind::Pattern { .. } => self.pattern(ui, line),
+            ParamKind::Files { folder_mode, request, open_files } => self.files(ui, line, *folder_mode, request, open_files),
             ParamKind::Section => {}
         }
     }
@@ -337,7 +427,7 @@ impl<'p> Pass<'p> {
 
     /// A number row with a unit menu: the field shows the base value in the chosen unit.
     fn with_units(&mut self, ui: &mut Ui, line: &Line<'_>) {
-        let ParamKind::Number { min, max, .. } = &line.param.kind else { return };
+        let ParamKind::Number { min, max, step, decimals, .. } = &line.param.kind else { return };
         let option = line.param.option();
         let Some(choices) = option.units() else { return };
         let base = self.work.number(line.key).unwrap_or(0.0);
@@ -347,6 +437,20 @@ impl<'p> Pass<'p> {
         let range = bounds(min.map(|m| m / factor), max.map(|m| m / factor));
         let entries: Vec<Entry<UnitKind>> = choices.list().iter().map(|unit| Entry::new(unit.kind, unit.label.clone())).collect();
         let unit_name = self.words.unit.clone();
+        if choices.is_shared() {
+            line.show(ui, |ui| {
+                let mut field = number_field(self.units, line.name.clone(), Some(base / factor), *decimals, Some(chosen.kind))
+                    .step(*step / factor)
+                    .id_salt("field");
+                if let Some(range) = range.clone() {
+                    field = field.range(range);
+                }
+                if let Some(v) = field.show(ui).edit.value().cloned().flatten() {
+                    self.work.set(line.key, FieldValue::Number(v * factor));
+                }
+            });
+            return;
+        }
         line.show(ui, |ui| {
             let mut field = UnitSelect::new(line.name.clone(), Bind::given(Some(base / factor)), Bind::given(chosen.kind), &entries)
                 .unit_label(unit_name.clone())
@@ -402,12 +506,110 @@ impl<'p> Pass<'p> {
 
     fn choice(&mut self, ui: &mut Ui, line: &Line<'_>, options: &[(String, Label)]) {
         let value = self.work.text(line.key).map(str::to_owned).or_else(|| line.param.kind.default_value().and_then(text_of)).unwrap_or_default();
-        let entries: Vec<Entry<String>> = options.iter().map(|(id, label)| Entry::new(id.clone(), label.clone())).collect();
+        let entries: Vec<Entry<String>> =
+            options.iter().map(|(id, label)| Entry::new(id.clone(), label.clone()).enabled(line.param.option_enabled(id))).collect();
+        let searchable = line.param.option().searchable();
+        line.show(ui, |ui| {
+            let mut select = Select::new(line.name.clone(), Bind::given(value.clone()), &entries);
+            if searchable {
+                select = select.searchable();
+            }
+            if let Some(v) = select.show(ui).value().cloned() {
+                self.work.set(line.key, FieldValue::Text(v));
+            }
+        });
+    }
+
+    /// A select of blend modes. The separators between the mode groups come from the entries' keys, not from the caller.
+    fn blend(&mut self, ui: &mut Ui, line: &Line<'_>, modes: &[(BlendKeyEntry<String>, Label)]) {
+        let value = self.work.text(line.key).map(str::to_owned).or_else(|| line.param.kind.default_value().and_then(text_of)).unwrap_or_default();
+        let keys = blend_key_entries(modes);
+        let entries: Vec<Entry<String>> =
+            blend_entries(&keys, |entry| modes.iter().find(|(mode, _)| mode.key == entry.key).map_or(Label::Empty, |(_, label)| label.clone()))
+                .into_iter()
+                .map(|entry| {
+                    let enabled = entry.value().is_none_or(|id| line.param.option_enabled(id));
+                    entry.enabled(enabled)
+                })
+                .collect();
         line.show(ui, |ui| {
             if let Some(v) = Select::new(line.name.clone(), Bind::given(value.clone()), &entries).show(ui).value().cloned() {
                 self.work.set(line.key, FieldValue::Text(v));
             }
         });
+    }
+
+    /// A pattern row: the stored id when the rows have it as a pattern, else the first pattern is shown. A pick writes
+    /// the pattern's id; the group headers of the list take no pick.
+    fn pattern(&mut self, ui: &mut Ui, line: &Line<'_>) {
+        let rows = self.patterns;
+        let is_pattern = |row: &&PresetRow<String>| matches!(row.kind, PresetKind::Item);
+        let stored = self.work.text(line.key);
+        let current = rows
+            .iter()
+            .filter(is_pattern)
+            .find(|row| Some(row.key.as_str()) == stored)
+            .or_else(|| rows.iter().find(is_pattern))
+            .map(|row| row.key.clone());
+        // With no pattern to offer the row is disabled and writes nothing.
+        let line = Line { param: line.param, key: line.key, name: line.name.clone(), enabled: line.enabled && current.is_some() };
+        line.show(ui, |ui| {
+            let picked = PresetPicker::pattern(line.name.clone(), Bind::given(current.clone()), rows, Bind::kept()).show(ui).picked;
+            if let Some(id) = picked.filter(|id| rows.iter().filter(is_pattern).any(|row| row.key == *id)) {
+                self.work.set(line.key, FieldValue::Text(id));
+            }
+        });
+    }
+
+    /// A files row: a `FileListPicker` over the row's keys. A change of folder, or Folder mode turned on with a folder
+    /// set, drops the old listing and files a request for the new one in the same edit, so the rows keep no memo of it.
+    fn files(&mut self, ui: &mut Ui, line: &Line<'_>, folder_mode: bool, request: &PickRequest, open_files: &[PathBuf]) {
+        let param = line.param;
+        let (folder_key, use_key, listed_key) = (param.folder_key(), param.use_folder_key(), param.folder_files_key());
+        let files = paths_at(&self.work, line.key);
+        let folder = self.work.text(&folder_key).map(PathBuf::from);
+        let use_folder = folder_mode && self.work.bool(&use_key).unwrap_or(false);
+        let listed = paths_at(&self.work, &listed_key);
+        let before_work = self.work.clone();
+        let mut list = FileList {
+            mode: if use_folder { FileListMode::Folder } else { FileListMode::Files },
+            files: files.clone(),
+            folder: folder.clone(),
+            selected: self.memo.selected.get(line.key).filter(|path| files.contains(path)).cloned(),
+        };
+        line.show(ui, |ui| {
+            let shown = FileListPicker::new(line.name.clone(), Bind::bound(&mut list))
+                .folder_mode(folder_mode)
+                .open_files(open_files)
+                .folder_files(&listed)
+                .request(request.clone())
+                .show(ui);
+            if !shown.changed {
+                return;
+            }
+            if list.files != files {
+                self.work.set(line.key, path_list(&list.files));
+            }
+            let now_folder = list.mode == FileListMode::Folder;
+            if now_folder != use_folder {
+                self.work.set(use_key.as_str(), FieldValue::Bool(now_folder));
+            }
+            if list.folder != folder
+                && let Some(path) = &list.folder
+            {
+                self.work.set(folder_key.as_str(), FieldValue::Text(path.to_string_lossy().into_owned()));
+            }
+            if (list.folder != folder || now_folder != use_folder) && !listed.is_empty() {
+                self.work.remove(&listed_key);
+            }
+            if let Some(request) = param.listing_after(&before_work, &self.work) {
+                self.listing = Some(request);
+            }
+        });
+        match list.selected {
+            Some(path) => self.memo.selected.insert(line.key.to_owned(), path),
+            None => self.memo.selected.remove(line.key),
+        };
     }
 
     /// A radio row is its own section: the title shows the row's name once, and the group it names follows.
@@ -421,7 +623,7 @@ impl<'p> Pass<'p> {
             let group = group.show(ui, |ui, _| {
                 Stack::new().show(ui, |ui, _| {
                     for (id, label) in options {
-                        Radio::new(id.clone()).label(label.clone()).show(ui);
+                        Radio::new(id.clone()).label(label.clone()).enabled(line.param.option_enabled(id) && line.enabled).show(ui);
                     }
                 });
             });
@@ -459,7 +661,11 @@ impl<'p> Pass<'p> {
             }
         }
         let armed = self.memo.armed.as_deref() == Some(line.key);
-        let shown = color.map_or(Mixed::Mixed, |rgb| Mixed::Same(Srgba::from_rgb_array(rgb)));
+        let previewed = self.previews.iter().find(|(key, _)| key == line.key).map(|(_, color)| *color);
+        let shown = match previewed {
+            Some(color) => Mixed::Same(color),
+            None => color.map_or(Mixed::Mixed, |rgb| Mixed::Same(Srgba::from_rgb_array(rgb))),
+        };
         line.show(ui, |ui| {
             beside(ui, |ui| {
                 let swatch = Swatch::new(line.name.clone(), shown).picker(line.key).id_salt("choose").show(ui);
@@ -615,22 +821,45 @@ impl<'p> Pass<'p> {
 
     fn custom(&mut self, ui: &mut Ui, line: &Line<'_>) {
         let ParamKind::Custom(row) = &line.param.kind else { return };
-        let mut context = CustomContext::new(line.name.clone(), self.work.clone());
+        let mut context = CustomContext::new(line.name.clone(), self.canvas);
         line.show_body(ui, |ui| {
             let _ = row.draw(ui, &mut self.work, &mut context);
         });
         if let Some(request) = context.take_request() {
             self.color = Some(request);
         }
+        if let Some(request) = context.take_eyedropper() {
+            self.memo.armed = Some(request.key.clone());
+            self.eyedropper = Some(request);
+        }
+        self.sampling |= context.is_sampling();
     }
 }
 
-/// Read-only text beside the row's label, or across the form for a full-width row.
+/// Read-only text beside the row's label, or across the form for a full-width row, inset like a field's text.
 fn read_only_text(ui: &mut Ui, line: &Line<'_>, text: &Label) {
     let shown = Env::of(ui).view().resolve(text);
     line.show_body(ui, |ui| {
-        SelectableText::new(line.name.clone(), shown.as_str()).multiline().show(ui);
+        SelectableText::new(line.name.clone(), shown.as_str()).multiline().field_inset().show(ui);
     });
+}
+
+/// The mode entries of a Blend row's `modes`, in menu order.
+fn blend_key_entries(modes: &[(BlendKeyEntry<String>, Label)]) -> Vec<BlendKeyEntry<String>> {
+    modes.iter().map(|(entry, _)| entry.clone()).collect()
+}
+
+/// The paths a files row keeps under `key`.
+fn paths_at(fields: &DialogFields, key: &str) -> Vec<PathBuf> {
+    let items = fields.list(key);
+    items
+        .iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| match item {
+            FieldValue::Text(text) => Some(PathBuf::from(text)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Shows `body` as one row of controls side by side.

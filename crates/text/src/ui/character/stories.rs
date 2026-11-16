@@ -1,5 +1,7 @@
 //! Stories of the Character and Paragraph controls, the Paragraph dialog and its preview.
 
+#[cfg(feature = "font-picker")]
+use super::FaceAxes;
 use super::{
     BaselinePosition, Caps, CharacterControls, CharacterValues, Kerning, Leading, LineSpacing, ParagraphAlign, ParagraphControls, ParagraphDialog,
     ParagraphFormat, ParagraphPreview, ParagraphValues, SpacingKind, SpecialIndent, TextAlign,
@@ -43,6 +45,7 @@ fn single_values(ui: &mut Ui, _: &mut StoryData) -> StoryOutput {
         strikethrough: Some(false),
         opentype: vec!["liga", "frac"],
         language: Some("en-US".to_owned()),
+        ..CharacterValues::default()
     };
     let (families, styles, languages) = (families(), styles(), languages());
     CharacterControls::new("Character", &values, &families, &styles).superscript(true).languages(&languages).show(ui).into()
@@ -68,6 +71,32 @@ fn paragraph_text(ui: &mut Ui, _: &mut StoryData) -> StoryOutput {
         hyphenate: Some(true),
     };
     ParagraphControls::new("Paragraph", &values).show(ui).into()
+}
+
+// No variable face ships with the stories, so the sliders have no axis to list; the state shows the slot is taken.
+#[cfg(feature = "font-picker")]
+#[story(CharacterControls<'static>, covers = [], drive = Drive::Never)]
+fn with_axes(ui: &mut Ui, _: &mut StoryData) -> StoryOutput {
+    let values = CharacterValues {
+        family: Some("Ubuntu".to_owned()),
+        style: Some("Bold".to_owned()),
+        axes: Some(vec![(*b"wght", 700.0)]),
+        ..CharacterValues::default()
+    };
+    let (families, styles) = (families(), styles());
+    CharacterControls::new("Character", &values, &families, &styles).axes(FaceAxes::new(&[], &[])).show(ui).into()
+}
+
+#[story(ParagraphControls<'static>, covers = [], drive = Drive::Never)]
+fn vertical(ui: &mut Ui, _: &mut StoryData) -> StoryOutput {
+    let values = ParagraphValues { align: Some(TextAlign::Center), space_after: Some(6.0), ..ParagraphValues::default() };
+    ParagraphControls::new("Paragraph", &values).vertical(true).show(ui).into()
+}
+
+#[story(ParagraphControls<'static>, covers = [], drive = Drive::Never)]
+fn no_hyphenate(ui: &mut Ui, _: &mut StoryData) -> StoryOutput {
+    let values = ParagraphValues { align: Some(TextAlign::Left), hyphenate: Some(true), ..ParagraphValues::default() };
+    ParagraphControls::new("Paragraph", &values).hyphenate(false).show(ui).into()
 }
 
 #[story(ParagraphControls<'static>, covers = [], drive = Drive::Never)]

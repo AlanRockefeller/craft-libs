@@ -26,10 +26,10 @@ mod tool_groups;
 mod tool_host;
 
 pub use crate::canvas_data::{Guide, GuideColor, GuideDrag, GuideKey, GuideLine, NavigatorOptions, NavigatorSettings, ProxyColor};
-pub use crop::{CropOverlay, CropOverlayOutput, CropShield, CropStyle, ShieldColor};
+pub use crop::{CropOverlay, CropOverlayOutput, CropShield, CropStyle, ShieldColor, paint_outside};
 pub use frame_step::{FRAME_STEP_MAX, frame_step};
 pub(crate) use march::{MARCH_SECONDS, MARCH_TICK, march_shift};
-pub use readout::readout;
+pub use readout::{ShowReadouts, hud, readout};
 pub use space::{CanvasSpace, RulerText, canvas_space, pixel_aligned};
 pub use words::CanvasWords;
 
@@ -37,7 +37,7 @@ pub use words::CanvasWords;
 pub use tool::tool_probe;
 pub use tool::{CanvasTool, NoTool, ToolAccess, ToolAction, ToolAnchor, ToolClaims, ToolContext, ToolKey, ToolPointer, ViewEase};
 pub use tool_groups::{PickStep, tool_pick};
-pub use tool_host::{ToolHost, ToolHostResponse, ToolInput, ToolReadout};
+pub use tool_host::{ContextRequest, StandInKey, ToolHost, ToolHostResponse, ToolInput, ToolReadout, ViewPan};
 
 mod raster_source;
 pub use raster_source::{PixelRect, RasterSource};
@@ -59,7 +59,7 @@ mod snap;
 pub use opacity_keys::OpacityDigit;
 pub(crate) use rulers::LABEL_STEP_MIN;
 pub use rulers::{NUDGE, NUDGE_FAR};
-pub use snap::{Snap, canvas_snap, snap_suspended, snap_tolerance};
+pub use snap::{GestureSnap, Snap, canvas_snap, snap_suspended, snap_tolerance};
 pub(crate) use space::context_menu;
 pub use space::{BackgroundPress, BodyKeys, CanvasRulers, context_click};
 // End of l4d-space.
@@ -69,7 +69,6 @@ mod momentary;
 mod navigate;
 mod rotate;
 mod tools;
-mod zoom_field;
 mod zoom_motion;
 
 pub use momentary::{Momentary, MomentaryCommands, MomentaryTool};
@@ -100,22 +99,23 @@ pub use navigator::NavigatorStyle;
 pub mod navigator_panel;
 
 use crate::contract::{
-    Bind, Common, Component, Container, ContainerProps, Cx, Focus as _, NoValue, Outcome, PartsCx, Pointer as _, Props as _, Role, Sizing,
+    Bind, Common, Component, Container, ContainerProps, Cx, Focus as _, NoValue, Outcome, PaintUi, PartsCx, Pointer as _, Props as _, Role, Sizing,
 };
 use crate::runtime::commands::{CommandSet as _, CommandState, Commands as _};
 use crate::runtime::env::Label;
 use crate::runtime::focus::KeyUse;
 use crate::runtime::motion::{Animate as _, spec};
 use crate::style::{ComponentStyle, StyleCx, SurfaceKind};
+use craft_behavior::geometry::crop::normalized_angle;
 use craft_behavior::kurbo::{Point, Rect as DocRect, Size};
 use craft_behavior::{
     CanvasTransform, CanvasView, EditEvent, HitLevel, HitPriority, Intent, Metrics, Mixed, PartKey, PointerButton, PressPhase, PressState, Sense,
     WheelNotch,
 };
-use egui::{Pos2, Rect, Response, Vec2};
+use egui::{Pos2, Rect, Response, Shape, Vec2};
 use zoom_motion::{Steer, ViewMotion};
 
-const BACKGROUND: PartKey = PartKey::new("background");
+pub(crate) const BACKGROUND: PartKey = PartKey::new("background");
 
 /// Why the background part is pointer-only: the keyboard path of the running tool is its command form
 /// ([`CanvasTool::command_form`]), the one owner of that fact.
@@ -176,11 +176,15 @@ pub struct Canvas<'a> {
     keys_to_body: bool,
     /// The rulers' units and zero point, published to the body in its [`CanvasSpace`].
     rulers: Option<CanvasRulers>,
-    /// The snapping of the coordinates the pointer sets on this canvas (View > Snap To): one function that the rulers
-    /// snap their zero point with, the guides snap a guide with and the tool host hands to the tool
-    /// ([`ToolContext::snap`]). Without it nothing snaps.
+    /// The snapping of the coordinates the pointer sets on this canvas (View > Snap To), as data over the document's
+    /// targets: the rulers snap their zero point with it, the guides snap a guide with it and the tool host hands it to
+    /// the tool ([`ToolContext::snap`]). The canvas sets its tolerance each pass from the view it shows. Without it
+    /// nothing snaps.
     #[prop]
     snap: Option<Snap>,
+    /// The pasteboard colour, set once here; the pasteboard and the crop shield read it from the space.
+    #[prop]
+    pasteboard: PasteboardColor,
     /// The view of this pass, after the canvas folded in its input.
     settled: Option<Settled>,
     /// The Menu key or Shift+F10 reached the focused canvas this pass.
@@ -193,6 +197,8 @@ pub struct Canvas<'a> {
     /// framework `CropTool`'s image mode.
     #[prop(name = "view_follows_pointer")]
     follows_pointer: bool,
+    /// The slot the body's paint reserved for the picture, published in the [`CanvasSpace`]; none in a measuring pass.
+    picture: Option<space::PictureSlot>,
 }
 
 /// A canvas's view in one pass.
@@ -222,12 +228,14 @@ impl<'a> Canvas<'a> {
             navigation: NavigationOptions::default(),
             show_rulers: false,
             keys_to_body: false,
+            pasteboard: PasteboardColor::Default,
             rulers: None,
             snap: None,
             settled: None,
             context_key: false,
             ease: None,
             follows_pointer: false,
+            picture: None,
         }
         .label(label)
         .ltr_axis()
@@ -330,13 +338,19 @@ impl<'a> Canvas<'a> {
             }
         }
         let mut jumped = false;
-        if let Some(wheel) = cx.take_wheel()
-            && let Some(action) = motion.wheel.read(&wheel, WheelNavigation::LINE, cx.env.shell().os, &self.navigation)
-        {
-            // The pointer the wheel came at: the canvas's own widget is not hovered where an app widget in its body
-            // covers it.
-            let at = wheel.at.unwrap_or_else(|| view.rect.center());
-            jumped |= WheelNavigation::apply(&mut view, action, at, size, pixels_per_point);
+        if let Some(wheel) = cx.take_wheel() {
+            let os = cx.env.shell().os;
+            if let Some(action) = motion.wheel.read(&wheel, WheelNavigation::LINE, os, &self.navigation) {
+                // The pointer the wheel came at: the canvas's own widget is not hovered where an app widget in its body
+                // covers it.
+                let at = wheel.at.unwrap_or_else(|| view.rect.center());
+                jumped |= WheelNavigation::apply(&mut view, action, at, size, pixels_per_point);
+            }
+            // A trackpad rotation or a twist of two fingers turns the view; a mirrored view turns the other way.
+            if let Some(degrees) = WheelNavigation::rotation(&WheelInput::of(&wheel, WheelNavigation::LINE, os), &self.navigation) {
+                view.rotation = normalized_angle(view.rotation + ViewTurn::screen_delta(degrees, view.flip_x));
+                jumped = true;
+            }
         }
         if let Some(delta) = Self::background_press(cx).1 {
             pan(&mut view, delta);
@@ -368,12 +382,11 @@ impl<'a> Canvas<'a> {
         }
         // A pan or a scroll takes over from an ease, here or in a tool.
         let mut steer = motion.steer.take();
-        match self.ease {
-            Some(Steer::Ease { .. }) if !self.navigation.animated_zoom => steer = Some(Steer::Stop),
-            Some(ease) => steer = Some(ease),
-            None => {}
+        if let Some(ease) = self.ease {
+            steer = Some(ease);
         }
-        if jumped {
+        // With Animated Zoom off no ease runs, whether the app passed one this pass or one was running.
+        if jumped || !self.navigation.animated_zoom {
             steer = Some(Steer::Stop);
         }
         let before = view;
@@ -422,7 +435,23 @@ impl<'a> Canvas<'a> {
         if easing {
             space.ease_through(shown);
         }
-        Some(space.with_keys(keys).with_document(self.document_size()).with_rulers(self.rulers).with_background(background).with_canvas(id))
+        let space = space
+            .with_keys(keys)
+            .with_document(self.document_size())
+            .with_rulers(self.rulers)
+            .with_pasteboard(self.pasteboard)
+            .with_background(background)
+            .with_canvas(id);
+        Some(match self.picture {
+            Some(slot) => space.with_picture(slot),
+            None => space,
+        })
+    }
+
+    /// The snap of this pass: the app's with the tolerance of the view on screen and the OS the pass runs on.
+    fn snapped(&self, os: craft_keymap::Platform) -> Option<Snap> {
+        let view = self.settled.map(|settled| settled.shown).or(self.given)?;
+        self.snap.clone().map(|snap| snap.at(&view, os))
     }
 
     /// The press on the background part as the canvas reports it, and the pan of a middle-button drag: a middle press
@@ -474,11 +503,11 @@ impl CanvasOutput {
         clamped(view, self.document, &self.navigation)
     }
 
-    /// Where a press on the background was released without a drag. A tool that creates geometry opens its command
-    /// form at this point.
+    /// Where a primary press on the background was released without a drag. A tool that creates geometry opens its
+    /// command form at this point.
     pub fn click_at(&self) -> Option<Pos2> {
         match self.press.phase {
-            PressPhase::Release { pos, click: true, .. } => Some(pos),
+            PressPhase::Release { start, pos, click: true, .. } if start.button == PointerButton::Primary => Some(pos),
             _ => None,
         }
     }
@@ -511,6 +540,13 @@ impl Component for Canvas<'_> {
         WheelNotch::Points(WheelNavigation::LINE)
     }
 
+    /// Reserves the slot the picture paints into, under every canvas control of the body (`CanvasSpace::paint_picture`).
+    fn paint(&mut self, _ui: &mut PaintUi<'_>, cx: &Cx<'_, Self>) {
+        let layer = cx.response.layer_id;
+        let idx = cx.core.ctx.graphics_mut(|graphics| graphics.entry(layer).add(cx.content_rect, Shape::Noop));
+        self.picture = Some(space::PictureSlot { layer, idx });
+    }
+
     /// The view of this pass, kept for the body and `finish`.
     fn update(&mut self, cx: &mut Cx<'_, Self>) {
         // Left untaken: the canvas's generic context request is recorded as for a secondary click.
@@ -537,15 +573,16 @@ impl Component for Canvas<'_> {
     /// The canvas's [`CanvasSpace`] for its body; a canvas without a view hides an outer canvas's.
     fn content_env(&self, cx: &Cx<'_, Self>, values: &mut crate::runtime::env::AppValues) {
         space::publish(values, self.space(cx.response.id, cx.env.scale().0, BackgroundPress::of(&Self::background_press(cx).0, self.context_key)));
-        snap::publish(values, self.snap.clone());
+        snap::publish(values, self.snapped(cx.env.shell().os));
     }
 
     /// The background part the active tool gets. It sits in the canvas root's space, the parent layer's. A press on it
-    /// focuses the canvas, so the keys the tool reads reach it.
+    /// focuses the canvas, so the keys the tool reads reach it. It has a context menu, so the press machine tells a
+    /// secondary click from a secondary drag on it as it does for the primary button.
     fn parts(&mut self, rect: Rect, cx: &mut PartsCx<'_, Self>) {
         cx.part(BACKGROUND, rect)
             .priority(HitPriority::new(HitLevel::Background, 0))
-            .sense(Sense::CLICK | Sense::DRAG | Sense::TAKE_FOCUS)
+            .sense(Sense::CLICK | Sense::CONTEXT_CLICK | Sense::DRAG | Sense::TAKE_FOCUS)
             .pointer_only(TOOL_PATH);
     }
 
@@ -554,7 +591,8 @@ impl Component for Canvas<'_> {
         let space = self.space(cx.response.id, cx.env.scale().0, BackgroundPress::of(&press, self.context_key));
         let view = self.settled.map(|settled| settled.target).filter(|target| Some(*target) != self.given);
         let document = self.document_size();
-        CanvasOutput { response: cx.response.clone(), press, space, view, snap: self.snap, document, navigation: self.navigation }
+        let snap = self.snapped(cx.env.shell().os);
+        CanvasOutput { response: cx.response.clone(), press, space, view, snap, document, navigation: self.navigation }
     }
 }
 

@@ -10,7 +10,7 @@ use crate::runtime::env::{Env, Label};
 use crate::runtime::focus::Initial;
 use crate::runtime::overlay::CloseReason;
 use crate::sections::{DialogRole, FooterButton, Section};
-use craft_keymap::mnemonic;
+use craft_keymap::{Chord, mnemonic};
 use craft_theme::variant::Tone;
 use egui::{Response, Ui};
 
@@ -23,6 +23,7 @@ pub(super) struct Reply {
     label: Label,
     role: DialogRole,
     lettered: bool,
+    chord: Option<Chord>,
     enabled: bool,
     reason: Option<Label>,
 }
@@ -30,12 +31,19 @@ pub(super) struct Reply {
 impl Reply {
     /// An answer with a letter.
     pub(super) fn new(label: impl Into<Label>, role: DialogRole) -> Self {
-        Reply { label: label.into(), role, lettered: true, enabled: true, reason: None }
+        Reply { label: label.into(), role, lettered: true, chord: None, enabled: true, reason: None }
     }
 
     /// An answer without a letter.
     pub(super) fn plain(label: impl Into<Label>, role: DialogRole) -> Self {
         Reply { lettered: false, ..Reply::new(label, role) }
+    }
+
+    /// A modified chord that also gives this answer while the prompt is the top modal (Cmd+D for Don't Save on
+    /// macOS), whatever control has the focus.
+    pub(super) fn chord(mut self, chord: Chord) -> Self {
+        self.chord = Some(chord);
+        self
     }
 
     /// Whether the answer is available; `reason` is what the disabled button tells.
@@ -46,13 +54,14 @@ impl Reply {
     }
 }
 
-/// The buttons of `replies`, in the given order. The letters are assigned over the labels in the scope's language
-/// (`craft_keymap::mnemonic::assign`), so every language gets letters from its own words; the footer shows them.
+/// The buttons of `replies`, in the given order. The letters are assigned over the labels in the scope's language and
+/// compared under its text folding (`craft_keymap::mnemonic::assign` with [`Env::folder`]), so every language gets
+/// letters from its own words; the footer shows them.
 pub(super) fn buttons(env: &Env, replies: Vec<Reply>) -> Vec<FooterButton> {
     let view = env.view();
     let labels: Vec<Label> = replies.iter().map(|reply| view.resolve(&reply.label)).collect();
     let lettered: Vec<&str> = replies.iter().zip(&labels).filter(|(reply, _)| reply.lettered).map(|(_, label)| label.as_str()).collect();
-    let mut letters = mnemonic::assign(&lettered).into_iter();
+    let mut letters = mnemonic::assign(&lettered, &env.folder()).into_iter();
     replies
         .into_iter()
         .zip(labels)
@@ -60,6 +69,9 @@ pub(super) fn buttons(env: &Env, replies: Vec<Reply>) -> Vec<FooterButton> {
             let mut button = FooterButton::new(label, reply.role).enabled(reply.enabled);
             if let Some(reason) = reply.reason {
                 button = button.disabled_reason(reason);
+            }
+            if let Some(chord) = reply.chord {
+                button = button.chord(chord);
             }
             match reply.lettered.then(|| letters.next().flatten()).flatten() {
                 Some((letter, _)) => button.letter(letter),

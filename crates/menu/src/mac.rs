@@ -35,7 +35,9 @@ use craft_keymap::{Chord, CommandRef, Key, Mods};
 use craft_window::native_menu as native;
 
 use crate::driver::{Backend, Dispatch, Event, NativeMenu, native_ok};
-use crate::model::{Builtin, Item, ItemKind, Menu, MenuBar, MenuRole, Node, Standard, label_or_system, native_id, structure_key, window_key};
+use crate::model::{
+    Alternate, Builtin, Item, ItemKind, Menu, MenuBar, MenuRole, Node, Standard, label_or_system, native_id, structure_key, window_key,
+};
 
 /// Install the native menu bar for `bar` (a [`crate::mac_layout`] result) and return the driver
 /// for it. Call it once, on the main thread, in eframe's creator closure, so winit's default menu
@@ -97,7 +99,7 @@ pub fn install_with(ctx: &egui::Context, bar: &MenuBar, options: MacOptions) -> 
 /// ⌘Q quits without asking.
 pub fn install_app_menu(ctx: &egui::Context, app_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ctx = ctx.clone();
-    let handler = Arc::new(move |id: &str, _: Option<native::Held>| {
+    let handler = Arc::new(move |id: &str, _: native::Chosen| {
         craft_quit::on_menu_event(&ctx, id);
         // Choosing an item is not window input, so nothing else wakes egui.
         ctx.request_repaint();
@@ -115,6 +117,8 @@ struct Target {
     command: CommandRef,
     chord: Option<Chord>,
     layout_shortcut: bool,
+    /// The command a click runs instead while the alternate's modifiers are held.
+    alternate: Option<Alternate>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -189,7 +193,10 @@ fn lower_nodes(nodes: &[Node], targets: &mut HashMap<String, Target>) -> Vec<nat
                     ItemKind::Plain => None,
                 };
                 let item = native::Item::new(id.clone(), native_label(it)).enabled(it.enabled).checked(checked).shortcut(shortcut);
-                targets.insert(id, Target { command: it.command.clone(), chord: it.shortcut, layout_shortcut: it.layout_shortcut });
+                targets.insert(
+                    id,
+                    Target { command: it.command.clone(), chord: it.shortcut, layout_shortcut: it.layout_shortcut, alternate: it.alternate.clone() },
+                );
                 native::Node::Item(item)
             }
         })
@@ -253,12 +260,13 @@ impl Backend for Native {
 
     fn attach(&mut self, dispatch: Dispatch) {
         let (ctx, targets, tx) = (self.ctx.clone(), self.targets.clone(), self.tx.clone());
-        self.bar.set_handler(Arc::new(move |id: &str, held: Option<native::Held>| {
+        self.bar.set_handler(Arc::new(move |id: &str, chosen: native::Chosen| {
             let target = lock(&targets).get(id).cloned();
             // Ids that aren't ours are AppKit's own items (Services, Zoom, …), already handled.
             if let Some(t) = target {
-                let held = held.map(|h| Mods { cmd: h.command, ctrl: h.control, alt: h.option, shift: h.shift });
-                let event = dispatch.chosen(&t.command, t.chord.as_ref(), t.layout_shortcut, held);
+                let h = chosen.held;
+                let mods = Mods { cmd: h.command, ctrl: h.control, alt: h.option, shift: h.shift };
+                let event = dispatch.chosen(&t.command, t.chord.as_ref(), t.layout_shortcut, chosen.key_down, mods, t.alternate.as_ref());
                 // The receiver goes away only with the app.
                 let _ = tx.send(event);
             }

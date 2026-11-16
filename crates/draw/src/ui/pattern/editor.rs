@@ -11,7 +11,7 @@ use craft_ui::contract::{Bind, FieldLayout, Outcome, Props as _, Remember as _, 
 use craft_ui::display::{Shade, Text};
 use craft_ui::form::{Field, FieldGroup};
 use craft_ui::layout_components::Row;
-use craft_ui::patterns::presets::{CellShape, PickerField, PresetBrowser, PresetPicker, PresetRow, PresetState, PresetView, ThumbInfo};
+use craft_ui::patterns::presets::{CellShape, PresetBrowser, PresetPicker, PresetRow, PresetState, PresetView, ThumbInfo};
 use craft_ui::primitives::ContentPainterCx;
 use craft_ui::runtime::env::{Env, Label, UnitKind};
 use craft_ui::text::NumberField;
@@ -19,7 +19,7 @@ use craft_ui::value_drag::AngleDial;
 use egui::{Rect, Response, Ui};
 
 /// The angle of the dial runs over half a turn each way.
-const ANGLE_RANGE: std::ops::RangeInclusive<f64> = -180.0..=180.0;
+pub(super) const ANGLE_RANGE: std::ops::RangeInclusive<f64> = -180.0..=180.0;
 
 type SwatchPaintFn = Arc<dyn Fn(&ContentPainterCx<'_>, Rect, &PatternSwatch) + Send + Sync>;
 
@@ -139,14 +139,12 @@ impl<'a> PatternFillEditor<'a> {
                         .show(ui, |ui, _| {
                             Row::new()
                                 .show(ui, |ui, _| {
-                                    let picker = PresetPicker::new(
+                                    let picker = PresetPicker::pattern(
                                         words.pattern.clone(),
                                         Bind::given(Some(current.pattern.clone())),
                                         &rows,
                                         Bind::bound(&mut state),
                                     )
-                                    .field(PickerField::Thumbnail)
-                                    .cell_shape(CellShape::Square)
                                     .show(ui);
                                     let snap = Button::new(words.snap_to_origin.clone()).id_salt("snap").show(ui);
                                     (picker.picked, clicked(&snap))

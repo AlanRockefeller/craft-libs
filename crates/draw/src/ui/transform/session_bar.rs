@@ -4,7 +4,7 @@
 mod stories;
 
 use super::session::{TransformEdit, TransformPhase, TransformSession, TransformSettings, TransformWarp};
-use super::transform_fields::{BarGroups, TransformFields, TransformRow, size_unit_of};
+use super::transform_fields::{TransformFields, TransformGroups, TransformRow, size_unit_of};
 use craft_behavior::{EditEvent, IconId, Mixed, RulerUnits};
 use craft_ui::bars::{Bar, BarKind};
 use craft_ui::buttons::IconButton;
@@ -83,11 +83,11 @@ impl<W> Outcome for TransformBarOutput<W> {
 ///   phase).
 /// - Warp phase: the app's [`warp_fields`](Self::warp_fields) group in place of the fields; then cancel, commit, Reset
 ///   warp, a rule and the switch.
-/// - [`groups`](Self::groups) narrows the strip; [`mode_switch`](Self::mode_switch) hides the switch (Content-Aware
-///   Scale).
+/// - [`groups`](Self::groups) narrows the strip. The switch is hidden for content that cannot warp (Content-Aware
+///   Scale, masks, channels, Quick Mask): the session's `BoxAllow::warp`.
 /// - Every control is an ordinary focusable control. The bar never changes the session: it reports
 ///   [`TransformEdit`]s, and writes the persisted choices (Show Reference Point, the aspect link, the interpolation,
-///   the W and H unit) to its settings binding as well.
+///   the W and H unit, the relative position) to its settings binding as well.
 #[must_use = "show the bar with `show`"]
 #[derive(craft_ui::contract::Pattern)]
 #[pattern(probe(TransformBar<'static, ()>))]
@@ -95,8 +95,7 @@ pub struct TransformBar<'a, W> {
     label: Label,
     session: &'a TransformSession<W>,
     settings: Bind<'a, TransformSettings>,
-    groups: BarGroups,
-    mode_switch: bool,
+    groups: TransformGroups,
     warp_fields: Option<BarSlot<'a>>,
     extra: Option<BarSlot<'a>>,
     units: (RulerText, RulerText),
@@ -111,8 +110,7 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
             label: label.into(),
             session,
             settings,
-            groups: BarGroups::ALL,
-            mode_switch: true,
+            groups: TransformGroups::ALL,
             warp_fields: None,
             extra: None,
             units: (pixels, pixels),
@@ -121,14 +119,8 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
     }
 
     /// Which groups of the fields show; all by default.
-    pub fn groups(mut self, groups: BarGroups) -> Self {
+    pub fn groups(mut self, groups: TransformGroups) -> Self {
         self.groups = groups;
-        self
-    }
-
-    /// Whether the Free Transform / Warp switch shows; true by default.
-    pub fn mode_switch(mut self, shown: bool) -> Self {
-        self.mode_switch = shown;
         self
     }
 
@@ -158,7 +150,7 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
 
     /// Shows the bar.
     pub fn show(self, ui: &mut Ui) -> TransformBarOutput<W> {
-        let TransformBar { label, session, mut settings, groups, mode_switch, mut warp_fields, mut extra, units, size_units } = self;
+        let TransformBar { label, session, mut settings, groups, mut warp_fields, mut extra, units, size_units } = self;
         let env = Env::of(ui);
         let words = env.words::<TransformBarWords>();
         let points = env.units().points_per_inch();
@@ -169,13 +161,14 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
         let mut reset_warp = false;
         let mut unit_picked = None;
         let mut switched = false;
+        let warp_allowed = session.allows().warp;
         // Reset warp and the mode switch stay in view after commit and cancel while the fields scroll.
         let trailing = |ui: &mut Ui, _: &mut BodyCx<'_>| {
             if warping {
                 let reset = IconButton::new(IconId::new("undo")).label(words.reset_warp.clone()).show(ui);
                 reset_warp = clicked(&reset);
             }
-            if mode_switch {
+            if warp_allowed {
                 Divider::vertical().show(ui);
                 let switch = IconButton::new(IconId::new("grid")).label(words.switch_warp.clone()).selected(warping).show(ui);
                 switched = clicked(&switch);
@@ -199,6 +192,7 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
                 let mut fields = TransformFields::new(label.clone(), Bind::given(row), session.rect(), Bind::given(current.aspect_linked))
                     .bar()
                     .groups(groups)
+                    .relative(Bind::given(current.relative_position))
                     .units(units.0, units.1)
                     .size_unit(size_unit_of(unit, units.0, points))
                     .interpolation(Bind::given(session.interpolation()));
@@ -247,9 +241,12 @@ impl<'a, W: TransformWarp> TransformBar<'a, W> {
         if let Some(on) = shown.linked {
             settings.aspect_linked = on;
         }
+        if let Some(on) = shown.relative {
+            settings.relative_position = on;
+        }
         if let Some(choice) = shown.interpolation {
             edits.push(TransformEdit::Interpolation(choice));
-            settings.interpolation = choice;
+            settings.interpolation = Some(choice);
         }
         if let Some(unit) = shown.unit_picked {
             settings.size_unit = Some(unit);

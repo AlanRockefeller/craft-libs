@@ -6,7 +6,7 @@ mod completion;
 use crate::primitives::{TextLayout, TextOptions};
 use crate::runtime::access::text::{Line, Run};
 use crate::runtime::egui::{clipboard, focus as egui_focus, input as egui_input, text_edit};
-use crate::runtime::focus::{KeepKeys, KeyUse};
+use crate::runtime::focus::{EditSet, KeepKeys, KeyUse};
 use crate::runtime::keys::{self, Intents};
 use crate::runtime::{commands, ime};
 use craft_behavior::{EditCommand, EditorInput, Intent, PartKey, TextPos};
@@ -29,6 +29,12 @@ pub(crate) enum End {
     /// The component put the text back as it was before the run (`Cx::set_draft` with `None`): the run ends as
     /// Escape ends it, but the Escape is not the field's.
     Revert,
+    /// The draft becomes the codec's normal form of its value and is selected; nothing applies and the run stays
+    /// open. `refuses` for a Tab on a `tab_rewrites` part, which alerts; a press that holds the draft does not.
+    Rewrite {
+        /// The rewrite alerts through `frame::refuse`.
+        refuses: bool,
+    },
 }
 
 /// A change of the draft the component asked for, applied in the next pass (`Cx::set_draft`).
@@ -76,7 +82,8 @@ pub(crate) struct TextState {
     /// The draft change `Cx::set_draft` asked for, applied at the start of the next pass.
     pub change: Option<DraftChange>,
     /// The selection, `(caret, anchor)`, the text part had when its edit menu took the focus: egui collapses the
-    /// selection of a widget without focus, and the menu's command acts on it once the focus is back.
+    /// selection of a widget without focus, and the menu's command acts on it once the focus is back, which reaches the
+    /// widget the pass after the menu closes.
     pub held_selection: Option<(usize, usize)>,
 }
 
@@ -85,9 +92,16 @@ pub(crate) fn text_id(id: Id, key: PartKey) -> Id {
     crate::runtime::memory::sub(id, ("text", key))
 }
 
-/// The keys the text part keeps, from its options.
-pub(crate) fn keys_of(base: KeyUse, options: &TextOptions) -> KeyUse {
-    let keys = if options.tab_inserts {
+/// The keys the text part keeps, from its options and the selection of its widget `widget`: with no selection Cut,
+/// Copy and Delete are inactive, so their keys and menu picks still reach the part (which does nothing with them, and
+/// never lets them reach the app) and the edit menu shows them disabled. The board reads the keys the stop registered;
+/// a selection change repaints, which registers them again. The selection is the one the part acts on: `held`, the
+/// one it kept while its edit menu has the focus (egui collapses the selection of a widget without focus), else its
+/// widget's.
+pub(crate) fn keys_of(ctx: &Context, widget: Id, held: Option<(usize, usize)>, base: KeyUse, options: &TextOptions) -> KeyUse {
+    debug_assert!(!(options.tab_inserts && options.tab_rewrites), "a text part either inserts or rewrites on Tab");
+    // A rewriting part keeps Tab so the focus service never moves focus on it.
+    let keys = if options.tab_inserts || options.tab_rewrites {
         base.with_keep(KeepKeys::Tab)
     } else if options.multiline() {
         base.with_keep(KeepKeys::BlockArrows)
@@ -95,6 +109,14 @@ pub(crate) fn keys_of(base: KeyUse, options: &TextOptions) -> KeyUse {
         base
     };
     let keys = keys.with_value(base.value || options.steps_value);
+    let keys = if options.holds_drafts { keys.with_holds_drafts() } else { keys };
+    let selected = held.or_else(|| selection(ctx, widget)).is_some_and(|(caret, anchor)| caret != anchor);
+    let keys = if selected {
+        keys
+    } else {
+        let idle = [EditCommand::Cut, EditCommand::Copy, EditCommand::Delete].into_iter().filter(|command| base.edits.contains(*command));
+        keys.with_inactive(idle.fold(EditSet::NONE, EditSet::with))
+    };
     // A multi-line part makes a plain Enter a line break.
     if options.submits || options.multiline() { keys.with_submits() } else { keys }
 }
@@ -305,6 +327,19 @@ fn arrows_from_end(ctx: &Context, widget: Id, len: usize) {
     }
 }
 
+/// Removes this pass's Tab and Shift+Tab presses from the input events; returns whether there was one. A Tab with
+/// Ctrl, Cmd or Alt is the window's, not the field's, and stays.
+fn take_tab(ctx: &Context) -> bool {
+    ctx.input_mut(|input| {
+        let before = input.events.len();
+        input.events.retain(|event| {
+            !matches!(event, egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. }
+                if !modifiers.ctrl && !modifiers.command && !modifiers.mac_cmd && !modifiers.alt)
+        });
+        input.events.len() != before
+    })
+}
+
 /// The modifiers held in this pass, which are the Enter press's.
 fn held_mods(ctx: &Context) -> Mods {
     let os = crate::runtime::windows::os_of(ctx);
@@ -319,10 +354,13 @@ pub(crate) fn run(state: &mut TextState, mut input: AdapterIn<'_>) -> AdapterOut
         if state.held_selection.is_none() {
             state.held_selection = selection(ctx, widget);
         }
-    } else if let Some((caret, anchor)) = state.held_selection.take()
-        && input.focused
-    {
-        select(ctx, widget, anchor, caret);
+    } else if input.focused {
+        if let Some((caret, anchor)) = state.held_selection.take() {
+            select(ctx, widget, anchor, caret);
+        }
+    } else if !state.focused {
+        // The menu closed a pass ago and the focus went elsewhere: nothing comes back to the held selection.
+        state.held_selection = None;
     }
     let mut base = state.draft.clone().or_else(|| state.normalised.take()).unwrap_or_else(|| input.shown.to_owned());
     let mut edited = apply(&mut input, state, &mut base, widget);
@@ -361,6 +399,10 @@ pub(crate) fn run(state: &mut TextState, mut input: AdapterIn<'_>) -> AdapterOut
         arrows_from_end(ctx, widget, base.chars().count());
     }
     let separated = input.focused && !input.read_only && state.preedit.is_none() && egui_input::take_separator(ctx, input.options.commit_on);
+    // The part keeps Tab (`keys_of`), so the focus service left it here; it is taken before the widget would insert it.
+    if input.focused && input.options.tab_rewrites && !input.read_only && state.preedit.is_none() && take_tab(ctx) {
+        state.end = Some(End::Rewrite { refuses: true });
+    }
     let filter = egui_focus::event_filter(input.keys.keep, false);
     let edit = text_edit::Edit {
         id: widget,
@@ -413,6 +455,16 @@ pub(crate) fn run(state: &mut TextState, mut input: AdapterIn<'_>) -> AdapterOut
     let typing = shown.focused && state.preedit.is_none() && !input.read_only;
     let at = state.draft.as_deref().filter(|_| typing).map(|text| (text, caret.unwrap_or_else(|| text.chars().count())));
     state.completions.refresh(input.options.complete.as_deref(), at);
+    // An Arrow or Page key on a stepping field (`steps_value`) with an unapplied draft applies the draft in this pass,
+    // so the step the component takes next starts from the committed value, not from the value before the typing.
+    let stepped = shown.focused
+        && !input.read_only
+        && input.options.steps_value
+        && !input.options.multiline()
+        && state.preedit.is_none()
+        && state.draft.is_some()
+        && ctx
+            .input(|i| [egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::PageUp, egui::Key::PageDown].into_iter().any(|key| i.key_pressed(key)));
     let submitted =
         (shown.entered && shown.focused).then(|| held_mods(ctx)).filter(|mods| !input.options.multiline() || (input.options.submits && mods.cmd));
     if let Some(mods) = submitted {
@@ -422,6 +474,8 @@ pub(crate) fn run(state: &mut TextState, mut input: AdapterIn<'_>) -> AdapterOut
             input.intents.take(Intent::SubmitForce);
         }
     } else if separated {
+        state.end = Some(End::Separator);
+    } else if stepped && state.end.is_none() {
         state.end = Some(End::Separator);
     } else if shown.lost_focus && !input.held && state.draft.is_some() && state.end.is_none() {
         state.end = Some(End::Blur);

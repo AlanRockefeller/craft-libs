@@ -90,6 +90,11 @@ impl<'a> EnvView<'a> {
         self.scoped.motion
     }
 
+    /// Whether the canvas surround shows the theme's pattern (`RootEnv::canvas_pattern`).
+    pub fn canvas_pattern(&self) -> bool {
+        self.scoped.canvas_pattern
+    }
+
     /// The pixels per point.
     pub fn scale(&self) -> Scale {
         self.scoped.scale

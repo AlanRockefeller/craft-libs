@@ -1,6 +1,11 @@
 //! The crop shield: the options that dim the area outside the frame.
 
-use egui::Color32;
+use crate::canvas::CanvasSpace;
+use crate::primitives::{Draw, PaintShape};
+use crate::style::DataColor;
+use craft_behavior::geometry::outside_pieces;
+use craft_behavior::kurbo::Point;
+use egui::{Color32, Pos2};
 
 /// Default shield opacity, in percent.
 const SHIELD_OPACITY: f32 = 75.0;
@@ -58,7 +63,30 @@ impl Default for CropShield {
     }
 }
 
+/// Paints `fill` over the canvas quad outside the convex `hole`, in screen points: one polygon per convex piece of
+/// [`outside_pieces`]. The one shield painter for both crops.
+pub fn paint_outside(draw: &Draw<'_>, canvas: [Pos2; 4], hole: &[Pos2], fill: DataColor) {
+    let point = |p: Pos2| Point::new(f64::from(p.x), f64::from(p.y));
+    let hole: Vec<Point> = hole.iter().copied().map(point).collect();
+    for piece in outside_pieces(canvas.map(point), &hole) {
+        let piece = piece.into_iter().map(|p| Pos2::new(p.x as f32, p.y as f32)).collect();
+        draw.data_fill(&PaintShape::Polygon(piece), fill);
+    }
+}
+
 impl CropShield {
+    /// The Perspective Crop's shield: enabled, a custom grey, 18 % opacity, no auto adjust, cropped area shown.
+    pub const PERSPECTIVE: CropShield = CropShield {
+        show_cropped_area: true,
+        enabled: true,
+        color: ShieldColor::Custom,
+        custom_color: [89, 89, 89],
+        auto_center_preview: true,
+        opacity: 18.0,
+        auto_adjust: false,
+        classic_mode: false,
+    };
+
     /// Show Cropped Area as it acts: always on in Classic mode (the stored choice is kept for the default mode).
     pub fn shows_cropped_area(&self) -> bool {
         self.classic_mode || self.show_cropped_area
@@ -68,6 +96,13 @@ impl CropShield {
     pub fn opacity(&self) -> f32 {
         let o = if self.opacity.is_finite() { self.opacity } else { SHIELD_OPACITY };
         o.clamp(0.0, 100.0) / 100.0
+    }
+
+    /// [`fill`](Self::fill) over the canvas colour of `space`: its pasteboard's colour when it has one, else
+    /// `theme_canvas`. The one rule both crops use to pick the Match Canvas colour.
+    pub fn fill_on(&self, space: &CanvasSpace, theme_canvas: Color32, editing: bool) -> Option<Color32> {
+        let canvas = space.pasteboard().fill().map_or(theme_canvas, |fill| fill.0);
+        self.fill(canvas, editing)
     }
 
     /// What to paint over the area outside the frame, `canvas` being the canvas colour and `editing` a crop drag in

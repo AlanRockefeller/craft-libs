@@ -63,16 +63,42 @@ impl<'a, M: MaskSource> From<&'a M> for OutlineSource<'a> {
 }
 
 /// A point to point map in document pixels: where a Free Transform puts the selection, or the app's warp.
-pub struct PointMap<'a>(Box<dyn Fn(Point) -> Point + 'a>);
+pub struct PointMap<'a> {
+    map: Box<dyn Fn(Point) -> Option<Point> + 'a>,
+    bends: bool,
+}
 
 impl<'a> PointMap<'a> {
-    /// The map that runs `map`.
-    pub fn new(map: impl Fn(Point) -> Point + 'a) -> Self {
-        PointMap(Box::new(map))
+    /// The map that runs `map`; it may drop a point (past a Distort's horizon). Without [`bends`](Self::bends), a segment
+    /// with an unmapped end is left out.
+    pub fn new(map: impl Fn(Point) -> Option<Point> + 'a) -> Self {
+        PointMap { map: Box::new(map), bends: false }
     }
 
-    fn apply(&self, point: Point) -> Point {
-        (self.0)(point)
+    /// Marks the map as bending: the ants are cut into pieces of at most 8 pt and the pieces past the horizon dropped.
+    #[must_use]
+    pub fn bends(mut self) -> Self {
+        self.bends = true;
+        self
+    }
+
+    fn apply(&self, point: Point) -> Option<Point> {
+        (self.map)(point)
+    }
+
+    /// The segment `a`–`b` through the map, as the pieces that stay mapped. A straight map keeps the segment whole and
+    /// drops it when an end is unmapped. A bending map does not keep a straight line straight, so the segment is cut
+    /// into pieces `piece` document units long at most (the view's 8 pt), and each piece with an unmapped end is
+    /// dropped.
+    fn lines(&self, a: Point, b: Point, piece: f64) -> Vec<(Point, Point)> {
+        if !self.bends {
+            return self.apply(a).zip(self.apply(b)).into_iter().collect();
+        }
+        let length = (b - a).hypot();
+        let count = if length.is_finite() && piece > 0.0 { (length / piece).ceil().clamp(1.0, 256.0) as usize } else { 1 };
+        let at = |i: usize| a.lerp(b, i as f64 / count as f64);
+        let ends: Vec<Option<Point>> = (0..=count).map(|i| self.apply(at(i))).collect();
+        ends.windows(2).filter_map(|pair| pair[0].zip(pair[1])).collect()
     }
 }
 
@@ -100,9 +126,10 @@ pub struct SelectionOverlayOutput {
 /// region [`quantised_region`] of the view's visible bounds shifted back by the [`offset`](Self::offset), so a small
 /// pan reuses the trace; bounds the mask's content bounds (the whole canvas when [`MaskSource::outside`] is above 0)
 /// within the region. With a [`mapped`](Self::mapped) outline the whole selection is traced instead (a Free Transform
-/// may carry parts from outside the view into it) with [`bounded_step`]. Segments are scaled up by the reduction.
-/// The trace is kept per overlay and runs again only when the mask's revision, the step, the region or the reduction
-/// changes.
+/// may carry parts from outside the view into it) with [`bounded_step`]. Segments are scaled up by the reduction and clamped to the canvas's document, so the ants of a reduced
+/// copy whose size is not a multiple of the reduction stay off the pasteboard.
+/// The trace is kept per overlay and runs again only when the mask's revision, the step, the region, the reduction or
+/// the canvas's document changes.
 ///
 /// Each segment end moves by the [`offset`](Self::offset), then through the [`mapped`](Self::mapped) map, then through
 /// the canvas view, so the ants are crisp on device pixels at any zoom and rotation.
@@ -126,8 +153,7 @@ pub struct SelectionOverlay<'a> {
     /// pixels each way. 0 counts as 1.
     #[prop(quantity = "reduction")]
     reduction: u32,
-    /// Draws the outline through this map, document point to document point.
-    #[prop(func = "Fn(Point) -> Point")]
+    /// The outline's map, document point to document point; set with [`mapped`](Self::mapped).
     mapped: Option<PointMap<'a>>,
     /// The Selection Preview mode (Color Range's modes, or Quick Mask).
     #[prop]
@@ -155,6 +181,12 @@ impl<'a> SelectionOverlay<'a> {
             quick_mask: QuickMaskLook::default(),
             unit: UnitKind::Pixels,
         }
+    }
+
+    /// Draws the outline through `map` (a [`PointMap`], bends kept); `None` draws it where it is.
+    pub fn mapped(mut self, map: Option<PointMap<'a>>) -> Self {
+        self.mapped = map;
+        self
     }
 
     /// Shows the overlay over `canvas`, the rect of the canvas it is shown in.
@@ -189,11 +221,13 @@ impl<'a> SelectionOverlay<'a> {
                 OutlineSource::Segments { segments, .. } => Arc::new(segments.to_vec()),
             };
             let [dx, dy] = offset.map(f64::from);
-            let place = |p: [i32; 2]| {
-                let at = Point::new(f64::from(p[0]) + dx, f64::from(p[1]) + dy);
-                mapped.as_ref().map_or(at, |map| map.apply(at))
+            let place = |p: [i32; 2]| Point::new(f64::from(p[0]) + dx, f64::from(p[1]) + dy);
+            // A bending map cuts each segment into pieces of at most 8 pt of the view.
+            let piece = canvas_space(&env.view()).map_or(f64::INFINITY, |space| space.view.doc_len(8.0));
+            let lines: Vec<(Point, Point)> = match &mapped {
+                None => traced.iter().map(|&(a, b)| (place(a), place(b))).collect(),
+                Some(map) => traced.iter().flat_map(|&(a, b)| map.lines(place(a), place(b), piece)).collect(),
             };
-            let lines = traced.iter().map(|&(a, b)| (place(a), place(b)));
             let value = value_of(&env, &words, bounds, preview, unit);
             Marquee::segments(label, lines).look(MarqueeLook::Ants).value(value).show_at(ui, canvas);
         }
@@ -277,8 +311,9 @@ impl RasterSource for SelectionPreviewSource<'_> {
     }
 }
 
-/// The key a trace is cached under: the mask's revision, the step, the region and the reduction.
-type TraceKey = (u64, u32, MaskRect, u32);
+/// The key a trace is cached under: the mask's revision, the step, the region, the reduction and the clamp to the
+/// canvas (so a canvas resize traces again).
+type TraceKey = (u64, u32, MaskRect, u32, Option<MaskRect>);
 
 /// The last trace of one overlay.
 #[derive(Clone, Default)]
@@ -375,7 +410,15 @@ impl Component for OutlineTrace<'_> {
         if self.whole {
             step = bounded_step(bounds, step);
         }
-        let key = (mask.revision(), step, region, k);
+        // A reduced mask's size scaled up can pass the canvas (3301 px at k = 3: 1101 × 3 = 3303), so its scaled segments
+        // are clamped to the document the canvas reports, in the mask's own coordinates (before the offset). Without a
+        // document size, no clamp.
+        let limit = space.document().filter(|_| k > 1).map(|document| {
+            let [dx, dy] = self.offset.map(f64::from);
+            let round = |v: f64, up: bool| (if up { v.ceil() } else { v.floor() }).clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+            MaskRect::new(round(-dx, false), round(-dy, false), round(document.width - dx, true), round(document.height - dy, true))
+        });
+        let key = (mask.revision(), step, region, k, limit);
         let cache = cx.memory::<TraceCache>();
         if cache.key == Some(key) {
             self.found = Traced { segments: cache.segments.clone(), retraced: false };
@@ -384,7 +427,10 @@ impl Component for OutlineTrace<'_> {
         let mut segments = outline(mask, bounds, step);
         if k > 1 {
             let scale = i32::try_from(k).unwrap_or(i32::MAX);
-            let up = |p: [i32; 2]| [p[0].saturating_mul(scale), p[1].saturating_mul(scale)];
+            let up = |p: [i32; 2]| {
+                let at = [p[0].saturating_mul(scale), p[1].saturating_mul(scale)];
+                limit.map_or(at, |l| [at[0].clamp(l.x0, l.x1.max(l.x0)), at[1].clamp(l.y0, l.y1.max(l.y0))])
+            };
             segments.iter_mut().for_each(|(a, b)| (*a, *b) = (up(*a), up(*b)));
         }
         let segments = Arc::new(segments);

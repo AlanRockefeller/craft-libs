@@ -21,6 +21,10 @@ fn open_slot<'s>(stage: &'s mut MemoryStage, id: Id, save: Option<&SaveKey>) -> 
 
 /// Whether the container is open this pass: its binding, else its opener's state, else its slot.
 pub(super) fn open_now<C: Container>(comp: &mut C, stage: &mut MemoryStage, id: Id, props: &ContainerProps) -> bool {
+    // A popup's layer (`OverlayUi::show_container`) is open while the popup is: the popup's slot is the one owner.
+    if let Some(open) = crate::contract::overlay::popup_layer_open(stage.ctx(), id) {
+        return open;
+    }
     let initially_open = props.collapse.is_none_or(|collapse| collapse.initially_open);
     match comp.open() {
         Some(bind) => matches!(bind.get(), Some(Mixed::Same(true))),
@@ -34,7 +38,7 @@ pub(super) fn open_now<C: Container>(comp: &mut C, stage: &mut MemoryStage, id: 
 /// Whether the layer-like container `id` shows nothing this pass: closed, past its exit fade, with no close waiting
 /// for it. The read step and the mount host would decide the same; a peek stage decides it, so a container found open
 /// runs with nothing applied twice. A closed one writes what deciding changed (a hold's dwell, its slot's first value)
-/// as its read step would have, outside a sizing pass.
+/// as its read step would have, outside a sizing pass, and stamps no `Seen`: it is not shown.
 pub(crate) fn unshown<C: Container>(comp: &mut C, ctx: &Context, id: Id, props: &ContainerProps, sizing: bool) -> bool {
     if !matches!(props.mount, Mount::Layer(_) | Mount::FullWindow | Mount::Viewport { .. }) {
         return false;
@@ -46,7 +50,7 @@ pub(crate) fn unshown<C: Container>(comp: &mut C, ctx: &Context, id: Id, props: 
         return false;
     }
     if !sizing {
-        let mut stage = MemoryStage::open(ctx, id);
+        let mut stage = MemoryStage::open_after(ctx, id, id);
         let open = open_now(comp, &mut stage, id, props);
         debug_assert!(!open, "a peek and a real stage decide the same open state");
         stage.write_back();
@@ -61,6 +65,11 @@ impl BodyHooks<'_> {
             return;
         }
         let id = cx.core.id;
+        // A popup's layer leaves its open state to the popup's slot, which its close (`note_layer_closed`) writes.
+        if crate::contract::overlay::popup_layer_open(&cx.core.ctx, id).is_some() {
+            self.open_at_read = self.open;
+            return;
+        }
         let opener = opener_of(comp.props(Internal::new())).cloned();
         match comp.open() {
             Some(mut bind) => {

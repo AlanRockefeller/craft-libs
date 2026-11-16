@@ -14,7 +14,7 @@ const CJK: &[u8] = include_bytes!("../../fonts/NotoSansCJKsc-test.otf");
 const OFFERED: &[&str] = &["en", "ar", "ja", "zh-CN", "zh-TW", "zh-HK", "ko", "th", "ka", "ru"];
 
 const fn face(family: &'static str, style: &'static str, scripts: &'static [&'static str]) -> EmbeddedFace {
-    EmbeddedFace { family, style, scripts, bytes: &[], index: 0 }
+    EmbeddedFace { family, style, scripts, bytes: &[], index: 0, role: None }
 }
 
 /// craft-fonts' manifest today, plus the regional CJK faces and Georgian it is planned to have.
@@ -78,8 +78,8 @@ fn test_fonts(ui_language: &str) -> UiFonts<'static> {
     UiFonts::new(&I18nScripts)
         .app_face("ui", egui_face("Ubuntu-Light"), &[FontRef::proportional()])
         .craft_faces(&[
-            EmbeddedFace { family: "Noto Sans Arabic", style: "Regular", scripts: &["Arab"], bytes: ARABIC, index: 0 },
-            EmbeddedFace { family: "Noto Sans CJK SC", style: "Regular", scripts: &["Hans", "Latn"], bytes: CJK, index: 0 },
+            EmbeddedFace { family: "Noto Sans Arabic", style: "Regular", scripts: &["Arab"], bytes: ARABIC, index: 0, role: None },
+            EmbeddedFace { family: "Noto Sans CJK SC", style: "Regular", scripts: &["Hans", "Latn"], bytes: CJK, index: 0, role: None },
         ])
         .languages(&["en", "ar", "ja", "ka"])
         .ui_language(ui_language)
@@ -102,6 +102,40 @@ fn face_list_prefers_a_face_with_the_whole_cluster() {
     // Only Hack has U+0301 COMBINING ACUTE ACCENT, and neither has U+0302.
     assert_eq!(face("a\u{0301}").as_deref(), Some("Hack"));
     assert_eq!(face("a\u{0302}").as_deref(), Some("Ubuntu-Light"));
+}
+
+/// craft-fonts' monospace face leads the Monospace family when the build embeds it, and only that family; without it
+/// egui's default monospace face leads.
+#[trial]
+fn a_craft_face_with_the_mono_role_leads_the_monospace_family() {
+    const MONO: EmbeddedFace = EmbeddedFace {
+        family: "JetBrains Mono",
+        style: "Regular",
+        scripts: &["Latn"],
+        bytes: &[],
+        index: 0,
+        role: Some(craft_fonts_build::MONO_ROLE),
+    };
+    let build = |faces: &[EmbeddedFace]| {
+        UiFonts::new(&I18nScripts).craft_faces(faces).languages(&["en"]).ui_language("en").system_fonts(SystemFonts::Off).stack()
+    };
+    let defaults = craft_ui::fonts::deflated_default_definitions();
+    let default_head = defaults.families.get(&FontFamily::Monospace).and_then(|chain| chain.first()).cloned();
+    assert!(default_head.is_some(), "egui has a default monospace face");
+
+    let with: Vec<EmbeddedFace> = CRAFT.iter().copied().chain([MONO]).collect();
+    let stack = build(&with);
+    let mono = head(&stack, &FontRef::monospace(), 2);
+    assert_eq!(mono.first().map(String::as_str), Some("JetBrains Mono Regular"), "the mono face leads Monospace");
+    assert_eq!(mono.get(1), default_head.as_ref(), "the default monospace face follows as the fallback");
+    assert_ne!(
+        stack.chain(&FontRef::proportional()).first().map(String::as_str),
+        Some("JetBrains Mono Regular"),
+        "the proportional family keeps its own head"
+    );
+
+    let without = build(CRAFT);
+    assert_eq!(without.chain(&FontRef::monospace()).first(), default_head.as_ref(), "without the mono face the default monospace face leads");
 }
 
 #[trial]

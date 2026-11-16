@@ -9,7 +9,7 @@ use super::{PathOptionsSettings, PenMode, PenWords};
 use craft_behavior::geometry::turn_to_45;
 use craft_behavior::kurbo::{Point, Rect as DocRect};
 use craft_behavior::{CancelReason, CanvasView, Cursor, CursorBadge, EditEvent, GestureId, Mixed, PaintedCursor, PointerButton};
-use craft_keymap::Mods;
+use craft_keymap::{Key, Mods};
 use craft_theme::Rgba;
 use craft_ui::canvas::{CanvasTool, ToolAccess, ToolAction, ToolAnchor, ToolClaims, ToolContext, ToolKey, ToolPath, ToolPointer};
 use craft_ui::canvas_controls::path_runs;
@@ -19,6 +19,24 @@ use egui::{CornerRadius, Pos2, Rect, Vec2};
 
 /// The side of the box a tool icon is drawn on; an icon's hotspot is in these units.
 const ICON_BOX: f32 = 24.0;
+
+/// Why a draft ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PenEnd {
+    /// Enter or a tool switch committed it.
+    Submit,
+    /// Escape ended it.
+    Escape,
+    /// The path was closed.
+    Closed,
+    /// Its only anchor was removed.
+    Removed,
+    /// Something else interrupted it (focus loss, a command).
+    Interrupted,
+    /// The draft was discarded back to the run's start.
+    Discarded,
+}
 
 /// What the pen reports to the host, drained with [`PenTool::take_events`].
 #[derive(Clone, Debug, PartialEq)]
@@ -33,7 +51,7 @@ pub enum PenEvent {
     Edit(EditEvent<EditSubpath>),
     /// The pen ended the draft (Enter, Escape, closing it, removing its only anchor, an interruption): the host
     /// stops handing it in. It follows the draft's `Commit` or `Cancel`.
-    Finished,
+    Finished(PenEnd),
     /// A press on the end point of an open path while no draft is open: the host makes that path's subpath the draft
     /// with the knot of that end last (reversing it for its first knot).
     Resumed(u64, KnotRef),
@@ -88,6 +106,8 @@ pub(super) enum Kind {
 pub(super) struct Drag {
     pub(super) origin: Pos2,
     pub(super) kind: Kind,
+    /// The pointer of the last sample, for what Space moves.
+    pub(super) last: Pos2,
     /// Past the click slop.
     pub(super) moved: bool,
     /// The in handle as the last pass left it: ⌥ keeps it there while the out handle follows.
@@ -106,7 +126,7 @@ struct Run {
 ///
 /// - Pointer, with the Pen ([`PenMode::Pen`]): a click adds a corner anchor (⇧ on the nearest 45° ray from the last
 ///   one); a drag pulls out symmetric handles (⇧ at 45°); ⌥ during the drag breaks the pair, so only the out handle
-///   follows. A press on the last anchor retracts its out handle and a drag sets it alone; ⌥ on one of its handles
+///   follows; Space moves the pulled anchor with its handles. A press on the last anchor retracts its out handle and a drag sets it alone; ⌥ on one of its handles
 ///   grabs that handle alone. A press on the first anchor closes the path on release, a drag there pulling out that
 ///   anchor's handles. With no draft, a press on an open path's end point ([`ends`](Self::ends)) reports
 ///   [`PenEvent::Resumed`].
@@ -123,8 +143,9 @@ struct Run {
 /// - [`PenMode::Curvature`] ([`mode`](Self::mode)): a click adds a smooth anchor the curve flows through, which
 ///   follows the pointer while the button is down (past the click slop); a press on the first anchor of 3 or more
 ///   closes at once; a press on another anchor grabs and drags it; the second click of a double click on an anchor
-///   toggles it between smooth and corner. Every change reflows the handles ([`EditSubpath::reflow`]). ⇧ and ⌥ do
-///   nothing; the keys and the gesture are the Pen's; there is no resume. Hover: with two or more anchors a dashed
+///   toggles it between smooth and corner. Every change reflows the handles ([`EditSubpath::reflow_kept`] with
+///   [`kept`](Self::kept)). ⇧ and ⌥ do nothing; the keys and the gesture are the Pen's, and a press on an open path's
+///   end point resumes it. Hover: with two or more anchors a dashed
 ///   preview of the curve the next click makes, with one a dashed line; always drawn, whatever the rubber band
 ///   setting.
 /// - [`sensing`](Self::sensing) false: drawn, keys kept, no press taken (the host's Direct Selection acts).
@@ -137,7 +158,7 @@ pub struct PenTool {
     pub(super) sensing: bool,
     pub(super) auto_add_delete: bool,
     options: PathOptionsSettings,
-    ends: Vec<(u64, KnotRef, Point)>,
+    pub(super) ends: Vec<(u64, KnotRef, Point)>,
     /// The draft being drawn; empty between drafts.
     pub(super) shown: EditSubpath,
     run: Option<Run>,
@@ -146,7 +167,11 @@ pub struct PenTool {
     next: GestureId,
     label: Arc<str>,
     pub(super) drag: Option<Drag>,
-    events: Vec<PenEvent>,
+    pub(super) events: Vec<PenEvent>,
+    /// The anchors of the draft the host handed in: undo never removes them.
+    own: usize,
+    /// The leading anchors of the draft that keep their handles when the Curvature mode reflows it.
+    pub(super) kept: usize,
 }
 
 impl Default for PenTool {
@@ -171,26 +196,63 @@ impl PenTool {
             label: Arc::from(""),
             drag: None,
             events: Vec::new(),
+            own: 0,
+            kept: 0,
         }
     }
 
     /// The host's open draft. The tool keeps the draft it is drawing and reads this only while it has none: a
     /// non-empty draft with none open (a resumed path) becomes the draft and begins its gesture at once. Hand in
-    /// `None` once [`PenEvent::Finished`] came.
+    /// `None` once [`PenEvent::Finished`] came. `None` while a run is open and no press is down means the host ended
+    /// the draft itself (a commit, a menu command): the tool drops its run and draft with no event, and the next press
+    /// starts a new draft. A press that is down keeps its run.
     pub fn draft(&mut self, draft: Option<&EditSubpath>) -> &mut Self {
-        if self.run.is_none() {
+        let host_ended = draft.is_none_or(|draft| draft.knots.is_empty()) && self.run.is_some() && self.drag.is_none();
+        if self.run.is_none() || host_ended {
+            self.run = None;
             match draft.filter(|draft| !draft.knots.is_empty()) {
                 Some(draft) => {
                     self.shown = draft.clone();
+                    self.own = draft.knots.len();
                     self.resume = true;
                 }
                 None => {
                     self.shown = EditSubpath::default();
+                    self.own = 0;
+                    self.kept = 0;
                     self.resume = false;
                 }
             }
         }
         self
+    }
+
+    /// Throws the draft away: `Edit(Cancel)` back to the run's start (the handed-in path of a resumed draft, nothing
+    /// for a new one), then `Finished(Discarded)`. False, and nothing changes, with no draft or while a press is
+    /// down.
+    pub fn discard(&mut self) -> bool {
+        if self.shown.knots.is_empty() || self.drag.is_some() {
+            return false;
+        }
+        self.drop_run(CancelReason::Dismissed);
+        true
+    }
+
+    /// The number of leading anchors of the handed-in draft that keep their handles when the Curvature mode reflows
+    /// the draft (the anchors of the path a press continued). Reset to 0 when the draft ends.
+    pub fn kept(&mut self, kept: usize) -> &mut Self {
+        self.kept = kept;
+        self
+    }
+
+    /// Replaces the draft with `draft`: one `Update`, beginning a run when none is open. False, and nothing
+    /// changes, while a press is down.
+    pub fn replace(&mut self, draft: &EditSubpath) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
+        self.change(draft.clone());
+        true
     }
 
     /// The Pen or the Curvature Pen; [`PenMode::Pen`] by default.
@@ -247,6 +309,17 @@ impl PenTool {
         self.sensing && self.drag.is_none() && self.closes_at(&self.shown, pointer.pos, &space.view, reach(cx))
     }
 
+    /// Whether a press at the pointer would continue an open path: sensing, no draft, no button down and the pointer
+    /// over an end point of [`ends`](Self::ends).
+    fn continues(&self, cx: &ToolContext<'_>) -> bool {
+        let (Some(space), Some(pointer)) = (cx.space(), cx.pointer) else { return false };
+        let reach = reach(cx);
+        self.sensing
+            && self.shown.knots.is_empty()
+            && self.drag.is_none()
+            && self.ends.iter().any(|(_, _, at)| space.view.to_screen(*at).distance(pointer.pos) <= reach)
+    }
+
     // ---- the draft gesture ----
 
     fn begin(&mut self) -> GestureId {
@@ -278,7 +351,7 @@ impl PenTool {
     /// Ends a draft too short to be a path. The gesture's start is what the host holds of the draft: when that is
     /// empty a cancel leaves nothing behind; when it holds anchors (a resumed path) the empty draft is committed, so
     /// the host removes them.
-    fn discard(&mut self, reason: CancelReason) {
+    fn drop_short(&mut self, reason: CancelReason) {
         let Some(run) = self.run.take() else { return };
         if run.before.knots.is_empty() {
             self.events.push(PenEvent::Edit(EditEvent::cancel(run.id, reason, Some(Mixed::Same(run.before)))));
@@ -290,35 +363,52 @@ impl PenTool {
     }
 
     /// The draft is over: reports `Finished` and starts clean.
-    pub(super) fn finish(&mut self) {
-        self.events.push(PenEvent::Finished);
+    pub(super) fn finish(&mut self, end: PenEnd) {
+        self.events.push(PenEvent::Finished(end));
         self.shown = EditSubpath::default();
         self.run = None;
         self.drag = None;
         self.resume = false;
+        self.own = 0;
+        self.kept = 0;
     }
 
-    /// Ends the draft open: a path of two anchors or more is kept, a shorter one discarded.
-    fn end(&mut self, reason: CancelReason) {
+    /// Cancels the run back to its start (the handed-in path of a resumed draft) and ends the draft as `Discarded`.
+    /// A resume still waiting for its first pass has no run: the host holds the path as it was.
+    fn drop_run(&mut self, reason: CancelReason) {
+        if let Some(run) = self.run.take() {
+            self.events.push(PenEvent::Edit(EditEvent::cancel(run.id, reason, Some(Mixed::Same(run.before)))));
+        }
+        self.finish(PenEnd::Discarded);
+    }
+
+    /// Ends the draft open as `end`: a path of two anchors or more is kept, a shorter one dropped. `reason` is what a
+    /// dropped draft's cancel says.
+    fn end(&mut self, reason: CancelReason, end: PenEnd) {
         if self.shown.knots.len() < 2 {
-            self.discard(reason);
+            self.drop_short(reason);
         } else {
             self.commit();
         }
-        self.finish();
+        self.finish(end);
     }
 
     fn remove_last_anchor(&mut self, reason: CancelReason) {
+        if self.own > 0 && self.shown.knots.len() <= self.own {
+            // Undo never eats the anchors of the path the draft resumed.
+            self.drop_run(reason);
+            return;
+        }
         if self.shown.knots.len() <= 1 {
-            self.discard(reason);
-            self.finish();
+            self.drop_short(reason);
+            self.finish(PenEnd::Removed);
             return;
         }
         let mut draft = self.shown.clone();
         draft.knots.pop();
         if self.mode == PenMode::Curvature {
             // Removing the last anchor changes the curve through the rest.
-            draft.reflow();
+            draft.reflow_kept(self.kept);
         }
         self.change(draft);
     }
@@ -380,13 +470,16 @@ impl PenTool {
             Kind::Close | Kind::Grab(_) | Kind::Move(_) => draft.knots[at].in_ctrl,
         };
         self.change(draft);
-        self.drag = Some(Drag { origin: pos, kind, moved: false, in_ctrl });
+        self.drag = Some(Drag { origin: pos, kind, last: pos, moved: false, in_ctrl });
         ToolAction::Claimed
     }
 
-    /// One sample of a press the tool owns: past the click slop the held part follows the pointer.
-    fn track(&mut self, pos: Pos2, mods: Mods, view: &CanvasView, slop: f32) {
+    /// One sample of a press the tool owns: past the click slop the held part follows the pointer. With `space`
+    /// held past the slop the pulled anchor and its handles move by the pointer's travel since the last sample
+    /// instead, so a sample that repeats a position (a second pass of a frame) moves nothing.
+    fn track(&mut self, pos: Pos2, mods: Mods, view: &CanvasView, slop: f32, space: bool) {
         let Some(mut drag) = self.drag.take() else { return };
+        let was_moved = drag.moved;
         drag.moved |= pos.distance(drag.origin) > slop;
         if drag.moved {
             let mut draft = self.shown.clone();
@@ -398,19 +491,28 @@ impl PenTool {
                         k.anchor += by;
                         k.in_ctrl += by;
                         k.out_ctrl += by;
-                        draft.reflow();
+                        draft.reflow_kept(self.kept);
                         self.change(draft);
                     }
                 }
                 kind => {
                     let at = if kind == Kind::Close { 0 } else { draft.knots.len().saturating_sub(1) };
                     if let Some(k) = draft.knots.get_mut(at) {
-                        pull(k, kind, to, mods, &mut drag.in_ctrl);
+                        if space && was_moved {
+                            let by = to - view.to_doc(drag.last);
+                            k.anchor += by;
+                            k.in_ctrl += by;
+                            k.out_ctrl += by;
+                            drag.in_ctrl += by;
+                        } else {
+                            pull(k, kind, to, mods, &mut drag.in_ctrl);
+                        }
                         self.change(draft);
                     }
                 }
             }
         }
+        drag.last = pos;
         self.drag = Some(drag);
     }
 
@@ -477,13 +579,13 @@ impl CanvasTool for PenTool {
 
     fn drag(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
         if let Some(space) = cx.space() {
-            self.track(pointer.pos, pointer.mods, &space.view, cx.slop);
+            self.track(pointer.pos, pointer.mods, &space.view, cx.slop, cx.held(Key::Space));
         }
     }
 
     fn release(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
         if let Some(space) = cx.space() {
-            self.track(pointer.pos, pointer.mods, &space.view, cx.slop);
+            self.track(pointer.pos, pointer.mods, &space.view, cx.slop, cx.held(Key::Space));
         }
         let Some(drag) = self.drag.take() else { return };
         if drag.kind == Kind::Close {
@@ -491,14 +593,14 @@ impl CanvasTool for PenTool {
             draft.closed = true;
             self.change(draft);
             self.commit();
-            self.finish();
+            self.finish(PenEnd::Closed);
         }
     }
 
     fn cancel(&mut self, reason: CancelReason, _: &mut ToolContext<'_>) {
         self.drag = None;
         if !self.shown.knots.is_empty() {
-            self.end(reason);
+            self.end(reason, PenEnd::Interrupted);
         }
     }
 
@@ -507,8 +609,12 @@ impl CanvasTool for PenTool {
             return false;
         }
         match key {
-            ToolKey::Submit | ToolKey::Cancel => {
-                self.end(CancelReason::Escape);
+            ToolKey::Submit => {
+                self.end(CancelReason::Escape, PenEnd::Submit);
+                true
+            }
+            ToolKey::Cancel => {
+                self.end(CancelReason::Escape, PenEnd::Escape);
                 true
             }
             ToolKey::Delete { .. } => {
@@ -545,7 +651,7 @@ impl CanvasTool for PenTool {
             PenMode::Curvature => ToolIcon::CurvaturePen,
         };
         // The pen's tip is the bottom left corner of the icon's box.
-        let badge = self.closes(cx).then_some(CursorBadge::Close);
+        let badge = if self.closes(cx) { Some(CursorBadge::Close) } else { self.continues(cx).then_some(CursorBadge::Continue) };
         Cursor::Painted(PaintedCursor::tool(icon.icon(), Vec2::Y * ICON_BOX, badge))
     }
 

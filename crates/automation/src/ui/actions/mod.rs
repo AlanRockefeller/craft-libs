@@ -5,7 +5,7 @@
 //! | Part | Names |
 //! |---|---|
 //! | The panel | [`ActionsPanel`], [`ActionsPanelOutput`], [`ActionsEvent`], [`ActionMove`], [`ActionPlace`], [`ActionSelection`], [`ShortcutChoice`] |
-//! | The app's side | [`ActionsHost`], [`ActionsPanelCommands`] and [`panel_rows`] (the panel menu), [`ActionsMenuAction`] |
+//! | The app's side | [`ActionsHost`], [`ActionsPanelCommands`], [`ActionsMenuFacts`] and [`panel_rows`] (the panel menu), [`ActionsMenuAction`] |
 //! | State | [`ActionsPanelState`], [`ActionsSettings`] (persisted) |
 //! | Columns and words | [`INCLUDE_COLUMN`], [`DIALOG_COLUMN`], [`ActionsWords`] |
 
@@ -21,7 +21,7 @@ mod stories;
 mod words;
 
 pub use body::{ActionMove, ActionPlace};
-pub use menu::{ActionsMenuAction, ActionsPanelCommands, panel_rows};
+pub use menu::{ActionsMenuAction, ActionsMenuFacts, ActionsPanelCommands, panel_rows};
 pub use panel::{ActionSelection, ActionsEvent, ActionsHost, ActionsPanel, ActionsPanelOutput, ActionsPanelState, ActionsSettings, ShortcutChoice};
 pub use rows::{DIALOG_COLUMN, INCLUDE_COLUMN};
 pub use words::ActionsWords;

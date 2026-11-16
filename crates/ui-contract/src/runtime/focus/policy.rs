@@ -261,6 +261,10 @@ pub struct KeyUse {
     pub claims: &'static [Chord],
     /// Edit commands delivered as `Intent::Edit`.
     pub edits: EditSet,
+    /// Edit commands in `edits` that do nothing now (Cut and Copy with no selection): their keys and menu picks still
+    /// reach the component, so they never fall through to the commands around it, and the edit menu shows them
+    /// disabled.
+    pub inactive: EditSet,
     /// The component's key class.
     pub owner: OwnerClass,
     /// The component's arrows step a value: Alt with an arrow is a fine move. Set per instance by a component that
@@ -293,6 +297,20 @@ pub struct KeyUse {
     /// Typed letters reach the component as `Intent::Text` (`take_text`): a closed select that opens its list on the
     /// first entry they begin.
     pub type_ahead: bool,
+    /// The component is a text field whose draft a press on a part declared `holds_drafts`, or on a popup layer above
+    /// it, leaves unapplied; a lone Alt in the field only alerts and a window deactivation does not commit the draft.
+    pub holds_drafts: bool,
+}
+
+/// Which Tab stops a dialog's Tab order visits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TabReach {
+    /// The window's rule (`RootEnv::tab_all_controls`).
+    #[default]
+    Root,
+    /// Only text stops, on every OS, wrapping inside the dialog's trap; with no text stop Tab does nothing.
+    Fields,
 }
 
 impl KeyUse {
@@ -306,6 +324,7 @@ impl KeyUse {
         activate: ActivateKeys::Neither,
         claims: &[],
         edits: EditSet::NONE,
+        inactive: EditSet::NONE,
         owner: OwnerClass::Widget,
         value: false,
         moves: false,
@@ -316,6 +335,7 @@ impl KeyUse {
         end: EndKey::LastItem,
         session: false,
         type_ahead: false,
+        holds_drafts: false,
     };
     /// A divider between panes: it takes the arrows as moves of its value, but it is no document and no canvas tool, so
     /// it marks no window as showing a document and takes no nudges.
@@ -345,6 +365,7 @@ impl KeyUse {
             activate,
             claims: &[],
             edits,
+            inactive: EditSet::NONE,
             owner,
             value: false,
             moves: false,
@@ -355,7 +376,14 @@ impl KeyUse {
             end: EndKey::LastItem,
             session: false,
             type_ahead: false,
+            holds_drafts: false,
         }
+    }
+
+    /// The same use declaring that a press that would apply the focused draft leaves it unapplied (`holds_drafts`).
+    pub const fn with_holds_drafts(mut self) -> Self {
+        self.holds_drafts = true;
+        self
     }
 
     /// The same use taking typed letters as `Intent::Text`.
@@ -373,6 +401,12 @@ impl KeyUse {
     /// The same use listing `edits`.
     pub const fn with_edits(mut self, edits: EditSet) -> Self {
         self.edits = edits;
+        self
+    }
+
+    /// The same use marking `inactive` of its edit commands as doing nothing now (`KeyUse::inactive`).
+    pub const fn with_inactive(mut self, inactive: EditSet) -> Self {
+        self.inactive = inactive;
         self
     }
 

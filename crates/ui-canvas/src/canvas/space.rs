@@ -5,6 +5,7 @@
 //! control reads it with [`canvas_space`]; the canvas's tool reads it with `ToolContext::space`, handed over by
 //! `CanvasOutput::space`.
 
+use super::PasteboardColor;
 use crate::contract::{Component, Cx, Focus as _, Pointer as _};
 use crate::runtime::env::{AppValues, EnvValue, EnvView, UnitKind, Units};
 use craft_behavior::canvas::zoom;
@@ -33,6 +34,19 @@ pub struct CanvasSpace {
     background: BackgroundPress,
     /// The canvas's id, under which its controls claim keys on the focused canvas.
     canvas: Option<egui::Id>,
+    pasteboard: PasteboardColor,
+    /// The canvas's picture slot for this pass, which [`paint_picture`](Self::paint_picture) appends to; `None` in a
+    /// measuring pass.
+    picture: Option<PictureSlot>,
+}
+
+/// The shape the canvas reserved in its paint hook for the picture: its layer and index, which
+/// [`CanvasSpace::paint_picture`] grows into a `Shape::Vec` in show order. The space is `Copy` and holds no painter,
+/// so the slot is named by these two.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PictureSlot {
+    pub(crate) layer: egui::LayerId,
+    pub(crate) idx: egui::layers::ShapeIdx,
 }
 
 impl CanvasSpace {
@@ -50,6 +64,8 @@ impl CanvasSpace {
             rulers: None,
             background: BackgroundPress::default(),
             canvas: None,
+            pasteboard: PasteboardColor::Default,
+            picture: None,
         }
     }
 
@@ -110,6 +126,53 @@ impl CanvasSpace {
         self
     }
 
+    /// This space with the pasteboard colour the canvas was given.
+    #[must_use]
+    pub fn with_pasteboard(mut self, color: PasteboardColor) -> Self {
+        self.pasteboard = color;
+        self
+    }
+
+    /// The pasteboard colour set once on the canvas: the pasteboard and the crop shield read it from the space.
+    pub fn pasteboard(&self) -> PasteboardColor {
+        self.pasteboard
+    }
+
+    /// Appends `shapes` to the canvas's picture slot, so they paint under every canvas control of the body, in show
+    /// order with the displays that use [`RasterDisplay::picture`](super::RasterDisplay::picture). It takes the
+    /// context because the space holds none. Outside a canvas's paint (a measuring pass) there is no slot, and it
+    /// paints nothing.
+    pub fn paint_picture(&self, ctx: &egui::Context, shapes: Vec<egui::Shape>) {
+        let Some(slot) = self.picture else { return };
+        if shapes.is_empty() {
+            return;
+        }
+        ctx.graphics_mut(|layers| {
+            layers.entry(slot.layer).mutate_shape(slot.idx, |clipped| {
+                if let egui::Shape::Vec(list) = &mut clipped.shape {
+                    list.extend(shapes);
+                    return;
+                }
+                let reserved = std::mem::replace(&mut clipped.shape, egui::Shape::Noop);
+                let list = if matches!(reserved, egui::Shape::Noop) { shapes } else { std::iter::once(reserved).chain(shapes).collect() };
+                clipped.shape = egui::Shape::Vec(list);
+            });
+        });
+    }
+
+    /// This space with the canvas's picture slot of this pass.
+    #[must_use]
+    pub(crate) fn with_picture(mut self, slot: PictureSlot) -> Self {
+        self.picture = Some(slot);
+        self
+    }
+
+    /// The slot the canvas reserved this pass, `None` before its paint step ran or outside a canvas: a display that
+    /// paints under the controls paints in place without one.
+    pub(crate) fn picture_slot(&self) -> Option<PictureSlot> {
+        self.picture
+    }
+
     /// This space published by the canvas `id`.
     #[must_use]
     pub(crate) fn with_canvas(mut self, id: egui::Id) -> Self {
@@ -117,7 +180,9 @@ impl CanvasSpace {
         self
     }
 
-    /// The id of the canvas that published this space, for a control that claims keys on the focused canvas.
+    /// The id of the canvas that published this space: what a control claims keys on the focused canvas with. A body
+    /// hands a control keyed by its canvas ([`Guides::new`](crate::canvas_controls::Guides::new)) the id it named the
+    /// canvas with, not this one: the space exists only once the view has settled, after the body's measuring run.
     pub(crate) fn canvas(&self) -> Option<egui::Id> {
         self.canvas
     }

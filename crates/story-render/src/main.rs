@@ -3,7 +3,7 @@
 //! `cargo run -p story-render --features <crate> -- --only <Name> --out <dir>` writes, into `<dir>`:
 //! `new-<Name>--<story>.png` for every story of the component, `new-<Name>.png` for the story its Overview card
 //! shows (its first), `stories.tsv` and `components.tsv`. Each story runs in a card's story body (`StoryBody`) in a
-//! fresh context, in ArtCraft Dark (`--theme`, `--mode`) at 2 pixels per point (`--scale`) with the interface fonts, and its image is cropped to the
+//! fresh context, in ArtCraft Dark (`--theme`, `--mode`, `--density`, `--contrast`) at 2 pixels per point (`--scale`) with the interface fonts, and its image is cropped to the
 //! story's surface and the layers it opened. A story runs in an embedded shell, over which its dialogs open, and a story
 //! whose dialog the card holds behind its button is shown with the dialog open.
 //!
@@ -20,20 +20,22 @@
 //! renders the story (with `--card`, the group) of that name only; `--threads N` (default: the cores, at most 8);
 //! `--width W` and `--room H` set the card's story width (with `--card`, the card's width) and the height a filling
 //! story gets, in points; `--scale S` the images' pixels per point (1 matches the old gallery's shots, so a canvas
-//! document shows at the same size on both sides); `--theme ID` and `--mode light|dark` the theme and mode (ArtCraft
-//! Dark without them). `stories.tsv` lists the scale of every image.
+//! document shows at the same size on both sides); `--theme ID`, `--mode light|dark`, `--density compact|comfortable`
+//! and `--contrast standard|high` the theme, mode, density and contrast (ArtCraft Dark and the gallery's density and
+//! contrast without them). A value that is not one of these is refused. `stories.tsv` lists the scale of every image.
 
 use craft_behavior::ColumnWidth;
 use craft_ui::contract::{Pad, Scroll, ShowContainer as _, Surface};
 use craft_ui::fonts::{I18nScripts, UiFonts};
 use craft_ui::layout_components::{Grid, Stack};
+use craft_ui::runtime::commands::CommandInput;
 use craft_ui::runtime::env::{RootEnv, WindowKey};
 use craft_ui::shell::AppShell;
 use craft_ui::testing::snapshot::{Renderer, RgbaImage, layer_rects, modal_open};
-use craft_ui::testing::{Frames, StoryRegistration};
+use craft_ui::testing::{Frames, Story, StoryRegistration};
 use craft_ui_gallery::WINDOW;
 use craft_ui_gallery::chrome::{Spec, StoryBody, overview_card};
-use craft_ui_gallery::viewer::{CardState, Catalog, Cells, GallerySettings, entry_of};
+use craft_ui_gallery::viewer::{CONTRASTS, CardState, Catalog, Cells, DENSITIES, GallerySettings, MODES, entry_of, theme_named};
 use egui::{Pos2, Rect, Ui, Vec2};
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -69,6 +71,10 @@ struct Options {
     /// The theme id and the mode the stories are shown in.
     theme: String,
     mode: String,
+    /// The density preset, `compact` or `comfortable`; empty keeps the gallery's default.
+    density: String,
+    /// The contrast, `standard` or `high`; empty keeps the gallery's default.
+    contrast: String,
 }
 
 fn options() -> Result<Options, String> {
@@ -85,6 +91,8 @@ fn options() -> Result<Options, String> {
         card: false,
         theme: String::new(),
         mode: "dark".to_owned(),
+        density: String::new(),
+        contrast: String::new(),
     };
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -99,11 +107,27 @@ fn options() -> Result<Options, String> {
             "--card" => options.card = true,
             "--theme" => options.theme = value()?,
             "--mode" => options.mode = value()?,
+            "--density" => options.density = value()?,
+            "--contrast" => options.contrast = value()?,
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
     if options.out.as_os_str().is_empty() {
         return Err("--out <dir> is required".to_owned());
+    }
+    // `restore_env` falls back to its defaults without a word, so each value is checked here. A render does not follow
+    // the OS: `system` is refused for the mode and the contrast.
+    if !options.theme.is_empty() && theme_named(&options.theme).is_none() {
+        return Err(format!("--theme {} is not a theme id", options.theme));
+    }
+    if options.mode == "system" || MODES.parse(&options.mode).is_none() {
+        return Err("--mode takes light or dark".to_owned());
+    }
+    if !options.density.is_empty() && DENSITIES.parse(&options.density).is_none() {
+        return Err("--density takes compact or comfortable".to_owned());
+    }
+    if !options.contrast.is_empty() && (options.contrast == "system" || CONTRASTS.parse(&options.contrast).is_none()) {
+        return Err("--contrast takes standard or high".to_owned());
     }
     Ok(options)
 }
@@ -196,6 +220,12 @@ fn root_env(options: &Options) -> RootEnv {
         settings.theme.clone_from(&options.theme);
     }
     settings.mode.clone_from(&options.mode);
+    if !options.density.is_empty() {
+        settings.density.clone_from(&options.density);
+    }
+    if !options.contrast.is_empty() {
+        settings.contrast.clone_from(&options.contrast);
+    }
     settings.restore_env(&mut env);
     env
 }
@@ -279,6 +309,12 @@ fn render(job: &Job, renderer: &mut Renderer, env: &RootEnv, options: &Options) 
     frames.screen(Vec2::from(WINDOW));
     frames.pixels_per_point(options.scale);
     frames.record_paint();
+    // The command states of the story shown, as the gallery gives them, before the first frame. The Overview gives its
+    // cards none, so a card is rendered under none.
+    frames.commands(match &job.shown {
+        Shown::Story(registration) => Story::command_input([&registration.story]),
+        Shown::Card(_) => CommandInput::new(),
+    });
     let (shown, dialog) = match &job.shown {
         Shown::Story(registration) => (story(&mut frames, registration, job, options), false),
         Shown::Card(spec) => card(&mut frames, spec, options),

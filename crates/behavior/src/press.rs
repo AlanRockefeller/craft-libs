@@ -106,6 +106,20 @@ impl PointerSample {
     pub const fn new(pressure: f32) -> Self {
         PointerSample { pressure, tilt: [0.0, 0.0], rotation: 0.0, eraser: false }
     }
+
+    /// The sample with every field in range: pressure within 0 to 1, tilt and rotation finite radians, a stray value
+    /// replaced by its neutral one.
+    ///
+    /// A tablet driver's pressure outside 0 to 1 is clamped and one that is no number reads as full pressure, so a
+    /// stroke keeps drawing; tilt is clamped to a quarter turn each way and an unreadable tilt or rotation is none.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let pressure = if self.pressure.is_nan() { 1.0 } else { self.pressure.clamp(0.0, 1.0) };
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let tilt = self.tilt.map(|tilt| if tilt.is_finite() { tilt.clamp(-quarter, quarter) } else { 0.0 });
+        let rotation = if self.rotation.is_finite() { self.rotation } else { 0.0 };
+        PointerSample { pressure, tilt, rotation, eraser: self.eraser }
+    }
 }
 
 /// A two-finger gesture.
@@ -314,11 +328,12 @@ impl Default for PressState {
 /// The longest gap between presses that still count as one multi-click, in seconds.
 pub const MULTI_CLICK_TIME: f64 = 0.3;
 
-/// The click count of a press at `pos` and `time`, given the previous press `(pos, time, clicks)`: one more when
-/// it follows within [`MULTI_CLICK_TIME`] and `slop` of the previous one, else 1.
-pub fn count_clicks(previous: Option<(Pos2, f64, u32)>, pos: Pos2, time: f64, slop: f32) -> u32 {
+/// The click count of a press at `pos` and `time` with `mods` held, given the previous press `(pos, time, clicks,
+/// mods)`: one more when it follows within [`MULTI_CLICK_TIME`] and `slop` of the previous one with the same
+/// modifiers, else 1.
+pub fn count_clicks(previous: Option<(Pos2, f64, u32, Mods)>, pos: Pos2, time: f64, mods: Mods, slop: f32) -> u32 {
     match previous {
-        Some((place, when, count)) if time - when <= MULTI_CLICK_TIME && place.distance(pos) <= slop => count + 1,
+        Some((place, when, count, held)) if held == mods && time - when <= MULTI_CLICK_TIME && place.distance(pos) <= slop => count + 1,
         _ => 1,
     }
 }
@@ -328,8 +343,13 @@ pub fn count_clicks(previous: Option<(Pos2, f64, u32)>, pos: Pos2, time: f64, sl
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PointerEvent {
-    /// The pointer moved.
-    Moved(Pos2),
+    /// The pointer moved, with the pen's reading for the move when the runtime has one.
+    Moved {
+        /// Where the pointer is.
+        at: Pos2,
+        /// The pen's reading paired with this move, interpolated from the tablet's samples.
+        sample: Option<PointerSample>,
+    },
     /// A button went down.
     #[non_exhaustive]
     Pressed {
@@ -521,7 +541,7 @@ impl<T: Copy> PressMachine<T> {
         }
         for event in input.events {
             match *event {
-                PointerEvent::Moved(at) => {
+                PointerEvent::Moved { at, .. } => {
                     pos = at;
                     if let Some(open) = &mut self.open
                         && open.released_at.is_none()
@@ -689,7 +709,7 @@ mod tests {
         let second = press(0.0, 1.1);
         assert_eq!(phases(&[&[press(0.0, 1.0)], &[up, second], &[up], &[]], Sense::CLICK), "D R! D R!");
         // The second press's drag starts in the pass that owes its Down, and the button goes up there too.
-        let far = PointerEvent::Moved(pos2(40.0, 0.0));
+        let far = PointerEvent::Moved { at: pos2(40.0, 0.0), sample: None };
         let passes: [&[PointerEvent]; 5] = [&[press(0.0, 1.0)], &[up, second], &[far, up], &[], &[]];
         assert_eq!(phases(&passes, Sense::CLICK | Sense::DRAG), "D R! D S R");
     }

@@ -14,9 +14,10 @@ use craft_ui::runtime::env::{Env, Label};
 use egui::{Response, Ui};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use super::ColorDisc;
 use super::picker::{ChannelRow, ChannelRule};
-use super::{ColorDisc, SwatchTable, SwatchTableOutput};
 use crate::harmony::{Guide, GuideOptions, Harmony, Variation};
+use craft_ui::choice::{SwatchTable, SwatchTableOutput};
 
 #[cfg(feature = "screen-testing")]
 mod stories;

@@ -3,7 +3,7 @@
 use super::value::NumberValue;
 use super::{DEFAULT_STEP, ON_GRID};
 use craft_behavior::nav::{LARGE_STEPS, snap_to_step};
-use craft_behavior::{Codec, MoveMods, NotAValue, NumberCodec, decimals_for_step};
+use craft_behavior::{Codec, MoveMods, NotAValue, NumberCodec, ParseNote, decimals_for_step};
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
@@ -166,17 +166,22 @@ impl<V: NumberValue> Codec for Ruled<V> {
         self.parse_tagged(text, start).map(|(value, _)| value)
     }
 
-    fn parse_tagged(&self, text: &str, start: &V) -> Result<(V, Option<u32>), NotAValue> {
+    /// The inner codec's note, with `held` set to the number read (in shown units) when it lies outside the range;
+    /// snapping and rounding are not holding. A name or a blank gives the default note.
+    fn parse_tagged(&self, text: &str, start: &V) -> Result<(V, ParseNote), NotAValue> {
         if let Some(name) = self.name_of(text) {
-            return Ok((name, None));
+            return Ok((name, ParseNote::default()));
         }
         if text.trim().is_empty() && (self.mixed || V::blank().is_none()) {
             return Err(NotAValue);
         }
-        let (read, tag) = self.inner.parse_tagged(text, &self.shown(start))?;
+        let (read, mut note) = self.inner.parse_tagged(text, &self.shown(start))?;
         match read {
-            Some(number) => Ok((V::of_number(self.held(number) / self.scale), tag)),
-            None => V::blank().map(|blank| (blank, None)).ok_or(NotAValue),
+            Some(number) => {
+                note.held = (number < self.rule.low || number > self.rule.high).then_some(number);
+                Ok((V::of_number(self.held(number) / self.scale), note))
+            }
+            None => V::blank().map(|blank| (blank, ParseNote::default())).ok_or(NotAValue),
         }
     }
 

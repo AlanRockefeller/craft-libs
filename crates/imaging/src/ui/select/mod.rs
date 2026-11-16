@@ -32,8 +32,9 @@
 //! the app needs no call for the right click.
 //!
 //! A press inside the selection drags it instead of drawing: the outline with a plain press and the operation New,
-//! the selected pixels with Cmd (Cmd+Alt a copy), a floating piece with a plain press. Click-driven tools (the
-//! Polygonal Lasso) need Cmd for any of it, and never while an outline is open. A Cmd press outside the selection is
+//! the selected pixels with Cmd (Cmd+Alt a copy). On a floating piece Cmd drags the piece and a plain press of a drag
+//! tool the outline (the app drops the piece first). Click-driven tools (the Polygonal Lasso) need Cmd for any of it,
+//! and never while an outline is open. A dragged selection snaps by its bounds ([`SelectionProbe::bounds`]). A Cmd press outside the selection is
 //! [`ToolAction::Ignored`](craft_ui::canvas::ToolAction) so the app's Move tool takes it.
 //!
 //! [`CanvasTool`]: craft_ui::canvas::CanvasTool
@@ -52,10 +53,12 @@ mod polygon;
 #[cfg(feature = "screen-testing")]
 pub(crate) mod stories;
 
+pub mod operations;
 pub use drag::{InsideDrag, PressRule, cursor_over, drag_kind};
-pub use lasso::LassoTool;
-pub use magnetic::{EdgeSearch, EdgeTracer, MagneticLassoTool, MagneticSettings};
+pub use lasso::{LassoTool, paint_outline};
+pub use magnetic::{EdgeSearch, EdgeTracer, MagneticLassoTool, MagneticOutlineView, MagneticSettings};
 pub use marquee::{MarqueeKind, MarqueeTool};
+pub use operations::{SelectionOpWords, selection_operations};
 pub use polygon::PolygonLassoTool;
 
 craft_ui::words! {
@@ -98,8 +101,8 @@ pub enum SelectionShape {
 pub enum DragKind {
     /// The outline alone.
     Outline,
-    /// The selected pixels, or the floating piece: Cmd cuts them out first, Cmd+Alt (`copy`) lifts a copy, a floating
-    /// piece moves with a plain press.
+    /// The selected pixels, or the floating piece: Cmd cuts them out first, Cmd+Alt (`copy`) lifts a copy, and Cmd
+    /// moves a floating piece.
     #[non_exhaustive]
     Pixels {
         /// Lift a copy instead of cutting.
@@ -147,8 +150,11 @@ pub enum SelectEvent {
     /// A click that drew nothing (a marquee released within its click slop): deselect. One undo step.
     Deselect,
     /// A press inside the selection dragged it: `Begin` at the press, `Update` as it moves, `Commit` at the release
-    /// (one undo step; a delta of 0 is no change, where the app deselects, or drops a floating piece that never
-    /// moved), `Cancel` on Escape.
+    /// (one undo step), `Cancel` on Escape. A press whose pointer never left it is a click, the `Commit` of a delta of 0,
+    /// where the app deselects or drops a floating piece that never moved; a drag that ends where it began (it came
+    /// back, or snapping pulled it back) changed nothing and ends with `Cancel` ([`CancelReason::Dismissed`]).
+    ///
+    /// [`CancelReason::Dismissed`]: craft_behavior::CancelReason::Dismissed
     DragSelection(EditEvent<SelectionDrag>),
 }
 
@@ -179,8 +185,9 @@ pub enum SelectPhase {
         /// The point count.
         points: usize,
     },
-    /// The selection being dragged.
-    Dragging(DragKind),
+    /// The selection being dragged: what moves and its whole-pixel offset so far, from which the app offsets the
+    /// marching ants and the floating piece while the drag runs.
+    Dragging(SelectionDrag),
 }
 
 impl SelectPhase {
@@ -209,6 +216,12 @@ pub trait SelectionProbe {
 
     /// Whether document point `at` is inside the selection (coverage above 0).
     fn inside_selection(&self, at: Point) -> bool;
+
+    /// The selection's content bounds in document units, for snapping a dragged selection's box; the default leaves a
+    /// drag unsnapped.
+    fn bounds(&self) -> Option<kurbo::Rect> {
+        None
+    }
 
     /// Whether a floating piece (pixels lifted by a selection drag, not yet dropped) is on the canvas. Default: none.
     fn floating(&self) -> bool {

@@ -11,7 +11,8 @@ use crate::runtime::pass_state;
 use crate::runtime::pointer;
 use craft_behavior::OwnerClass;
 use craft_behavior::overlay::Side;
-use egui::{Context, Id, Pos2, Rect, ViewportId};
+use egui::emath::TSTransform;
+use egui::{Context, Id, LayerId, Pos2, Rect, ViewportId};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -156,6 +157,8 @@ pub struct OpenEntry {
     pub(crate) region: Option<Rect>,
     /// The layer's place on its dialog stack (`stack_place`): the modal families of one stack stack in its order.
     pub(crate) place: Option<usize>,
+    /// The dialog of a dialog host the layer shows for (`stack_place`).
+    dialog: Option<Id>,
 }
 
 impl OpenEntry {
@@ -178,6 +181,7 @@ impl OpenEntry {
             window: false,
             region: None,
             place: None,
+            dialog: None,
         }
     }
 
@@ -202,20 +206,24 @@ impl OpenEntry {
 pub(crate) struct Pass {
     current: Vec<OpenEntry>,
     last: Vec<OpenEntry>,
-    /// The layers whose bodies are running, innermost last.
-    drawing: Vec<Id>,
+    /// The layers whose bodies are running and the tier each shows in, innermost last.
+    drawing: Vec<(Id, Tier)>,
     /// The side of its anchor each anchored layer was placed on this pass, set before its body runs.
     sides: Vec<(Id, Side)>,
-    /// Each activation of this pass: the component and a layer whose body was running around it.
-    activated: Vec<(Id, Id)>,
+    /// The map from its parent's layer space to screen space of each layer container shown this pass, set by its host
+    /// before its body runs: the caller's `placed`, `placed_at`, float position and `bounds` are in that space.
+    spaces: Vec<(Id, TSTransform)>,
+    /// Each activation of this pass: the component and the layers it closes (`note_activated`).
+    activated: Vec<(Id, Vec<Id>)>,
     /// The components whose activation this pass opened or closed a popup (`claim_activation`).
     claimed: Vec<Id>,
     /// The layers a primary press landed outside of, this pass, while their dismissal keeps them open.
     pressed_outside: Vec<Id>,
     /// The popup a press that opened it ended on, and where, this pass.
     dragged_release: Option<(Id, Pos2)>,
-    /// The dialog stack place of the layers recorded now (`stack_place`).
+    /// The dialog stack place of the layers recorded now, and the dialog they show for (`stack_place`).
     place: Option<usize>,
+    dialog: Option<Id>,
 }
 
 /// The top modal layer of a viewport: its id and the scrim under it.
@@ -267,11 +275,13 @@ fn with_pass<R>(ctx: &Context, f: impl FnOnce(&mut Pass) -> R) -> R {
             }
             pass.drawing.clear();
             pass.sides.clear();
+            pass.spaces.clear();
             pass.activated.clear();
             pass.claimed.clear();
             pass.pressed_outside.clear();
             pass.dragged_release = None;
             pass.place = None;
+            pass.dialog = None;
         },
         f,
     )
@@ -372,6 +382,19 @@ pub fn top(ctx: &Context) -> Option<Id> {
     })
 }
 
+/// Whether `layer` is the layer of a popup open above `below` in last pass's overlay stack: `layer` belongs to a
+/// non-exiting popup entry, and `below` is the window's base layer (no entry's layer) or the layer of an entry
+/// opened before it. The stack, not egui's area order, says which layer was opened above which.
+pub(crate) fn popup_above(ctx: &Context, layer: LayerId, below: LayerId) -> bool {
+    with_pass(ctx, |pass| {
+        // Entries are recorded parent first, so an earlier entry was opened before a later one.
+        let Some(at) = pass.last.iter().position(|entry| entry.layer == layer && entry.rank == Rank::Popup && !entry.exiting) else {
+            return false;
+        };
+        pass.last.iter().position(|entry| entry.layer == below).is_none_or(|under| under < at)
+    })
+}
+
 /// `id` and everything opened from inside it, shown last frame.
 pub fn family(ctx: &Context, id: Id) -> SmallVec<[Id; 4]> {
     with_pass(ctx, |pass| {
@@ -406,10 +429,30 @@ pub(crate) fn placed_side(ctx: &Context, id: Id) -> Option<Side> {
     with_pass(ctx, |pass| pass.sides.iter().rev().find(|(layer, _)| *layer == id).map(|(_, side)| *side))
 }
 
+/// Records that the layer container `id` is shown in this pass from a parent whose layer maps to screen space by
+/// `to_screen`.
+pub(crate) fn note_parent_space(ctx: &Context, id: Id, to_screen: TSTransform) {
+    with_pass(ctx, |pass| pass.spaces.push((id, to_screen)));
+}
+
+/// The map from the parent's layer space of the layer container `id` to screen space, as its host recorded it in this
+/// pass; the identity for any other container.
+pub(crate) fn parent_space(ctx: &Context, id: Id) -> TSTransform {
+    with_pass(ctx, |pass| pass.spaces.iter().rev().find(|(layer, _)| *layer == id).map_or(TSTransform::IDENTITY, |(_, space)| *space))
+}
+
 /// The parent a layer opened now has: the layer whose body is running.
 #[doc(hidden)]
 pub fn drawing_parent(ctx: &Context) -> Option<Id> {
-    with_pass(ctx, |pass| pass.drawing.last().copied())
+    with_pass(ctx, |pass| pass.drawing.last().map(|(id, _)| *id))
+}
+
+/// The tier a layer of `rank` opened now shows in: the higher of its rank's and that of the layer whose body is
+/// running. egui sorts layers by tier before the family order, so a floating window opened inside a modal's family
+/// shows in the modal's tier, above its parent, and takes input.
+pub(crate) fn layer_tier(ctx: &Context, rank: Rank) -> Tier {
+    let parent = with_pass(ctx, |pass| pass.drawing.last().map(|(_, tier)| *tier));
+    parent.map_or(rank.tier(), |parent| parent.max(rank.tier()))
 }
 
 /// Whether the layer `id`, open in this pass, faded out in the last one: it opens anew.
@@ -426,11 +469,11 @@ pub(crate) fn appears(ctx: &Context, id: Id, exiting: bool) -> bool {
 
 /// Marks the layer `id`'s body as running, so layers opened from inside it become its children, with the `side` of
 /// its anchor it was placed on. A layer shown again while it fades out opens anew: it appears in this frame and pass.
-pub(crate) fn begin_layer(ctx: &Context, id: Id, exiting: bool, side: Option<Side>) {
+pub(crate) fn begin_layer(ctx: &Context, id: Id, tier: Tier, exiting: bool, side: Option<Side>) {
     crate::runtime::replay::block(ctx);
     let reopened = reopened(ctx, id, exiting);
     with_pass(ctx, |pass| {
-        pass.drawing.push(id);
+        pass.drawing.push((id, tier));
         if let Some(side) = side {
             pass.sides.push((id, side));
         }
@@ -507,7 +550,7 @@ pub(crate) fn note_dragged_release(ctx: &Context, popup: Id, at: Pos2) {
 
 /// Whether a press that opened the layer whose body is running ended inside `rect` (screen space) in this pass.
 pub(crate) fn released_inside(ctx: &Context, rect: Rect) -> bool {
-    with_pass(ctx, |pass| pass.dragged_release.is_some_and(|(popup, at)| pass.drawing.contains(&popup) && rect.contains(at)))
+    with_pass(ctx, |pass| pass.dragged_release.is_some_and(|(popup, at)| pass.drawing.iter().any(|(id, _)| *id == popup) && rect.contains(at)))
 }
 
 /// Ends the body `begin_layer` started.
@@ -517,13 +560,16 @@ pub(crate) fn end_layer(ctx: &Context) {
     });
 }
 
-/// Records that the component `id` was activated: every layer whose body is running, except the one `id` is the
-/// container of, may close on it (`Dismiss.on_activate`).
+/// Records that the component `id` was activated: the innermost layer whose body is running around it, other than the
+/// one `id` is the container of, and the menus the walk out of that layer crosses (`focus::menus_closed_from`) may
+/// close on it (`Dismiss.on_activate`). An activation in a popup opened from a field inside a menu leaves that menu
+/// open.
 pub(crate) fn note_activated(ctx: &Context, id: Id) {
-    with_pass(ctx, |pass| {
-        let layers: Vec<(Id, Id)> = pass.drawing.iter().copied().filter(|layer| *layer != id).map(|layer| (id, layer)).collect();
-        pass.activated.extend(layers);
-    });
+    let Some(layer) = with_pass(ctx, |pass| pass.drawing.iter().rev().map(|(layer, _)| *layer).find(|layer| *layer != id)) else {
+        return;
+    };
+    let closes = crate::runtime::focus::menus_closed_from(ctx, layer);
+    with_pass(ctx, |pass| pass.activated.push((id, closes)));
 }
 
 /// Records that the activation of `component` in this pass toggled a popup it opens: an opener's activation opens
@@ -536,9 +582,10 @@ pub(crate) fn claim_activation(ctx: &Context, component: Id) {
     });
 }
 
-/// Whether a component inside the layer `id` was activated in this pass, other than an opener toggling its popup.
-pub(crate) fn activated_inside(ctx: &Context, id: Id) -> bool {
-    with_pass(ctx, |pass| pass.activated.iter().any(|(component, layer)| *layer == id && !pass.claimed.contains(component)))
+/// Whether an activation in this pass closes the layer `id` (`note_activated`), other than an opener toggling its
+/// popup.
+pub(crate) fn closed_by_activation(ctx: &Context, id: Id) -> bool {
+    with_pass(ctx, |pass| pass.activated.iter().any(|(component, closes)| closes.contains(&id) && !pass.claimed.contains(component)))
 }
 
 /// The input hook: removes the primary presses that land outside the top menu family, its anchors and its parents,
@@ -576,15 +623,27 @@ pub(crate) fn note_peers(ctx: &Context, id: Id, peers: Vec<Rect>) {
     });
 }
 
-/// Runs `show` with the layers it records at `place` on the dialog stack: a dialog host shows each open dialog
-/// inside its stack place, bottom first, and the modal families of the stack then stack in that order whatever
-/// opened, appeared or was pressed last. Families without a place keep their raise order.
+/// Runs `show` with the layers it records at `place` on the dialog stack, for the host's `dialog`: a dialog host shows
+/// each open dialog inside its stack place, bottom first, and the modal families of the stack then stack in that order
+/// whatever opened, appeared or was pressed last. Families without a place keep their raise order.
 #[doc(hidden)]
-pub fn stack_place<R>(ctx: &Context, place: usize, show: impl FnOnce() -> R) -> R {
-    let outer = with_pass(ctx, |pass| pass.place.replace(place));
+pub fn stack_place<R>(ctx: &Context, place: usize, dialog: Id, show: impl FnOnce() -> R) -> R {
+    let outer = with_pass(ctx, |pass| (pass.place.replace(place), pass.dialog.replace(dialog)));
     let out = show();
-    with_pass(ctx, |pass| pass.place = outer);
+    with_pass(ctx, |pass| (pass.place, pass.dialog) = outer);
     out
+}
+
+/// A dialog host removed `dialog`: the layers it showed for it (`stack_place`) in the running or the last pass end
+/// their shown life at once (`memory::end_shown`), as a container that shows nothing does, so the next open of the
+/// dialog is a first pass.
+#[doc(hidden)]
+pub fn end_stack_dialog(ctx: &Context, dialog: Id) {
+    let shown: Vec<Id> =
+        with_pass(ctx, |pass| pass.current.iter().chain(&pass.last).filter(|entry| entry.dialog == Some(dialog)).map(|entry| entry.id).collect());
+    for id in shown {
+        crate::runtime::memory::end_shown(ctx, id);
+    }
 }
 
 /// Records the layer shown in this pass, parent first: a layer is recorded once its body ran, after the layers opened
@@ -594,6 +653,7 @@ pub(crate) fn record(ctx: &Context, mut entry: OpenEntry) {
     crate::runtime::replay::block(ctx);
     with_pass(ctx, |pass| {
         entry.place = entry.place.or(pass.place);
+        entry.dialog = entry.dialog.or(pass.dialog);
         if let Some(at) = pass.current.iter().position(|recorded| recorded.id == entry.id) {
             pass.current[at] = entry;
             return;
@@ -844,6 +904,10 @@ pub(crate) fn popup_over_modal(ctx: &Context) -> bool {
 /// The modal layer whose body is running, the innermost one when layers nest: the layer a control inside it belongs to.
 pub(crate) fn modal_drawing(ctx: &Context) -> Option<Id> {
     with_pass(ctx, |pass| {
-        pass.drawing.iter().rev().copied().find(|id| pass.current.iter().chain(&pass.last).any(|entry| entry.id == *id && entry.rank.is_modal()))
+        pass.drawing
+            .iter()
+            .rev()
+            .map(|(id, _)| *id)
+            .find(|id| pass.current.iter().chain(&pass.last).any(|entry| entry.id == *id && entry.rank.is_modal()))
     })
 }

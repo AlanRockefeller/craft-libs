@@ -2,9 +2,10 @@
 //! boundaries, anchors and their handles, dragged by the pointer and moved from the keyboard.
 //!
 //! Beside it: the Warp group of the options bar ([`WarpFields`]), Puppet Warp ([`pin`]),
-//! Perspective Warp ([`perspective`]) and the one painter of a deformed mesh's lines
+//! Perspective Warp ([`perspective`]), the Cylinder warp's editor ([`CylinderWarp`]) and the one painter of a deformed mesh's lines
 //! (`MeshLines`).
 
+mod cylinder;
 mod fields;
 mod grid;
 mod mesh;
@@ -14,6 +15,7 @@ pub mod pin;
 #[cfg(feature = "screen-testing")]
 mod stories;
 
+pub use cylinder::{CylinderHandle, CylinderValues, CylinderWarp, CylinderWarpOutput, CylinderWarpStyle};
 pub use fields::{WarpFieldValues, WarpFields, WarpFieldsEdit, WarpFieldsOutput, WarpFieldsWords, WarpGridChoice, WarpStyleEntry};
 pub use grid::{POINT, SURFACE, WarpGrid, WarpGridOutput, WarpGridStyle, WarpRule, WarpSurface, WarpWords};
 pub(crate) use mesh::MeshLines;

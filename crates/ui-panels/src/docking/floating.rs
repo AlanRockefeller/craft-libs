@@ -11,15 +11,17 @@ use crate::contract::BodyCx;
 use crate::contract::SizeLimits;
 use crate::contract::overlay::{PlacementChange, PlacementKind, Popup};
 use crate::contract::{
-    Bind, BindMut, Common, Component, Container, ContainerProps, Cx, DragBand, HeaderRegion, Inner, Mount, NoValue, Outcome, Overlay, Pad,
+    Bind, BindMut, Common, Component, Container, ContainerProps, Cx, DragBand, HeaderRegion, Inner, Mount, NoValue, OsFiles, Outcome, Overlay, Pad,
     Pointer as _, Props as _, Role, Show as _, ShowContainer as _, Sizing, WordSetCx as _,
 };
+use crate::runtime::drag::OsFile;
 use crate::runtime::env::{Env, Label};
 use crate::runtime::overlay::CloseReason;
 use crate::runtime::windows::WindowSpec;
 use crate::sections::{HeaderAction, HeaderStrength, MenuRows, TitleRow};
 use crate::style::{ComponentStyle, StyleCx, SurfaceKind};
 use craft_behavior::{GesturePhase, Metrics, Sense};
+use craft_ui_widgets::popover::WholeWindow;
 use egui::{Id, Rect, Response, Ui, Vec2};
 use std::cell::RefCell;
 use std::hash::Hash;
@@ -52,6 +54,8 @@ pub struct FloatingGroupOutput {
     pub action: Option<HeaderAction>,
     /// Whether a double click on the title band asks to minimize the group, or restore it when it is minimized.
     pub minimized_toggled: bool,
+    /// The files dropped on the group's window that no target there took.
+    pub files: Vec<OsFile>,
 }
 
 impl Outcome for FloatingGroupOutput {
@@ -121,6 +125,8 @@ pub struct FloatingGroup<'a> {
     take_drop: Option<TakeDrop<'a>>,
     /// A move by the title began this pass.
     moving: bool,
+    /// The files dropped on the group's OS window that no target there took.
+    files: Vec<OsFile>,
 }
 
 type StartDrag<'a> = Box<dyn for<'b, 'c> FnOnce(&'b mut Cx<'c, FloatingGroup<'a>>) + 'a>;
@@ -155,6 +161,7 @@ impl<'a> FloatingGroup<'a> {
             start_drag: None,
             take_drop: None,
             moving: false,
+            files: Vec::new(),
         }
         .label(title)
     }
@@ -251,6 +258,13 @@ impl Component for FloatingGroup<'_> {
             take(cx);
             self.take_drop = Some(take);
         }
+        // A layer float lies in the app window, whose own targets take those drops.
+        if self.native.is_some() {
+            let target = WholeWindow::new(cx.rect);
+            if let Some(dropped) = cx.window_drop_target::<OsFiles, _>(&target) {
+                self.files = dropped.files;
+            }
+        }
     }
 
     fn finish(mut self, mut cx: Cx<'_, Self>) -> FloatingGroupOutput {
@@ -265,7 +279,13 @@ impl Component for FloatingGroup<'_> {
         if let Some(opener) = self.menu_opener {
             Popup::toggle(opener, &mut cx);
         }
-        let output = FloatingGroupOutput { response: cx.response.clone(), placed: self.placed, action: self.taken, minimized_toggled: self.toggled };
+        let output = FloatingGroupOutput {
+            response: cx.response.clone(),
+            placed: self.placed,
+            action: self.taken,
+            minimized_toggled: self.toggled,
+            files: self.files,
+        };
         native::raise(&cx.core.ctx, &output);
         native::fade(&cx.core.ctx, &output);
         output

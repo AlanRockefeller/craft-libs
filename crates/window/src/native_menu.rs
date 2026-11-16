@@ -3,7 +3,7 @@
 //! The app describes its menus as a [`Bar`] (titles, items with a unique `id`, labels, check state
 //! and key equivalents). [`NativeBar::install`] makes it the application's menu bar and
 //! [`NativeBar::apply`] keeps it in step with later descriptions. A chosen item reaches the app's
-//! [`Handler`] with the item's `id` and, for a key-down, the modifiers held. Nothing here knows
+//! [`Handler`] with the item's `id`, whether a key press chose it and the modifiers held. Nothing here knows
 //! what an item runs.
 //!
 //! Only macOS has an application menu bar (with the `appkit` feature, built on `muda`). On other
@@ -33,13 +33,23 @@ use other as imp;
 
 pub use imp::{hide_app, hide_other_apps, install_app_menu, system_title};
 
-/// Called when an item is chosen: the item's `id` and, when a key-down chose it, the modifiers
-/// held. The platform calls it between frames from the event that chose the item, on the main
-/// thread. An id the app does not know belongs to a platform item (Services, Zoom, …), which the
+/// Called when an item is chosen: the item's `id` and how it was chosen ([`Chosen`]: key press or
+/// click, and the modifiers held either way). The platform calls it between frames from the event
+/// that chose the item, on the main thread. An id the app does not know belongs to a platform item (Services, Zoom, …), which the
 /// platform already handled.
-pub type Handler = Arc<dyn Fn(&str, Option<Held>) + Send + Sync>;
+pub type Handler = Arc<dyn Fn(&str, Chosen) + Send + Sync>;
 
-/// The modifier keys held with a key-down.
+/// How a menu item was chosen: by a key equivalent or a click, and the modifiers held then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Chosen {
+    /// A key-down chose the item.
+    pub key_down: bool,
+    /// The modifiers held when it was chosen.
+    pub held: Held,
+}
+
+/// The modifier keys held.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     /// Command (⌘).

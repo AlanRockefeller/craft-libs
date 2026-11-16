@@ -1,8 +1,13 @@
 //! [`AdjustContext`], what every adjustment editor shares with its host, and the tone channels of
 //! Levels and Curves ([`ToneSpace`], [`ToneChannel`], [`ToneChannels`]).
 
+use std::sync::Arc;
+
+use craft_behavior::{EditEvent, Mixed};
 use craft_theme::Srgba;
+use craft_ui::contract::{Bind, CommandSet};
 use craft_ui::runtime::env::Label;
+use craft_ui::runtime::memory::StageAccess;
 
 use super::AdjustWords;
 use crate::ui::histogram::ChannelColor;
@@ -171,7 +176,8 @@ impl ToneChannel {
 }
 
 /// The channels a Levels or Curves panel lists, in Channel-select order; a histogram, a Levels
-/// value or a curve of the host is addressed by the same index.
+/// value or a curve of the host is addressed by the same index. The list is empty for an action whose target is
+/// unresolved ([`listed`](Self::listed) with no channel); the panels then draw no Channel select.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ToneChannels {
     channels: Vec<ToneChannel>,
@@ -209,6 +215,14 @@ impl ToneChannels {
         Self { channels: vec![channel], gray: false, isolated: true }
     }
 
+    /// The channels of a colour set the host isolated (Image › Curves with several Channels-panel targets
+    /// selected, storytold/photocraft#5335), in Channel-select order: a combined entry (a neutral
+    /// [`Named`](ToneChannel::Named) channel) and then the selected components. No entry is a composite, so Curves
+    /// overlays no other channel.
+    pub fn listed(channels: Vec<ToneChannel>) -> Self {
+        Self { channels, gray: false, isolated: false }
+    }
+
     /// The channels in order.
     pub fn as_slice(&self) -> &[ToneChannel] {
         &self.channels
@@ -219,7 +233,8 @@ impl ToneChannels {
         self.channels.len()
     }
 
-    /// Whether the list is empty (never for [`of`](Self::of)).
+    /// Whether the list is empty ([`listed`](Self::listed) with none); never for
+    /// [`of`](Self::of) and [`isolated`](Self::isolated).
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
@@ -238,5 +253,64 @@ impl ToneChannels {
     /// other channels' curves.
     pub fn is_composite(&self, index: usize) -> bool {
         matches!(self.channels.get(index), Some(ToneChannel::Composite(_)))
+    }
+}
+
+/// Alt+2 to Alt+6 in an adjustment dialog's Curves or Levels panel: picks the Channel select's entry by position. A
+/// position within the panel's [`ToneChannels`] becomes the shown channel; one past the list is consumed and changes
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, CommandSet)]
+#[command(prefix = "adjustChannel", scope = "adjustChannel")]
+#[non_exhaustive]
+pub enum ToneChannelCommands {
+    /// The first entry.
+    #[command(modal = "in_dialogs", label = "Channel 1", default = "Alt+2")]
+    Channel1,
+    /// The second entry.
+    #[command(modal = "in_dialogs", label = "Channel 2", default = "Alt+3")]
+    Channel2,
+    /// The third entry.
+    #[command(modal = "in_dialogs", label = "Channel 3", default = "Alt+4")]
+    Channel3,
+    /// The fourth entry.
+    #[command(modal = "in_dialogs", label = "Channel 4", default = "Alt+5")]
+    Channel4,
+    /// The fifth entry.
+    #[command(modal = "in_dialogs", label = "Channel 5", default = "Alt+6")]
+    Channel5,
+}
+
+impl ToneChannelCommands {
+    /// The entry's position, 0 to 4.
+    pub const fn index(self) -> usize {
+        match self {
+            ToneChannelCommands::Channel1 => 0,
+            ToneChannelCommands::Channel2 => 1,
+            ToneChannelCommands::Channel3 => 2,
+            ToneChannelCommands::Channel4 => 3,
+            ToneChannelCommands::Channel5 => 4,
+        }
+    }
+}
+
+impl ToneChannels {
+    /// The entry `command` picks: its position when the list has it, `None` for a position past the list.
+    pub(super) fn entry_of(&self, command: ToneChannelCommands) -> Option<usize> {
+        (command.index() < self.len()).then_some(command.index())
+    }
+}
+
+/// The shown channel the host keeps in `bind`, when it holds one.
+pub(super) fn read_shown(bind: &mut Option<Bind<'_, usize>>, cx: &mut impl StageAccess) -> Option<usize> {
+    match bind.as_mut()?.reborrow().read(cx)? {
+        Mixed::Same(value) => Some(value),
+        Mixed::Mixed => None,
+    }
+}
+
+/// Stores `after` as the shown channel in `bind` when it differs from `before`; without a bind there is nothing to write.
+pub(super) fn write_shown(bind: &mut Option<Bind<'_, usize>>, cx: &mut impl StageAccess, before: usize, after: usize) {
+    if let (Some(bind), true) = (bind.as_mut(), before != after) {
+        bind.reborrow().write(cx, &EditEvent::set(Mixed::Same(before), after, Arc::from("Channel"), None));
     }
 }

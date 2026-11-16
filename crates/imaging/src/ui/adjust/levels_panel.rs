@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use craft_behavior::{EditEvent, EditEvents, Mixed};
 use craft_ui::buttons::Button;
-use craft_ui::contract::{Bind, Entry, NoValue, Outcome, Pattern, Props, Remember as _, Show as _, ShowContainer as _, Sizing, clicked};
+use craft_ui::contract::{
+    Bind, CommandSet as _, Commands as _, Entry, NoValue, Outcome, Pattern, Props, Remember as _, Show as _, ShowContainer as _, Sizing, clicked,
+};
 use craft_ui::display::{Shade, Text};
 use craft_ui::layout_components::{Row, Stack};
 use craft_ui::pickers::Select;
@@ -16,7 +18,8 @@ use craft_ui::runtime::env::Env;
 use craft_ui::style::TypeRole;
 use egui::{Id, Response, Ui};
 
-use super::{AdjustContext, AdjustWords, Levels, LevelsClip, LevelsEditor, ToneChannels, TonePicker, TonePickerRow};
+use super::context::{read_shown, write_shown};
+use super::{AdjustContext, AdjustWords, Levels, LevelsClip, LevelsEditor, ToneChannelCommands, ToneChannels, TonePicker, TonePickerRow};
 use crate::ui::histogram::{ChannelColor, HistogramData};
 
 impl Levels {
@@ -108,6 +111,9 @@ pub struct LevelsPanel<'a> {
     /// The document canvas the armed picker samples.
     #[prop]
     canvas: Option<Id>,
+    /// The shown channel, kept by the host dialog; without it the panel keeps its own.
+    #[prop]
+    channel: Option<Bind<'a, usize>>,
     picker_enabled: [bool; 3],
     /// The document's mode has no point pickers: all disabled, with the note.
     #[prop(flag)]
@@ -131,6 +137,7 @@ impl<'a> LevelsPanel<'a> {
             stale: false,
             pickers: None,
             canvas: None,
+            channel: None,
             picker_enabled: [true; 3],
             pickers_unavailable: false,
             context: AdjustContext::dialog(true),
@@ -149,18 +156,40 @@ impl<'a> LevelsPanel<'a> {
         // pc: crates/ui-egui/src/dialogs/adjust_editors/levels.rs:63-85 (Channel select, Auto at the
         // row's end, Auto from the shown channel's histogram), crates/ui-egui/src/dialogs/adjust_dialog.rs:186-216
         // (the picker row in the dialog).
-        let Self { label, mut levels, channels, histograms, stale, mut pickers, canvas, picker_enabled, pickers_unavailable, context, enabled } =
-            self;
+        let Self {
+            label,
+            mut levels,
+            channels,
+            histograms,
+            stale,
+            mut pickers,
+            canvas,
+            channel: mut channel_bind,
+            picker_enabled,
+            pickers_unavailable,
+            context,
+            enabled,
+        } = self;
         let words = Env::of(ui).words::<AdjustWords>();
         let entries: Vec<Entry<usize>> = channels.as_slice().iter().enumerate().map(|(at, channel)| Entry::new(at, channel.label(&words))).collect();
         let (mut edit, mut picker, mut clipping) = (EditEvents::new(), None, None);
         let mut shown = 0;
-        let group = Stack::new().label(label).enabled(enabled).show(ui, |ui, cx| {
+        let stack = Stack::new().label(label).enabled(enabled);
+        // Alt+2…Alt+6 pick the Channel select's entry in a dialog; Properties has no such keys.
+        let stack = if context.is_dialog() { stack.command_scope(ToneChannelCommands::SCOPE) } else { stack };
+        let group = stack.show(ui, |ui, cx| {
             let all: Vec<Levels> = match levels.reborrow().read(cx) {
                 Some(Mixed::Same(all)) => all,
                 _ => Vec::new(),
             };
-            let channel = (*cx.keep::<usize>()).min(channels.len().saturating_sub(1));
+            let stored = read_shown(&mut channel_bind, cx).unwrap_or_else(|| *cx.keep::<usize>());
+            let mut commanded = stored;
+            if context.is_dialog() {
+                while let Some((command, _)) = cx.take_command::<ToneChannelCommands>() {
+                    commanded = channels.entry_of(command).unwrap_or(commanded);
+                }
+            }
+            let channel = commanded.min(channels.len().saturating_sub(1));
             let value = all.get(channel).copied().unwrap_or_else(|| Levels::identity(0.0..=255.0));
             let counts = histograms.get(channel);
             let color = channels.as_slice().get(channel).map_or(ChannelColor::Neutral, |c| c.color());
@@ -170,10 +199,13 @@ impl<'a> LevelsPanel<'a> {
             let mut picked = channel;
             let mut auto = false;
             Row::new().show(ui, |ui, _| {
-                Text::new(words.channel.clone()).shade(Shade::Muted).role(TypeRole::Label).show(ui);
-                let select = Select::new(words.channel.clone(), Bind::given(channel), &entries).sizing(Sizing::Content).show(ui);
-                if let Some(&at) = select.value() {
-                    picked = at;
+                // No channels (an action whose target is unresolved): no Channel select.
+                if !entries.is_empty() {
+                    Text::new(words.channel.clone()).shade(Shade::Muted).role(TypeRole::Label).show(ui);
+                    let select = Select::new(words.channel.clone(), Bind::given(channel), &entries).sizing(Sizing::Content).show(ui);
+                    if let Some(&at) = select.value() {
+                        picked = at;
+                    }
                 }
                 auto = clicked(&Button::new(words.auto.clone()).enabled(counts.is_some()).show(ui));
             });
@@ -217,7 +249,10 @@ impl<'a> LevelsPanel<'a> {
             }
             // An edit belongs to the channel it was drawn for; a switch shows from the next pass.
             shown = if picked == channel || !edit.is_empty() { channel } else { picked };
-            *cx.keep::<usize>() = shown;
+            write_shown(&mut channel_bind, cx, stored, shown);
+            if channel_bind.is_none() {
+                *cx.keep::<usize>() = shown;
+            }
         });
         LevelsPanelOutput { response: group.output, edit, channel: shown, picker, clipping }
     }

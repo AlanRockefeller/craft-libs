@@ -1,7 +1,7 @@
 //! The `Overlay` data, its presets and builders, its dismissal rules and the placement changes it reports.
 
 use super::opener::{Opener, Trigger};
-use super::place::{Anchor, FloatPlace, OverlayFit, Place, Resize, SizeLimits, ViewportShare};
+use super::place::{Anchor, FloatPlace, OverlayFit, Place, Resize, ResizeEdges, SizeLimits, ViewportShare};
 use crate::runtime::access::PopupKind;
 use crate::runtime::focus::{FocusPolicy, Initial};
 use crate::runtime::motion::{MotionSpec, spec};
@@ -9,7 +9,9 @@ use crate::runtime::overlay::{Backdrop, Rank};
 use crate::runtime::windows::ResizeEdge;
 use craft_behavior::overlay::{Align, MinWidth, Side};
 use craft_behavior::{GesturePhase, OwnerClass};
+use egui::emath::TSTransform;
 use egui::{Align2, Pos2, Rect, Response, Vec2};
+use std::borrow::Cow;
 
 /// What a press outside the layer and its anchor does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,7 +126,8 @@ pub struct Overlay {
     /// The position the caller places the layer's top left at, in the layer's parent space; its size comes from its
     /// content and size limits. Reported and owned like `placed`.
     pub placed_at: Option<Pos2>,
-    /// The rect a move or resize keeps the layer inside.
+    /// The rect the layer is kept inside: where it is placed, hung or floated, and through the user's moves and
+    /// resizes. In the layer's parent space.
     pub bounds: Option<Rect>,
     /// The layer's own opacity, below the open and close motion's.
     pub opacity: f32,
@@ -134,6 +137,8 @@ pub struct Overlay {
     /// Whether the layer's move band moves the OS window the layer is shown in, in place of the layer: the chrome a
     /// modal puts over the part of a title bar it covers. The layer stays where it is placed.
     pub moves_window: bool,
+    /// Set only by [`Overlay::full_window`].
+    full_window: bool,
 }
 
 /// The share of the viewport a dropdown list may take. Half the width leaves room for the list to hang from the end
@@ -169,7 +174,25 @@ impl Overlay {
             opacity: 1.0,
             body_scroll: true,
             moves_window: false,
+            full_window: false,
         }
+    }
+
+    /// The overlay with what its caller gives in the parent's layer space (`placed`, `placed_at`, a float position
+    /// and `bounds`) in screen space, by the parent layer's map `to_screen`: where the layer host places the layer and
+    /// its body moves and resizes it.
+    pub(crate) fn in_screen(&self, to_screen: TSTransform) -> Cow<'_, Overlay> {
+        if to_screen == TSTransform::IDENTITY {
+            return Cow::Borrowed(self);
+        }
+        let mut mapped = self.clone();
+        mapped.placed = mapped.placed.map(|rect| to_screen * rect);
+        mapped.placed_at = mapped.placed_at.map(|pos| to_screen * pos);
+        mapped.bounds = mapped.bounds.map(|rect| to_screen * rect);
+        if let Place::Float(FloatPlace { pos: Some(pos) }) = &mut mapped.place {
+            *pos = to_screen * *pos;
+        }
+        Cow::Owned(mapped)
     }
 
     fn below() -> Place {
@@ -232,6 +255,19 @@ impl Overlay {
         overlay
     }
 
+    /// A modal over the whole window: a modal rank with no backdrop, from its content, with `focus` as its scope.
+    pub fn full_window(focus: FocusPolicy) -> Overlay {
+        let mut overlay = Overlay::modal().fit(OverlayFit::Content).focus(focus);
+        overlay.rank = Rank::modal(Backdrop::None);
+        overlay.full_window = true;
+        overlay
+    }
+
+    /// Whether the layer was made by [`Overlay::full_window`]; the rank and backdrop are not read.
+    pub fn is_full_window(&self) -> bool {
+        self.full_window
+    }
+
     /// A modal: centred, content capped.
     pub fn modal() -> Overlay {
         let mut overlay = Overlay::dialog();
@@ -273,6 +309,12 @@ impl Overlay {
     /// Whether edge grips resize the layer.
     pub fn resizable(mut self, on: bool) -> Overlay {
         self.resize = if on { Resize::GRIPS } else { Resize::NONE };
+        self
+    }
+
+    /// Grips on the given edges only; a placement that holds an edge keeps its grip away.
+    pub fn resize_edges(mut self, edges: ResizeEdges) -> Overlay {
+        self.resize = Resize::edges(edges);
         self
     }
 
@@ -337,7 +379,8 @@ impl Overlay {
         self
     }
 
-    /// Sets the rect a move or resize keeps the layer inside.
+    /// Sets the rect the layer is kept inside: where it is placed, hung or floated, and through the user's moves and
+    /// resizes.
     pub fn bounds(mut self, bounds: Rect) -> Overlay {
         self.bounds = Some(bounds);
         self

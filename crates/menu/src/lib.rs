@@ -47,8 +47,18 @@
 //!   backend. **File** ([`MenuRole::File`]) gets Close Window unless the app binds ⌘W;
 //! - **clashes** with the system's keys (⌘H, ⌥⌘H, ⌘M, ⌘W, ⌘,, ⌘Q) are resolved in the app's
 //!   favour and reported ([`Clash`]); Hide and Minimize move to ⌃⌘H and ⌃⌘M, as Photoshop does,
-//!   the others go without a shortcut. Shortcuts the app binds outside its menus count too
-//!   ([`LayoutOptions::extra_shortcuts`]).
+//!   the others go without a shortcut. A system item gives way to the command the app's keymap
+//!   gives the key to, in a menu or not ([`LayoutOptions::keys`]), and to an item that shows it.
+//!
+//! **Alternates.** An [`Item`] or [`Row`] can carry an [`Alternate`]: while its modifiers are held
+//! as the row is clicked, the row runs the alternate's command, in the in-window bar and the native
+//! menu. Key equivalents are never swapped.
+//!
+//! **Customization.** [`Customization`] drops the rows the user hid and tints the ones they
+//! coloured, before [`from_items`].
+//!
+//! **Appearance.** [`ThemeMenu`] builds the Appearance submenu and the quick favourites rows, as
+//! [`LanguageMenu`] does for languages.
 //!
 //! The labels the layout writes itself are English unless the app passes its translations in
 //! [`LayoutOptions::label`].
@@ -86,6 +96,7 @@
 
 pub mod bar;
 pub mod context;
+mod customize;
 mod documents;
 mod driver;
 mod help;
@@ -95,6 +106,7 @@ mod layout;
 mod modal;
 mod model;
 mod palette;
+mod theme;
 
 pub mod mac;
 
@@ -102,6 +114,7 @@ pub mod shortcuts;
 
 pub use bar::{EnglishHook, Labeled, MenuBarOutput, MenuBarUi};
 pub use craft_keymap::{Chord, CommandRef};
+pub use customize::Customization;
 pub use documents::DOCUMENT_COMMAND_PREFIX;
 pub use driver::{Backend, ClipboardKeys, CommandHook, Dispatch, Event, Gate, NativeMenu, had_input};
 pub use help::{HelpCommand, HelpLabels, HelpLink, HelpMenu};
@@ -110,8 +123,10 @@ pub use language::{LANGUAGE_COMMAND, LanguageChoice, LanguageLabels, LanguageMen
 pub use layout::{Clash, Layout, LayoutOptions, Target, desktop_layout, layout, mac_layout, web_layout};
 pub use modal::{ModalRules, NAVIGATION_COMMANDS, PendingRule};
 pub use model::{
-    Builtin, Document, Item, ItemKind, ItemRole, Menu, MenuBar, MenuRole, Node, Platforms, Row, Standard, from_items, structure_key, tidy, window_key,
+    Alternate, Builtin, Document, Item, ItemKind, ItemRole, Menu, MenuBar, MenuRole, Node, Platforms, Row, Standard, from_items, structure_key, tidy,
+    window_key,
 };
+pub use theme::{THEME_COMMAND, ThemeChoice, ThemeLabels, ThemeMenu, ThemeRow};
 
 #[cfg(feature = "screen-testing")]
 /// The stories and words this crate registers, for the story tests.

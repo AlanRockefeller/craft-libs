@@ -1,8 +1,8 @@
 //! `ToolFixture` (22.4, the tool row): drives a [`CanvasTool`] on a [`Canvas`] through press, drag, release and
 //! Escape, and checks what every tool owes the canvas.
 
-use crate::canvas::{Canvas, CanvasTool, ToolHost, ToolPath};
-use crate::contract::{BodyCx, ShowContainer as _};
+use crate::canvas::{Canvas, CanvasTool, Snap, ToolHost, ToolPath};
+use crate::contract::{BodyCx, Props as _, ShowContainer as _};
 use crate::runtime::access::Role;
 use crate::testing::{Fixture, Target, pointer};
 use craft_behavior::kurbo::Size;
@@ -18,6 +18,12 @@ pub const DOCUMENT: Size = Size::new(1200.0, 900.0);
 /// Where the Escape drag of [`ToolFixture::check`] starts, as a fraction of the canvas from its top left corner: away
 /// from the path of the first drag, which a tool may leave a hit part on.
 const ESCAPE_DRAG_START: Vec2 = Vec2::new(0.25, 0.25);
+
+/// The id a [`ToolFixture`] gives its canvas labelled `label`: what a body hands to a control keyed by its canvas
+/// ([`Guides::new`](crate::canvas_controls::Guides::new)), as an app names its own canvas.
+pub fn canvas_id(label: &'static str) -> Id {
+    Id::new(("tool fixture canvas", label))
+}
 
 /// A tool shown on a canvas that fills the fixture's room, with the gesture phases the host reported.
 #[non_exhaustive]
@@ -39,7 +45,7 @@ impl<T: CanvasTool + 'static> ToolFixture<T> {
     /// A canvas named `label` whose body `body` fills: canvas controls shown at the body's rect join the canvas's
     /// arena, and a press on one of their parts never reaches the tool.
     pub fn with_body(label: &'static str, tool: T, body: impl FnMut(&mut Ui, &mut BodyCx<'_>) + 'static) -> Self {
-        Self::shown(label, tool, None, body)
+        Self::shown(label, tool, None, None, body)
     }
 
     /// [`ToolFixture::with_body`] over a canvas given the view `view` makes of the canvas's room, so the body's
@@ -50,13 +56,26 @@ impl<T: CanvasTool + 'static> ToolFixture<T> {
         view: impl Fn(Rect) -> CanvasView + 'static,
         body: impl FnMut(&mut Ui, &mut BodyCx<'_>) + 'static,
     ) -> Self {
-        Self::shown(label, tool, Some(Box::new(view)), body)
+        Self::shown(label, tool, Some(Box::new(view)), None, body)
+    }
+
+    /// [`ToolFixture::with_view`] over a canvas that snaps with `snap` ([`Canvas::snap`]): the tool's
+    /// `ToolContext::snap` and `snap_rect`, and the body's controls through `canvas_snap`, snap to its targets.
+    pub fn with_snap(
+        label: &'static str,
+        tool: T,
+        view: impl Fn(Rect) -> CanvasView + 'static,
+        snap: Snap,
+        body: impl FnMut(&mut Ui, &mut BodyCx<'_>) + 'static,
+    ) -> Self {
+        Self::shown(label, tool, Some(Box::new(view)), Some(snap), body)
     }
 
     fn shown(
         label: &'static str,
         tool: T,
         view: Option<Box<dyn Fn(Rect) -> CanvasView>>,
+        snap: Option<Snap>,
         mut body: impl FnMut(&mut Ui, &mut BodyCx<'_>) + 'static,
     ) -> Self {
         let tool = Rc::new(RefCell::new(tool));
@@ -65,9 +84,12 @@ impl<T: CanvasTool + 'static> ToolFixture<T> {
         let enabled = Rc::new(Cell::new(true));
         let (shown, seen, id, on) = (Rc::clone(&tool), Rc::clone(&gestures), Rc::clone(&canvas), Rc::clone(&enabled));
         let mut fixture = Fixture::new(move |ui| {
-            let mut shown_canvas = Canvas::new(label).document(DOCUMENT);
+            let mut shown_canvas = Canvas::new(label).id(canvas_id(label)).document(DOCUMENT);
             if let Some(view) = &view {
                 shown_canvas = shown_canvas.view(view(ui.available_rect_before_wrap()));
+            }
+            if let Some(snap) = &snap {
+                shown_canvas = shown_canvas.snap(snap.clone());
             }
             let canvas = shown_canvas.show(ui, &mut body);
             id.set(canvas.output.response.id);
