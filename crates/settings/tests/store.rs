@@ -140,3 +140,81 @@ fn a_map_entry_the_app_removes_is_removed_from_the_file() {
     let (last, _) = open_keyed(tmp.path());
     assert!(last.get().shortcuts.is_empty(), "{}", read_config(tmp.path()));
 }
+
+/// Options for a `Prefs` store in `dir`, importing `legacy.txt` (its text is the language) when there is no
+/// `config.toml`.
+fn read_options(dir: &Path) -> OpenOptions<Prefs> {
+    fn parse(bytes: &[u8]) -> Result<(Prefs, Vec<craft_settings::SectionError>), String> {
+        let mut prefs = Prefs::default();
+        prefs.general.language = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+        Ok((prefs, Vec::new()))
+    }
+    let legacy = craft_settings::LegacyFile { path: dir.join("legacy.txt"), parse };
+    OpenOptions::new(Location::Dir(dir.to_path_buf())).probe(empty_probe()).legacy(vec![legacy])
+}
+
+#[test]
+fn a_read_sees_what_a_store_wrote_and_touches_nothing_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A folder that does not exist reads as defaults and is not created.
+    let missing = tmp.path().join("missing");
+    let (prefs, _) = SettingsStore::<Prefs>::read(&read_options(&missing));
+    assert_eq!(prefs, Prefs::default());
+    assert!(!missing.exists(), "a read creates no folder");
+
+    // With no config.toml the legacy file is imported in memory only.
+    std::fs::write(tmp.path().join("legacy.txt"), "nl").unwrap();
+    let (prefs, _) = SettingsStore::<Prefs>::read(&read_options(tmp.path()));
+    assert_eq!(prefs.general.language, "nl");
+    assert!(!config_path(tmp.path()).exists(), "a read writes no config.toml");
+
+    // What an opened store saved is what a read sees, ahead of the legacy file.
+    let (mut store, _) = SettingsStore::open_with(read_options(tmp.path()));
+    store.update(|p| p.general.language = "de".into());
+    store.flush().unwrap();
+    let (prefs, _) = SettingsStore::<Prefs>::read(&read_options(tmp.path()));
+    assert_eq!(prefs.general.language, "de");
+
+    // A damaged config.toml reads as defaults and stays where it is, unchanged.
+    let broken = "schema_version = 2\n[general\nlanguage = \"fr\"\n";
+    write_config(tmp.path(), broken);
+    let (prefs, report) = SettingsStore::<Prefs>::read(&read_options(tmp.path()));
+    assert_eq!(prefs.general.language, Prefs::default().general.language);
+    assert!(report.broken_moved_to.is_none());
+    assert_eq!(report.damaged.as_deref(), Some(config_path(tmp.path()).as_path()), "a damaged file is named, not read as absent");
+    assert!(report.has_problems());
+    assert_eq!(read_config(tmp.path()), broken, "a read never moves or rewrites the file");
+    let moved = std::fs::read_dir(tmp.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("config.broken-"));
+    assert!(!moved, "nothing is moved aside");
+}
+
+/// A portable folder that is not writable: `read` loads the platform folder, as `open_with` does.
+#[cfg(unix)]
+#[test]
+fn a_read_falls_back_to_the_platform_folder_like_an_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let exe = tmp.path().join("exe");
+    let portable = exe.join("config");
+    let platform = tmp.path().join("platform");
+    std::fs::create_dir_all(&portable).unwrap();
+    std::fs::create_dir_all(platform.join("testcraft")).unwrap();
+    std::fs::write(exe.join("portable"), "").unwrap();
+    write_config(&portable, "schema_version = 2\n[general]\nlanguage = \"portable\"\n");
+    write_config(&platform.join("testcraft"), "schema_version = 2\n[general]\nlanguage = \"platform\"\n");
+    let options = || {
+        let probe = craft_settings::Probe { env: Box::new(|_| None), exe_dir: Some(exe.clone()), platform_config_dir: Some(platform.clone()) };
+        OpenOptions::<Prefs>::new(Location::Auto).probe(probe)
+    };
+    let (prefs, _) = SettingsStore::<Prefs>::read(&options());
+    assert_eq!(prefs.general.language, "portable");
+
+    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (prefs, report) = SettingsStore::<Prefs>::read(&options());
+    let (store, _) = SettingsStore::open_with(options());
+    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(prefs.general.language, "platform");
+    assert!(report.warning.is_some());
+    assert_eq!(store.get().general.language, "platform", "an open takes the same folder");
+}

@@ -76,6 +76,7 @@ pub trait PathTrack {
 
 /// The part of the path the text fills: arc lengths of its start and end, and whether it runs against the path.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PathRange {
     /// The arc length of the text's start.
     pub start: f64,
@@ -83,6 +84,13 @@ pub struct PathRange {
     pub end: f64,
     /// The text sits on the other side of the path and runs backwards.
     pub flip: bool,
+}
+
+impl PathRange {
+    /// The range from arc length `start` to `end`, running against the path when `flip`.
+    pub const fn new(start: f64, end: f64, flip: bool) -> Self {
+        Self { start, end, flip }
+    }
 }
 
 /// The part of the markers under the pointer or being dragged.
@@ -242,7 +250,7 @@ pub struct PathTextMarkers<'a> {
     range: Bind<'a, PathRange>,
     track: &'a dyn PathTrack,
     /// Where the paragraph's anchor sits in the span: 0 the start, 0.5 the centre, 1 the end.
-    #[prop]
+    #[prop(quantity = "fraction of the span")]
     anchor: f64,
     /// The text overflows the range: the end mark shows a plus.
     #[prop]

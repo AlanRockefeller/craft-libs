@@ -4,14 +4,15 @@ use super::control_click::ControlClick;
 use crate::runtime::frame::PerViewport;
 use crate::runtime::pen::PenPass;
 use craft_behavior::one_press::split_after_first_press;
-use craft_behavior::{Buttons, PointerButton, PointerEvent, PointerKind, PointerSample, WheelPhase, WheelUnit};
+use craft_behavior::{Buttons, PointerButton, PointerEvent, PointerKind, PointerSample, WheelPhase, WheelSource, WheelUnit};
 use craft_host::target::Os;
 use craft_keymap::{KeyInput, Mods};
-use egui::{Context, Event, Id, ImeEvent, Key, MouseWheelUnit, Pos2, TouchPhase, Vec2, ViewportId};
+use egui::{Context, Event, Id, ImeEvent, Key, MouseWheelSource, MouseWheelUnit, Pos2, TouchPhase, Vec2, ViewportId};
 
 pub use egui::RawInput;
 
-/// What the one-press rule needs between frames, for one viewport.
+/// The events that wait for the next frame, for one viewport: the one-press rule's and those the key stage cuts at a
+/// focus move (`keys::input_hook`).
 #[derive(Default)]
 pub(crate) struct HeldInput {
     events: Vec<Event>,
@@ -19,6 +20,13 @@ pub(crate) struct HeldInput {
 }
 
 impl HeldInput {
+    /// Holds `events`, which a later step of this pass's input hook cut, for the next frame, ahead of the events held
+    /// already: they arrived before them.
+    pub(crate) fn hold_ahead(&mut self, mut events: Vec<Event>) {
+        events.append(&mut self.events);
+        self.events = events;
+    }
+
     /// Whether events wait for the next frame.
     #[cfg(feature = "testing")]
     pub(crate) fn holds(&self) -> bool {
@@ -43,23 +51,26 @@ pub(crate) fn hold_back_presses(input: &mut RawInput, frame: u64, held: &mut Hel
     !held.events.is_empty()
 }
 
-/// Takes key presses out of the running pass's input: `places` counts the input's key presses, in order. Each press
-/// goes with its release when that is in the input too; otherwise its key is no longer down. Returns, for each
-/// place, whether the release is still to come.
-pub(crate) fn withdraw_presses(ctx: &Context, places: &[usize]) -> Vec<bool> {
+/// Takes key presses and texts out of the running pass's input. `places` and `texts` are the places the key stage
+/// recorded as it left them in the input (`in_egui`): a press's among the input's key presses, a text's among its text
+/// events. Each press goes with its release when that is in the input too; otherwise its key is no longer down.
+/// Returns, for each press place, whether the release is still to come.
+pub(crate) fn withdraw(ctx: &Context, places: &[usize], texts: &[usize]) -> Vec<bool> {
     ctx.input_mut(|input| {
-        let presses: Vec<(usize, egui::Key)> = input
-            .events
-            .iter()
-            .enumerate()
-            .filter_map(|(at, event)| match event {
-                Event::Key { key, pressed: true, .. } => Some((at, *key)),
-                _ => None,
-            })
-            .collect();
+        // The index in the input of the event at each recorded place of its kind.
+        let at_places = |kind: fn(&Event) -> bool, wanted: &[usize]| -> Vec<usize> {
+            let of_kind: Vec<usize> = input.events.iter().enumerate().filter(|(_, event)| kind(event)).map(|(at, _)| at).collect();
+            wanted.iter().filter_map(|place| of_kind.get(*place).copied()).collect()
+        };
+        let presses = at_places(|event| matches!(event, Event::Key { pressed: true, .. }), places);
+        let texts = at_places(|event| matches!(event, Event::Text(_)), texts);
         let mut gone = vec![false; input.events.len()];
-        let mut open = Vec::with_capacity(places.len());
-        for (at, key) in places.iter().filter_map(|place| presses.get(*place).copied()) {
+        for at in texts {
+            gone[at] = true;
+        }
+        let mut open = Vec::with_capacity(presses.len());
+        for at in presses {
+            let Event::Key { key, .. } = input.events[at] else { continue };
             gone[at] = true;
             let release = input.events[at + 1..]
                 .iter()
@@ -302,7 +313,7 @@ pub(crate) fn pointer_read(ctx: &Context) -> PointerRead {
                 Event::PointerMoved(pos) => {
                     stirred = true;
                     moves.push(events.len());
-                    events.push(PointerEvent::Moved { at: *pos, sample: None });
+                    events.push(PointerEvent::moved(*pos, None));
                 }
                 Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => {
                     // Only the next press sets the barrel state again, so a missed release never remaps a plain tap.
@@ -395,17 +406,18 @@ pub(crate) fn hit_targets(ctx: &Context) -> (Option<Id>, Option<Id>) {
 }
 
 /// The wheel input of the pass: the summed scroll in points (`line` and `page` points per line and page), the
-/// last event's unit, phase and modifiers. `None` when no wheel event arrived.
+/// last event's unit, phase and modifiers, and the device: fingers when any event of the pass came from them. `None`
+/// when no wheel event arrived.
 ///
 /// A wheel event's modifiers are the windowing layer's modifier state, which on Windows can miss a held Alt while the
 /// Alt key's own press and release still arrive: Alt counts as held from its key's press to its release, starting from
 /// whether it was down before the pass's first Alt key event (egui's held keys when the pass has none).
-pub(crate) fn wheel_read(ctx: &Context, line: f32, page: f32) -> Option<(Vec2, WheelUnit, WheelPhase, Mods)> {
+pub(crate) fn wheel_read(ctx: &Context, line: f32, page: f32) -> Option<(Vec2, WheelUnit, WheelPhase, Mods, WheelSource)> {
     let os = crate::runtime::windows::os_of(ctx);
     let zoom_modifier = ctx.options(|options| options.input_options.zoom_modifier);
     let is_alt = |key: &Key| matches!(key, Key::AltLeft | Key::AltRight);
     ctx.input(|input| {
-        let mut read: Option<(Vec2, WheelUnit, WheelPhase, Mods)> = None;
+        let mut read: Option<(Vec2, WheelUnit, WheelPhase, Mods, WheelSource)> = None;
         // A repeat means the key was already down; a release means it was down until then.
         let mut alt_key = input
             .raw
@@ -422,7 +434,7 @@ pub(crate) fn wheel_read(ctx: &Context, line: f32, page: f32) -> Option<(Vec2, W
             {
                 alt_key = *pressed;
             }
-            if let Event::MouseWheel { unit, delta, modifiers, phase, .. } = event {
+            if let Event::MouseWheel { unit, delta, modifiers, phase, source } = event {
                 let (unit, points) = match unit {
                     MouseWheelUnit::Point => (WheelUnit::Point, 1.0),
                     MouseWheelUnit::Line => (WheelUnit::Line, line),
@@ -438,7 +450,17 @@ pub(crate) fn wheel_read(ctx: &Context, line: f32, page: f32) -> Option<(Vec2, W
                 let share = if modifiers.matches_any(zoom_modifier) { Vec2::ZERO } else { *delta * points };
                 let sum = read.map_or(Vec2::ZERO, |(sum, ..)| sum) + share;
                 let held = egui::Modifiers { alt: modifiers.alt || alt_key, ..*modifiers };
-                read = Some((sum, unit, phase, Mods::from_egui(&held, os)));
+                let source = match source {
+                    MouseWheelSource::Unknown => WheelSource::Unknown,
+                    MouseWheelSource::Wheel => WheelSource::Wheel,
+                    MouseWheelSource::Trackpad => WheelSource::Trackpad,
+                    MouseWheelSource::Momentum => WheelSource::Momentum,
+                };
+                let source = match read {
+                    Some((.., before)) if before.fingers() && !source.fingers() => before,
+                    _ => source,
+                };
+                read = Some((sum, unit, phase, Mods::from_egui(&held, os), source));
             }
         }
         read
@@ -624,4 +646,22 @@ pub(crate) fn held_press_origin(ctx: &Context) -> Option<Pos2> {
 /// A plain Left or Right arrow press reached egui this pass, with no modifier held.
 pub(crate) fn plain_horizontal_arrow_pressed(ctx: &Context) -> bool {
     ctx.input(|input| input.modifiers.is_none() && (input.key_pressed(Key::ArrowLeft) || input.key_pressed(Key::ArrowRight)))
+}
+
+/// An Up, Down, Page Up or Page Down press reached egui this pass.
+pub(crate) fn step_key_pressed(ctx: &Context) -> bool {
+    ctx.input(|input| [Key::ArrowUp, Key::ArrowDown, Key::PageUp, Key::PageDown].into_iter().any(|key| input.key_pressed(key)))
+}
+
+/// Removes this pass's Tab and Shift+Tab presses from the input events; returns whether there was one. A Tab with
+/// Ctrl, Cmd or Alt is the window's, not the field's, and stays.
+pub(crate) fn take_tab(ctx: &Context) -> bool {
+    ctx.input_mut(|input| {
+        let before = input.events.len();
+        input.events.retain(|event| {
+            !matches!(event, Event::Key { key: Key::Tab, pressed: true, modifiers, .. }
+                if !modifiers.ctrl && !modifiers.command && !modifiers.mac_cmd && !modifiers.alt)
+        });
+        input.events.len() != before
+    })
 }

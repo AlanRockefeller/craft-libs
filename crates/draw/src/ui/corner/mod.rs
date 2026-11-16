@@ -15,6 +15,7 @@ mod words;
 use kurbo::Point;
 
 pub use style::CornerStyle;
+pub(crate) use widgets::paint_widget;
 pub use widgets::{CornerWidgets, CornerWidgetsOutput};
 pub use words::CornerWords;
 

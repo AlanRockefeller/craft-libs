@@ -7,6 +7,7 @@
 
 use super::PasteboardColor;
 use crate::contract::{Component, Cx, Focus as _, Pointer as _};
+use crate::primitives::PaintSlot;
 use crate::runtime::env::{AppValues, EnvValue, EnvView, UnitKind, Units};
 use craft_behavior::canvas::zoom;
 use craft_behavior::kurbo::{Point, Size};
@@ -35,18 +36,10 @@ pub struct CanvasSpace {
     /// The canvas's id, under which its controls claim keys on the focused canvas.
     canvas: Option<egui::Id>,
     pasteboard: PasteboardColor,
+    precise: bool,
     /// The canvas's picture slot for this pass, which [`paint_picture`](Self::paint_picture) appends to; `None` in a
     /// measuring pass.
-    picture: Option<PictureSlot>,
-}
-
-/// The shape the canvas reserved in its paint hook for the picture: its layer and index, which
-/// [`CanvasSpace::paint_picture`] grows into a `Shape::Vec` in show order. The space is `Copy` and holds no painter,
-/// so the slot is named by these two.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct PictureSlot {
-    pub(crate) layer: egui::LayerId,
-    pub(crate) idx: egui::layers::ShapeIdx,
+    picture: Option<PaintSlot>,
 }
 
 impl CanvasSpace {
@@ -65,6 +58,7 @@ impl CanvasSpace {
             background: BackgroundPress::default(),
             canvas: None,
             pasteboard: PasteboardColor::Default,
+            precise: false,
             picture: None,
         }
     }
@@ -95,6 +89,20 @@ impl CanvasSpace {
 
     fn on_screen(&self, view: CanvasView) -> CanvasView {
         if self.follows_pointer { view } else { pixel_aligned(view, self.pixels_per_point) }
+    }
+
+    /// This space with the precise cursor on or off for this pass ([`precise`](Self::precise)).
+    #[must_use]
+    pub fn with_precise(mut self, precise: bool) -> Self {
+        self.precise = precise;
+        self
+    }
+
+    /// Whether pointers over the canvas show their precise cursor (a crosshair) in this pass: Preferences > Cursors >
+    /// Other Cursors is Precise ([`Canvas::precise_cursors`](super::Canvas::precise_cursors)), toggled by Caps Lock.
+    /// The one source for the canvas's tool (`ToolContext::precise`) and its controls.
+    pub fn precise(&self) -> bool {
+        self.precise
     }
 
     /// This space with the keys the canvas left to its body in the pass.
@@ -143,33 +151,21 @@ impl CanvasSpace {
     /// context because the space holds none. Outside a canvas's paint (a measuring pass) there is no slot, and it
     /// paints nothing.
     pub fn paint_picture(&self, ctx: &egui::Context, shapes: Vec<egui::Shape>) {
-        let Some(slot) = self.picture else { return };
-        if shapes.is_empty() {
-            return;
+        if let Some(slot) = self.picture {
+            slot.extend(ctx, shapes);
         }
-        ctx.graphics_mut(|layers| {
-            layers.entry(slot.layer).mutate_shape(slot.idx, |clipped| {
-                if let egui::Shape::Vec(list) = &mut clipped.shape {
-                    list.extend(shapes);
-                    return;
-                }
-                let reserved = std::mem::replace(&mut clipped.shape, egui::Shape::Noop);
-                let list = if matches!(reserved, egui::Shape::Noop) { shapes } else { std::iter::once(reserved).chain(shapes).collect() };
-                clipped.shape = egui::Shape::Vec(list);
-            });
-        });
     }
 
     /// This space with the canvas's picture slot of this pass.
     #[must_use]
-    pub(crate) fn with_picture(mut self, slot: PictureSlot) -> Self {
+    pub(crate) fn with_picture(mut self, slot: PaintSlot) -> Self {
         self.picture = Some(slot);
         self
     }
 
     /// The slot the canvas reserved this pass, `None` before its paint step ran or outside a canvas: a display that
     /// paints under the controls paints in place without one.
-    pub(crate) fn picture_slot(&self) -> Option<PictureSlot> {
+    pub(crate) fn picture_slot(&self) -> Option<PaintSlot> {
         self.picture
     }
 

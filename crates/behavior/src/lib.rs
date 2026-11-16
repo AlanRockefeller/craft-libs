@@ -71,7 +71,7 @@ pub use kurbo;
 pub use codec::{Caret, Codec, NotAValue, NumberCodec, ParseNote, PlainText, decimals_for_step};
 pub use columns::{ColumnKey, ColumnWidth, GridSection, GridView, sub_row_cells};
 pub use command::{CommandFlags, pick_instance, resolve_flags};
-pub use cursor::{CountMark, Cursor, CursorBadge, CursorIcon, CursorPriority, IconId, PaintedCursor};
+pub use cursor::{CountMark, Cursor, CursorBadge, CursorIcon, CursorPriority, IconId, PaintedCursor, PointerGlyph};
 pub use digit_keys::{DigitEntry, DigitKeys};
 pub use doc_key::DocKey;
 pub use dock::DockSide;
@@ -112,7 +112,7 @@ pub use sizing::{ControlMetrics, Metrics, Proposal};
 pub use typing::{EditRun, Ended, EscapeRule, Escaped, Typed, TypingRun};
 pub use value::{Applied, CancelReason, EditEvent, EditEvents, EditPolicy, Gesture, GestureId, GestureNote, GesturePhase, Mixed, Validity, Value};
 pub use value_drag::{DragWarp, ValueDrag, wrap_value};
-pub use wheel::{GESTURE_GAP, Wheel, WheelFocus, WheelGesture, WheelNotch, WheelPhase, WheelRoom, WheelTaker, WheelUnit};
+pub use wheel::{GESTURE_GAP, Wheel, WheelFocus, WheelGesture, WheelNotch, WheelPhase, WheelRoom, WheelSource, WheelTaker, WheelUnit};
 
 #[cfg(test)]
 extern crate self as craft_behavior;

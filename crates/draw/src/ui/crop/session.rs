@@ -483,11 +483,11 @@ impl CropSession {
 
     /// The first frame edit from the hidden overlay, a ratio or size change or a Straighten press:
     /// the default frame shows again.
-    pub fn show(&mut self) {
+    pub fn show_frame(&mut self) {
         self.dismissed = None;
     }
 
-    /// The frame the last [`reset`](Self::reset) made, while no other step replaced it.
+    /// The frame the last `reset` made, while no other step replaced it.
     pub fn reset_to(&self) -> Option<CropBox> {
         self.reset_to
     }

@@ -62,6 +62,7 @@ craft_ui::words! {
 
 /// The cylinder's values: the box, the depths of its top and bottom edges and the wrap.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CylinderValues {
     /// The left edge of the box.
     pub left: f64,
@@ -119,7 +120,7 @@ impl CylinderValues {
     /// silhouettes and the edges keep their order (a moved one stops 1 unit short of the other) and a depth stays
     /// within the half axis, or within its own reach when it already lies past that (a cylinder read from a file). A
     /// drag by nothing changes nothing.
-    fn dragged(self, handle: CylinderHandle, by: DocVec) -> Self {
+    fn moved(self, handle: CylinderHandle, by: DocVec) -> Self {
         let mut v = self;
         let a = ((self.right - self.left) / 2.0).max(MIN_SIDE / 2.0);
         match handle {
@@ -199,13 +200,6 @@ pub enum CylinderHandle {
     Wrap,
     /// The surface.
     Surface,
-}
-
-impl CylinderHandle {
-    /// The place of a handle with a part among [`HANDLES`]; `None` for the surface.
-    fn index(self) -> Option<usize> {
-        HANDLES.iter().position(|&handle| handle == self)
-    }
 }
 
 /// The look of the cylinder editor: its lines in `overlay.line` over `overlay.halo`, the corners as handle squares and
@@ -295,17 +289,15 @@ impl<'a> CylinderWarp<'a> {
                     held.began = true;
                     *cx.press_slot::<Press>() = Some(held.clone());
                 }
-                cx.propose(held.values.dragged(held.handle, view.to_doc(pos) - held.origin));
+                cx.propose(held.values.moved(held.handle, view.to_doc(pos) - held.origin));
             }
             PressPhase::Release { .. } => {
                 if cx.press_slot::<Press>().take().is_some_and(|held| held.began) {
                     cx.commit();
                 }
             }
-            PressPhase::Cancel { .. } => {
-                if cx.press_slot::<Press>().take().is_some_and(|held| held.began) {
-                    cx.cancel(CancelReason::Escape);
-                }
+            PressPhase::Cancel { .. } if cx.press_slot::<Press>().take().is_some_and(|held| held.began) => {
+                cx.cancel(CancelReason::Escape);
             }
             _ => {}
         }
@@ -319,7 +311,7 @@ impl<'a> CylinderWarp<'a> {
         let Some(handle) = focused else { return };
         if let Some((direction, mods)) = cx.intents().take_nudge() {
             let step = if mods.shift { NUDGE_FAR } else { NUDGE };
-            cx.set(values.dragged(handle, space.view.unmap_vec(direction) * step));
+            cx.set(values.moved(handle, space.view.unmap_vec(direction) * step));
         }
     }
 }

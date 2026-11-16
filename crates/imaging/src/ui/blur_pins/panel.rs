@@ -41,7 +41,6 @@ impl<'a> BlurPinsPanel<'a> {
     /// Inside a modal body, declares the canvas gesture each pass, so the pins on the canvas keep their presses while
     /// the Blur Gallery dialog is modal. The pins take presses and drags at any time, so the pass-through is
     /// [`CanvasGesture::PRIMARY`] whenever the panel is shown.
-    #[must_use]
     pub fn canvas(mut self, canvas: egui::Id) -> Self {
         self.canvas = Some(canvas);
         self
@@ -63,7 +62,7 @@ impl<'a> BlurPinsPanel<'a> {
                 Some((index, amount)) => {
                     let (label, unit) = if kind == BlurKind::Spin { (&words.blur_angle, UnitKind::Degrees) } else { (&words.blur, UnitKind::Pixels) };
                     let row = SliderField::new(label.clone(), Bind::given(amount), 0.0..=kind.max()).step(1.0).unit_kind(unit).show(ui);
-                    for event in row.events {
+                    for event in row.edit.events {
                         if let Some(&value) = event.value() {
                             pins.pins[index].amount = value.clamp(0.0, kind.max());
                         }

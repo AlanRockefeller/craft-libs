@@ -7,7 +7,9 @@ use crate::dialog::{DialogId, DialogResult, DialogStack, FieldRefusal, StackDial
 use crate::form::Field;
 use crate::pickers::Select;
 use crate::runtime::env::{ColumnSize, UnitKind};
+use crate::runtime::{keys, overlay};
 use craft_behavior::PixelSize;
+use craft_keymap::{Chord, Mods};
 use egui::Ui;
 use serde_json::json;
 
@@ -156,7 +158,8 @@ pub struct ImageSize<'a> {
     /// The methods the list offers, in the order of [`Resample::ALL`]; all of them when empty.
     #[prop]
     methods: Vec<Resample>,
-    /// The bytes one pixel takes, for the file size readout.
+    /// The bytes one pixel of the flat image takes, for the file size readout: the mode's colour channels at the
+    /// document's depth, no alpha (1/8 for Bitmap, 1 for Indexed).
     #[prop(quantity = "bytes per pixel")]
     bytes_per_pixel: f64,
 }
@@ -185,16 +188,34 @@ impl<'a> ImageSize<'a> {
                 if let (false, Some(first)) = (entries.iter().any(|entry| entry.value() == Some(&state.method)), first_method) {
                     state.method = first;
                 }
-                let was = kit.file_size(state.size.original(), bytes_per_pixel);
-                let now = state.size.pixels();
+                let (now, original) = (state.size.pixels(), state.size.original());
                 let tone = kit.tone_of(now);
-                let shown = words.size_was.fill(&[("size", kit.file_size(now, bytes_per_pixel).as_str()), ("old", was.as_str())]);
+                let size = kit.file_size(now, bytes_per_pixel);
+                // "(was …)" only once the pixel size differs from the document's.
+                let shown = if now == original {
+                    size
+                } else {
+                    words.size_was.fill(&[("size", size.as_str()), ("old", kit.file_size(original, bytes_per_pixel).as_str())])
+                };
                 kit.readout(ui, &words.image_size, shown, tone);
                 kit.readout(ui, &words.dimensions, kit.dimensions(now), tone);
                 kit.refusal(ui, now);
                 kit.sides(ui, &mut state.size);
                 kit.resolution(ui, &mut state.size);
 
+                if !ui.is_sizing_pass() && overlay::drawing_top_modal(ui.ctx()) {
+                    let owner = ui.scope_id().with("resample-keys");
+                    for (key, method) in Resample::KEYS {
+                        let chord = Chord::new(Mods::ALT, key);
+                        keys::capture(ui.ctx(), owner, chord);
+                        while keys::take_claimed(ui.ctx(), owner, chord) {
+                            let offered = |method: &Resample| entries.iter().any(|entry| entry.value() == Some(method));
+                            if let Some(method) = method.filter(|method| state.size.is_resampling() && offered(method)) {
+                                state.method = method;
+                            }
+                        }
+                    }
+                }
                 let on = Checkbox::new(Bind::given(state.size.is_resampling())).label(words.resample.clone()).id_salt("resample").show(ui);
                 if let Some(on) = on.value().copied() {
                     state.size.resampling(on);

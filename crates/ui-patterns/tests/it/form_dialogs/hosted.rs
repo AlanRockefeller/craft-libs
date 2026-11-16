@@ -253,3 +253,210 @@ fn hosted_export_as_finishes_when_the_app_answers_its_save_request() {
     let answered = host.borrow_mut().take::<HostedExportAs>().and_then(DialogResult::ok).map(|result| result.path);
     assert_eq!(answered, Some(path), "the answered path finishes the dialog with it");
 }
+
+/// Export As: Enter alone does not export; Convert to sRGB starts on and its box gives the document's profile; + adds
+/// 0.5x "@0.5x", then 0.75x, and a row's trash button removes it while more than one is left; two rows ask for a folder
+/// and answer one output per row; without folder export, two rows refuse Export.
+#[trial]
+fn export_as_writes_one_file_per_scale_all_row_and_only_from_its_button() {
+    use craft_ui::patterns::form_dialogs::{ExportProfile, ScaleRow, ScaleSize};
+    use craft_ui::runtime::requests::PathKind;
+    assert_eq!(ExportOptions::default().profile, ExportProfile::Srgb, "Convert to sRGB is on by default");
+    let host = Rc::new(RefCell::new(DialogHost::new()));
+    let mut fixture = fixture(&host);
+    host.borrow_mut().open(HostedExportAs::new("Poster", PICTURE, ExportOptions::default()));
+    fixture.idle(10);
+    let options = |host: &Rc<RefCell<DialogHost>>| host.borrow().get::<HostedExportAs>().map(|dialog| dialog.options().clone()).expect("open");
+    let pick = |host: &Rc<RefCell<DialogHost>>| host.borrow_mut().get_mut::<HostedExportAs>().and_then(HostedExportAs::pick_path);
+
+    fixture.key(Key::Enter, Modifiers::NONE).idle(4);
+    assert!(pick(&host).is_none() && host.borrow().is_open::<HostedExportAs>(), "Enter does not start the export");
+
+    let srgb = fixture.by_label("Convert to sRGB").expect("the Color Space box");
+    fixture.click(&srgb).idle(4);
+    assert_eq!(options(&host).profile, ExportProfile::Document, "unticked keeps the document's profile");
+
+    let one = fixture.by_label("Remove size 1").expect("the first row's trash button");
+    fixture.click(&one).idle(4);
+    assert_eq!(options(&host).scale_rows().len(), 1, "the last row stays");
+    let add = fixture.by_label("Add a size").expect("the + button");
+    fixture.click(&add).idle(4);
+    let add = fixture.by_label("Add a size").expect("the + button");
+    fixture.click(&add).idle(4);
+    assert_eq!(
+        options(&host).scale_all,
+        [ScaleRow::default(), ScaleRow::new(ScaleSize::X0_5, "@0.5x"), ScaleRow::new(ScaleSize::X0_75, "@0.75x")],
+        "+ adds the next sizes"
+    );
+    let third = fixture.by_label("Remove size 3").expect("the third row's trash button");
+    fixture.click(&third).idle(4);
+    assert_eq!(options(&host).scale_all.len(), 2);
+
+    let export = fixture.by_label("Export…").expect("the Export button");
+    fixture.click(&export).idle(4);
+    let request = pick(&host).expect("Export asks where to write");
+    assert!(matches!(request.kind, PathKind::Folder), "two rows ask for a folder");
+    if let Some(dialog) = host.borrow_mut().get_mut::<HostedExportAs>() {
+        dialog.answer_path(request.key.clone(), PathBuf::from("/tmp/out"));
+    }
+    fixture.idle(6);
+    let outputs = host.borrow_mut().take::<HostedExportAs>().and_then(DialogResult::ok).map(|result| result.outputs).expect("answered");
+    let listed: Vec<(PixelSize, &str)> = outputs.iter().map(|output| (output.size, output.suffix.as_str())).collect();
+    assert_eq!(listed, [(PICTURE, ""), (PixelSize::new(800, 450), "@0.5x")], "one output per row");
+
+    let mut two = ExportOptions::default();
+    two.scale_all = vec![ScaleRow::default(), ScaleRow::new(ScaleSize::X2, "@2x")];
+    host.borrow_mut().open(HostedExportAs::new("Poster", PICTURE, two).folder_export(false));
+    fixture.idle(10);
+    let export = fixture.by_label("Export…").expect("the Export button");
+    fixture.click(&export).idle(4);
+    let ctx = fixture.ctx().clone();
+    assert!(pick(&host).is_none() && !host.borrow_mut().confirm::<HostedExportAs>(&ctx), "without a folder two rows refuse Export");
+}
+
+/// A layer export of several files asks for a folder where the app can write one, the browser's build keeps the save
+/// request, and an export of one file asks for that file by name.
+#[trial]
+fn an_export_of_several_files_asks_for_a_folder() {
+    use craft_ui::runtime::requests::PathKind;
+    let host = Rc::new(RefCell::new(DialogHost::new()));
+    let mut fixture = fixture(&host);
+    let pick = |host: &Rc<RefCell<DialogHost>>| host.borrow_mut().get_mut::<HostedExportAs>().and_then(HostedExportAs::pick_path);
+    for (files, folder_export, folder) in [(2, true, true), (2, false, false), (1, true, false)] {
+        host.borrow_mut().open(HostedExportAs::new("Poster", PICTURE, ExportOptions::default()).files(files).folder_export(folder_export));
+        fixture.idle(10);
+        let export = fixture.by_label("Export…").expect("the Export button");
+        fixture.click(&export).idle(4);
+        let request = pick(&host).expect("Export asks where to write");
+        let case = format!("{files} files, folder export {folder_export}");
+        assert_eq!(matches!(request.kind, PathKind::Folder), folder, "{case}: a folder");
+        if !folder {
+            assert_eq!(request.file_name.as_deref(), Some("Poster.png"), "{case}: the file is named");
+        }
+        fixture.key(Key::Escape, Modifiers::NONE).idle(4);
+        assert!(host.borrow().is_empty(), "{case}: Escape cancels");
+    }
+}
+
+/// Enter in a field of Export As commits that field and leaves the dialog open. + adds sizes in their order up to the
+/// row limit, then is disabled, and a suffix is cut at its limit.
+#[trial]
+fn export_as_keeps_scale_all_within_its_limits_and_enter_in_a_field_only_commits_it() {
+    use craft_ui::patterns::form_dialogs::{ScaleRow, ScaleSize};
+    let host = Rc::new(RefCell::new(DialogHost::new()));
+    let mut fixture = fixture(&host);
+    host.borrow_mut().open(HostedExportAs::new("Poster", PICTURE, ExportOptions::default()));
+    fixture.idle(10);
+    let options = |host: &Rc<RefCell<DialogHost>>| host.borrow().get::<HostedExportAs>().map(|dialog| dialog.options().clone()).expect("open");
+
+    let scale = fixture.by_label("Scale").expect("the Scale field");
+    fixture.click(&scale).idle(2);
+    fixture.key(Key::A, Modifiers::COMMAND).type_text("50");
+    fixture.key(Key::Enter, Modifiers::NONE).idle(4);
+    assert!(host.borrow().is_open::<HostedExportAs>(), "Enter in the Scale field leaves the dialog open");
+    assert_eq!(options(&host).output_size(PICTURE), PixelSize::new(800, 450), "Enter commits the field");
+
+    for _ in 1..ScaleRow::MAX_ROWS {
+        let add = fixture.by_label("Add a size").expect("the + button");
+        fixture.click(&add).idle(4);
+    }
+    let rows = options(&host).scale_rows();
+    assert_eq!(rows.len(), ScaleRow::MAX_ROWS, "+ adds rows up to the limit");
+    let added: Vec<ScaleSize> = rows.iter().skip(1).map(|row| row.size).collect();
+    let order: Vec<ScaleSize> = ScaleSize::ADD_ORDER.iter().copied().filter(|size| *size != rows[0].size).take(added.len()).collect();
+    assert_eq!(added, order, "+ adds the sizes in their order");
+    let add = fixture.by_label("Add a size").expect("the + button");
+    assert!(fixture.tree().is_disabled_key(add.node), "+ is disabled at the limit");
+
+    let suffix = fixture.by_label("Suffix 2").expect("the second row's suffix");
+    fixture.click(&suffix).idle(2);
+    fixture.key(Key::A, Modifiers::COMMAND).type_text(&"s".repeat(ScaleRow::MAX_SUFFIX + 10));
+    fixture.key(Key::Tab, Modifiers::NONE).idle(4);
+    assert_eq!(options(&host).scale_rows()[1].suffix.chars().count(), ScaleRow::MAX_SUFFIX, "a suffix is cut at its limit");
+}
+
+/// Image Size's readout counts the flat image in whole-byte rows (a Bitmap row of 9 pixels takes 2 bytes) and says
+/// "(was …)" only once the pixel size differs from the document's.
+#[trial]
+fn image_size_readout_counts_whole_byte_rows_and_says_was_only_after_a_change() {
+    let host = Rc::new(RefCell::new(DialogHost::new()));
+    let mut fixture = fixture(&host);
+    host.borrow_mut()
+        .open(HostedImageSize::new(ImageSizeValues::new(PixelSize::new(9, 8)), |values| ImageSize::new(values).bytes_per_pixel(1.0 / 8.0)));
+    fixture.settle();
+    let texts = |fixture: &Fixture| fixture.texts().iter().map(|painted| painted.text.clone()).collect::<Vec<_>>();
+    assert!(texts(&fixture).iter().any(|text| text == "16 bytes"), "2 bytes a row, 8 rows: {:?}", texts(&fixture));
+    assert!(!texts(&fixture).iter().any(|text| text.contains("(was")), "no (was …) at the document's size");
+    let width = fixture.by_label("Width").expect("the Width field");
+    fixture.click(&width).settle();
+    fixture.key(Key::A, Modifiers::COMMAND).type_text("18");
+    fixture.key(Key::Tab, Modifiers::NONE).settle();
+    assert!(texts(&fixture).iter().any(|text| text.contains("(was 16 bytes)")), "{:?}", texts(&fixture));
+}
+
+/// Alt+1..8 pick the Resample method (#15054), each press with the text it typed taken out of the input, so the
+/// focused field types nothing; a press that picks nothing takes its text too.
+#[trial]
+fn image_size_alt_digits_pick_resample_without_typing_into_a_field() {
+    use craft_ui::patterns::form_dialogs::Resample;
+    use craft_ui::testing::input::{key_press, text};
+    let host = Rc::new(RefCell::new(DialogHost::new()));
+    let mut fixture = fixture(&host);
+    let resample = |host: &Rc<RefCell<DialogHost>>| {
+        host.borrow().open_dialogs().into_iter().next().and_then(|open| open.fields).and_then(|fields| fields.get("resample").cloned())
+    };
+    let field_text = |fixture: &Fixture, label: &str| {
+        let field = fixture.by_label(label).expect("the field");
+        fixture.tree().value_of(field.node).unwrap_or_default().to_owned()
+    };
+    let alt_digit = |fixture: &mut Fixture, key: Key, typed: &str, modifiers: Modifiers| {
+        fixture.frame(vec![key_press(key, modifiers), text(typed)]).settle();
+    };
+    let alt = Modifiers::ALT;
+
+    host.borrow_mut().open(image_size());
+    fixture.settle();
+    let width = fixture.by_label("Width").expect("the Width field");
+    fixture.click(&width).settle();
+    let before = field_text(&fixture, "Width");
+    alt_digit(&mut fixture, Key::Num7, "7", alt);
+    assert_eq!(resample(&host), Some(json!("nearestNeighbor")), "Alt+7 picks Nearest Neighbor");
+    assert_eq!(field_text(&fixture, "Width"), before, "Alt+7 types nothing into the focused field");
+    alt_digit(&mut fixture, Key::Num8, "•", alt);
+    assert_eq!(resample(&host), Some(json!("bilinear")), "Alt+8 picks Bilinear");
+    alt_digit(&mut fixture, Key::Num3, "3", alt);
+    assert_eq!(resample(&host), Some(json!("bilinear")), "Alt+3 picks nothing");
+    assert_eq!(field_text(&fixture, "Width"), before, "Alt+3 types nothing either");
+    alt_digit(&mut fixture, Key::Num7, "7", alt | Modifiers::CTRL);
+    assert_eq!(resample(&host), Some(json!("bilinear")), "Ctrl+Alt+7 (AltGr) leaves the method alone");
+    fixture.key(Key::A, Modifiers::COMMAND).type_text("50");
+    assert_eq!(field_text(&fixture, "Width"), "50", "plain typing still edits the field");
+    let ctx = fixture.ctx().clone();
+    assert!(host.borrow_mut().cancel::<HostedImageSize>(&ctx), "the dialog closes");
+    host.borrow_mut().take::<HostedImageSize>();
+    fixture.settle();
+
+    // Resample off: the keys pick nothing and type nothing into the resolution field.
+    host.borrow_mut().open(HostedImageSize::new(ImageSizeValues::new(PICTURE).resampling(false), |values| ImageSize::new(values)));
+    fixture.settle();
+    let resolution = fixture.by_label("Resolution").expect("the Resolution field");
+    fixture.click(&resolution).settle();
+    let before = field_text(&fixture, "Resolution");
+    alt_digit(&mut fixture, Key::Num7, "7", alt);
+    assert_eq!(resample(&host), Some(Value::Null), "Resample stays off");
+    assert_eq!(field_text(&fixture, "Resolution"), before, "the resolution field types nothing");
+    let ctx = fixture.ctx().clone();
+    assert!(host.borrow_mut().cancel::<HostedImageSize>(&ctx), "the dialog closes");
+    host.borrow_mut().take::<HostedImageSize>();
+    fixture.settle();
+
+    // A method the dialog does not offer is not picked.
+    host.borrow_mut().open(HostedImageSize::new(ImageSizeValues::new(PICTURE), |values| {
+        ImageSize::new(values).methods(vec![Resample::Automatic, Resample::NearestNeighbor])
+    }));
+    fixture.settle();
+    alt_digit(&mut fixture, Key::Num5, "5", alt);
+    assert_eq!(resample(&host), Some(json!("automatic")), "Alt+5 picks nothing when Bicubic Sharper is not listed");
+    alt_digit(&mut fixture, Key::Num7, "7", alt);
+    assert_eq!(resample(&host), Some(json!("nearestNeighbor")), "Alt+7 picks a listed method");
+}
