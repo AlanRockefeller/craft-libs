@@ -64,6 +64,8 @@ pub struct ToolRailOutput<T> {
     pub double_clicked: Option<T>,
     /// The column toggle was clicked; the host flips its column count.
     pub toggle_columns: bool,
+    /// The side toggle was clicked; the host moves the rail to the other edge.
+    pub toggle_side: bool,
     /// The Edit Toolbar button's response while the rail shows it: a click on it opens the drawer, and the drawer
     /// takes it as its opener ([`ToolbarDrawer::opened_by`](crate::rails::ToolbarDrawer::opened_by)).
     pub edit_toolbar: Option<Response>,
@@ -127,6 +129,10 @@ pub struct ToolRail<'a, T: Value + 'static> {
     /// Shows the column toggle at the top, named by the label.
     #[prop(into)]
     column_toggle: Option<Label>,
+    /// Shows a button beside the column toggle, named by the label, that asks the host to move the rail to the other
+    /// edge.
+    #[prop(into)]
+    side_toggle: Option<Label>,
     /// Shows the Edit Toolbar button after the last slot, named by the label.
     #[prop(into)]
     edit_toolbar: Option<Label>,
@@ -138,6 +144,7 @@ pub struct ToolRail<'a, T: Value + 'static> {
     hidden: &'a [T],
     footer: Option<FooterFn<'a>>,
     toggled: bool,
+    side_toggled: bool,
 }
 
 impl<'a, T: Value + 'static> ToolRail<'a, T> {
@@ -163,11 +170,13 @@ impl<'a, T: Value + 'static> ToolRail<'a, T> {
             columns: NonZeroU8::MIN,
             edge: PaneEdge::Start,
             column_toggle: None,
+            side_toggle: None,
             edit_toolbar: None,
             editing: false,
             hidden: &[],
             footer: None,
             toggled: false,
+            side_toggled: false,
         }
         .label(label)
     }
@@ -193,7 +202,7 @@ impl<'a, T: Value + 'static> ToolRail<'a, T> {
     pub fn show_rail(mut self, ui: &mut Ui, footer: impl FnMut(&mut Ui, RailFooter) + 'a) -> ToolRailOutput<T> {
         let columns = self.column_count();
         self.props = self.props.roving(Roving::new(NavShape::wrapped_grid(columns)));
-        if self.column_toggle.is_some() {
+        if self.column_toggle.is_some() || self.side_toggle.is_some() {
             self.props = self.props.header(HeaderRegion::new());
         }
         self.footer = Some(Box::new(footer));
@@ -294,6 +303,7 @@ impl<T: Value + 'static> Component for ToolRail<'_, T> {
             select: None,
             double_clicked: None,
             toggle_columns: self.toggled,
+            toggle_side: self.side_toggled,
             edit_toolbar: None,
             flyout: None,
             dropped: None,
@@ -303,13 +313,21 @@ impl<T: Value + 'static> Component for ToolRail<'_, T> {
 }
 
 impl<T: Value + 'static> Container for ToolRail<'_, T> {
-    /// The column toggle.
+    /// The column toggle and the side toggle.
     fn header(&mut self, ui: &mut Ui, _: &mut BodyCx<'_>) {
-        let Some(label) = self.column_toggle.clone() else { return };
         let (columns, rtl) = (self.column_count(), Env::of(ui).direction.is_rtl());
-        let icon = crate::collapse::chevrons(column_toggle_points_right(columns, !self.at_end() != rtl));
-        let toggle = IconButton::new(icon).id_salt("column-toggle").label(label).show(ui);
-        self.toggled |= clicked(&toggle);
+        let at_left = !self.at_end() != rtl;
+        if let Some(label) = self.column_toggle.clone() {
+            let icon = crate::collapse::chevrons(column_toggle_points_right(columns, at_left));
+            let toggle = IconButton::new(icon).id_salt("column-toggle").label(label).show(ui);
+            self.toggled |= clicked(&toggle);
+        }
+        if let Some(label) = self.side_toggle.clone() {
+            // The icon shows the edge the rail moves to.
+            let icon = IconId::new(if at_left { "panel_right" } else { "panel_left" });
+            let toggle = IconButton::new(icon).id_salt("side-toggle").label(label).show(ui);
+            self.side_toggled |= clicked(&toggle);
+        }
     }
 
     /// The host's footer.

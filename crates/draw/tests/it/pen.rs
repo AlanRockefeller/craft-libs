@@ -3,7 +3,7 @@
 
 use craft_behavior::kurbo::Point;
 use craft_behavior::{CanvasView, EditEvent};
-use craft_draw::ui::pen::{EditSubpath, Knot, PenEvent, PenTool};
+use craft_draw::ui::pen::{EditSubpath, Knot, PenEnd, PenEvent, PenMode, PenTool};
 use craft_ui::testing::{ToolFixture, trial};
 use egui::{Event, Modifiers, PointerButton, Pos2, Rect, vec2};
 
@@ -68,6 +68,13 @@ impl Pen {
         self.sync();
     }
 
+    /// Space goes down or up.
+    fn space(&mut self, down: bool) {
+        let key = Event::Key { key: egui::Key::Space, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::NONE };
+        self.fixture.fixture().frame(vec![key]);
+        self.sync();
+    }
+
     fn click(&mut self, at: Pos2, modifiers: Modifiers) {
         self.press(at, modifiers);
         self.release(at, modifiers);
@@ -93,7 +100,7 @@ impl Pen {
             match event {
                 PenEvent::Edit(EditEvent::Update { value, .. }) => now = value.clone(),
                 PenEvent::Edit(EditEvent::Commit { after, .. }) => now = after.clone(),
-                PenEvent::Finished => now = EditSubpath::default(),
+                PenEvent::Finished(_) => now = EditSubpath::default(),
                 _ => {}
             }
         }
@@ -117,7 +124,7 @@ impl Pen {
                 PenEvent::Edit(EditEvent::Commit { .. }) => "commit",
                 PenEvent::Edit(EditEvent::Cancel { .. }) => "cancel",
                 PenEvent::Edit(_) => "other",
-                PenEvent::Finished => "finished",
+                PenEvent::Finished(_) => "finished",
                 PenEvent::Resumed(..) => "resumed",
             })
             .collect()
@@ -187,6 +194,136 @@ fn the_pen_is_a_tool_every_canvas_accepts() {
     fixture.check();
 }
 
+// With Space held mid-drag the anchor and both handles move by the pointer's travel; released, the handle follows
+// the pointer again. A pass that repeats the pointer moves nothing.
+#[trial]
+fn space_moves_the_anchor_with_its_handles() {
+    let mut pen = pen();
+    pen.click_doc(60.0, 60.0);
+    let from = pen.at(160.0, 60.0);
+    pen.press(from, Modifiers::NONE);
+    pen.move_to(from + vec2(40.0, 30.0), Modifiers::NONE);
+    assert_eq!(pen.draft().knots[1], Knot::smooth(doc(160.0, 60.0), doc(200.0, 90.0)));
+
+    pen.space(true);
+    pen.move_to(from + vec2(60.0, 30.0), Modifiers::NONE);
+    assert_eq!(pen.draft().knots[1], Knot::smooth(doc(180.0, 60.0), doc(220.0, 90.0)), "the anchor took the 20 points of travel");
+    pen.move_to(from + vec2(60.0, 30.0), Modifiers::NONE);
+    assert_eq!(pen.draft().knots[1].anchor, doc(180.0, 60.0), "a repeated pointer moves nothing");
+
+    pen.space(false);
+    pen.move_to(from + vec2(60.0, 50.0), Modifiers::NONE);
+    let knot = pen.draft().knots[1];
+    assert_eq!(knot.anchor, doc(180.0, 60.0));
+    assert_eq!(knot.out_ctrl, doc(220.0, 110.0), "the handle follows the pointer again");
+    pen.release(from + vec2(60.0, 50.0), Modifiers::NONE);
+}
+
+// A draft the host hands in gains one anchor; the first removal updates the draft, the next goes back to the handed-in
+// path and ends the draft as discarded, never as an empty commit.
+#[trial]
+fn removing_a_resumed_drafts_own_anchor_restores_the_path_and_ends_the_draft() {
+    let mut pen = pen();
+    let own = EditSubpath::new(vec![Knot::corner(doc(60.0, 60.0)), Knot::corner(doc(160.0, 60.0))], false);
+    pen.fixture.tool_mut().draft(Some(&own));
+    pen.fixture.fixture().settle();
+    pen.sync();
+    assert_eq!(pen.kinds(), ["begin"], "the handed-in draft begins its gesture at once");
+
+    pen.click_doc(260.0, 160.0);
+    assert_eq!(pen.draft().knots.len(), 3);
+    assert!(pen.fixture.tool_mut().remove_last());
+    pen.sync();
+    assert_eq!(pen.draft(), own, "the added anchor is gone");
+    assert!(pen.fixture.tool_mut().remove_last());
+    pen.sync();
+    assert_eq!(pen.log.last(), Some(&PenEvent::Finished(PenEnd::Discarded)));
+    assert!(pen.kinds().ends_with(&["cancel", "finished"]), "{:?}", pen.kinds());
+    assert!(!pen.kinds().contains(&"commit"), "no empty commit removes the path: {:?}", pen.kinds());
+    assert_eq!(pen.draft(), EditSubpath::default());
+}
+
 // ---- Curvature mode ----
 
+// Curvature mode with `kept(2)`: a handed-in draft resumes, a new click keeps knots 0 and 1's handles but bends knot
+// 1's out handle, and `replace` is one `Update`, refused while a press is down.
+#[trial]
+fn a_curvature_resume_keeps_the_carried_knots_and_replace_updates_the_draft() {
+    let mut pen = pen();
+    let carried = EditSubpath::new(vec![Knot::smooth(doc(60.0, 60.0), doc(80.0, 70.0)), Knot::smooth(doc(160.0, 60.0), doc(180.0, 40.0))], false);
+    {
+        let mut tool = pen.fixture.tool_mut();
+        tool.mode(PenMode::Curvature);
+        tool.kept(2);
+        tool.draft(Some(&carried));
+    }
+    pen.fixture.fixture().settle();
+    pen.sync();
+    assert_eq!(pen.kinds(), ["begin"]);
+
+    pen.click_doc(260.0, 160.0);
+    let draft = pen.draft();
+    assert_eq!(draft.knots.len(), 3);
+    assert_eq!(draft.knots[0], carried.knots[0], "the first knot keeps its handles");
+    assert_eq!(draft.knots[1].anchor, carried.knots[1].anchor);
+    assert_eq!(draft.knots[1].in_ctrl, carried.knots[1].in_ctrl, "the last kept knot keeps its in handle");
+    assert_eq!(draft.knots[1].out_ctrl, carried.knots[1].anchor, "the last kept knot's out handle starts the new run");
+
+    let before = pen.log.len();
+    assert!(pen.fixture.tool_mut().replace(&carried));
+    pen.sync();
+    assert_eq!(pen.log.len(), before + 1, "one event");
+    assert!(matches!(pen.log.last(), Some(PenEvent::Edit(EditEvent::Update { value, .. })) if *value == carried));
+
+    let at = pen.at(300.0, 100.0);
+    pen.press(at, Modifiers::NONE);
+    let during = pen.log.len();
+    assert!(!pen.fixture.tool_mut().replace(&carried), "refused while the press is down");
+    pen.sync();
+    assert_eq!(pen.log.len(), during);
+    pen.release(at, Modifiers::NONE);
+}
+
+/// Three clicks of the Curvature Pen far apart give three anchors, each click an `Update`: on its own, and with the
+/// host handing the draft it holds back in before every frame, as an app's per-pass configuration does.
+#[trial]
+fn three_curvature_clicks_give_three_anchors() {
+    for round_trip in [false, true] {
+        let mut pen = pen();
+        pen.fixture.tool_mut().mode(PenMode::Curvature);
+        let points = [(60.0, 160.0), (160.0, 60.0), (260.0, 160.0)];
+        for (n, (x, y)) in points.into_iter().enumerate() {
+            let at = pen.at(x, y);
+            let updates = pen.kinds().iter().filter(|kind| **kind == "update").count();
+            for event in [Event::PointerMoved(at), button(at, true, Modifiers::NONE), button(at, false, Modifiers::NONE)] {
+                if round_trip {
+                    let held = pen.draft();
+                    let mut tool = pen.fixture.tool_mut();
+                    tool.mode(PenMode::Curvature).draft((!held.knots.is_empty()).then_some(&held)).kept(0);
+                }
+                pen.fixture.fixture().frame(vec![event]);
+                pen.sync();
+            }
+            let what = format!("round trip {round_trip}, click {}", n + 1);
+            assert_eq!(pen.draft().knots.len(), n + 1, "{what}: {:?}", pen.kinds());
+            assert!(pen.kinds().iter().filter(|kind| **kind == "update").count() > updates, "{what}: an Update");
+        }
+    }
+}
+
 // ---- Path modes and Path Options ----
+
+/// A host that ended the draft itself hands in no draft: the pen drops its run without an event, and the next press
+/// starts a new draft rather than carrying on the ended one.
+#[trial]
+fn a_draft_the_host_ended_is_not_carried_on() {
+    let mut pen = pen();
+    pen.click_doc(100.0, 100.0);
+    pen.click_doc(200.0, 100.0);
+    assert_eq!(pen.draft().knots.len(), 2);
+    pen.fixture.tool_mut().draft(None);
+    assert!(pen.fixture.tool_mut().take_events().is_empty(), "the host ended it: the pen reports nothing");
+    pen.log.clear();
+    pen.click_doc(100.0, 200.0);
+    assert_eq!(pen.draft().knots.len(), 1, "a new draft");
+}

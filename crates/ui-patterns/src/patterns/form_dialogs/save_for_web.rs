@@ -9,7 +9,7 @@ use super::size_model::LinkedSize;
 use super::sizing::{Resample, SizingWords};
 use crate::runtime::requests::{HostAnswer, PathFilter, PathRequest};
 
-use crate::contract::{Bind, NoValue, Outcome, Props as _, ShowContainer as _};
+use crate::contract::{Bind, Held, NoValue, Outcome, Props as _, ShowContainer as _};
 
 use crate::layout_components::{Row, Stack};
 
@@ -19,7 +19,7 @@ use crate::runtime::memory::{Remember as _, SaveKey};
 
 use crate::runtime::motion::Animate;
 use crate::runtime::overlay::CloseReason;
-use craft_behavior::PixelSize;
+use craft_behavior::{PixelSize, Selection};
 use craft_keymap::{Chord, Key, Mods};
 
 use craft_theme::Rgba;
@@ -29,7 +29,7 @@ use egui::{Response, Ui};
 
 use serde::{Deserialize, Serialize};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod options;
 mod panes;
@@ -44,11 +44,15 @@ mod model;
 
 pub use hosted::HostedSaveForWeb;
 pub use model::{
-    Animation, ColorTable, Dither, SaveForWebOptions, SaveForWebResult, WantedVariant, WebFormat, WebMetadata, WebPreset, WebVariant, WebView,
+    Animation, ColorTable, Dither, SaveForWebOptions, SaveForWebResult, WantedVariant, WebFormat, WebMetadata, WebPreset, WebSlice, WebSlices,
+    WebVariant, WebView,
 };
 
 /// The key of the matte colour request the dialog files.
 pub const MATTE_COLOR_KEY: &str = "web.matte";
+
+/// The key of the colour request the dialog files for an edited palette entry.
+pub const PALETTE_COLOR_KEY: &str = "web.palette";
 
 /// The key of the path request Save… files.
 pub const SAVE_PATH_KEY: &str = "web.save";
@@ -145,6 +149,11 @@ craft_ui::words! {
         pane_name: template "saveForWeb.paneName" = "{pane}: {first}, {second}";
         /// The pane waits for the app's encode.
         pane_pending: "saveForWeb.panePending" = "Encoding";
+        slices: "saveForWeb.slices" = "Slices";
+        all_slices: "saveForWeb.allSlices" = "All Slices";
+        user_slices: "saveForWeb.userSlices" = "All User Slices";
+        selected_slices: "saveForWeb.selectedSlices" = "Selected Slices";
+        save_html: "saveForWeb.saveHtml" = "Save HTML and Images";
     }
 }
 
@@ -168,6 +177,10 @@ struct Live {
     clock: f64,
     revision: u64,
     reported: u64,
+    /// The selection of the Color Table's cells.
+    table: Selection<usize>,
+    /// The palette index whose colour request is out.
+    editing: Option<u16>,
 }
 
 impl Default for Live {
@@ -183,6 +196,8 @@ impl Default for Live {
             clock: 0.0,
             revision: 1,
             reported: 0,
+            table: Selection::default(),
+            editing: None,
         }
     }
 }
@@ -230,8 +245,9 @@ pub struct SaveForWebOutput {
     /// The panes to encode, when the settings, the size, the view or the frame changed: every pane the view shows,
     /// with the revision to answer with.
     pub wanted_variants: Vec<WantedVariant>,
-    /// What the dialog asks of the host: the colour picker for the matte (keyed [`MATTE_COLOR_KEY`]) and, after
-    /// Save…, the file dialog (keyed [`SAVE_PATH_KEY`]). The host answers with
+    /// What the dialog asks of the host: the colour picker for the matte (keyed [`MATTE_COLOR_KEY`]) or for a
+    /// palette entry (keyed [`PALETTE_COLOR_KEY`]) and, after Save…, the file dialog (keyed [`SAVE_PATH_KEY`]). The
+    /// host answers with
     /// [`HostRequests::answer_color`] and [`HostRequests::answer_path`] and gives the answers back through
     /// [`SaveForWebDialog::answers`].
     pub requests: HostRequests,
@@ -291,7 +307,12 @@ impl WebPictures {
 ///   into Reset, which restores the settings and the size from when the dialog opened. Ctrl+Z steps the dialog's own
 ///   settings.
 /// - Panes: a drag pans every pane, Ctrl with the wheel zooms about the pointer, a double click fits, a click selects
-///   the pane. The zoom row steps through the preview's zoom levels and has Fit and 100%.
+///   the pane. The zoom row steps through the preview's zoom levels and has Fit and 100%. A click on a slice of the
+///   document selects it, and Shift adds it to or removes it from the selection.
+/// - Color Table: an indexed format whose shown pane carries a palette lists it in a table; opening an entry files a
+///   colour request keyed [`PALETTE_COLOR_KEY`], and the answer is kept in `palette_edits` until the format, the
+///   colour count, the palette method or a preset is set. A host answer applies in the pass that takes it; a second
+///   pass of the same frame sees none.
 /// - Encoding is the app's: [`SaveForWebOutput::wanted_variants`] lists the panes to encode; the app answers with
 ///   [`WebVariant`]s in `pictures`, and the dialog drops none: the owner of the pictures drops stale ones
 ///   ([`HostedSaveForWeb::set_variant`]).
@@ -324,6 +345,17 @@ pub struct SaveForWebDialog<'a> {
     /// The host's answers to earlier requests: the matte colour and the path of the file to write.
     #[prop]
     answers: Vec<HostAnswer>,
+    /// The document's slices, for the Slices choice.
+    #[prop]
+    slices: &'a [WebSlice],
+    /// Binds the view tab to `view`: the dialog shows the bound view and writes the tab the user picks, so the host
+    /// and the dialog share one value.
+    #[prop]
+    view: Option<Bind<'a, WebView>>,
+    /// Binds the animation frame the panes show to `frame`: the dialog shows the bound frame and writes the frame Play
+    /// moves to, so the host and the dialog share one value.
+    #[prop]
+    frame: Option<Bind<'a, u32>>,
 }
 
 impl<'a> SaveForWebDialog<'a> {
@@ -340,12 +372,17 @@ impl<'a> SaveForWebDialog<'a> {
             remember: None,
             saving: false,
             answers: Vec::new(),
+            slices: &[],
+            view: None,
+            frame: None,
         }
     }
 
     /// Shows the dialog.
     pub fn show(self, ui: &mut Ui) -> SaveForWebOutput {
-        let SaveForWebDialog { name, size, pictures, options, open, presets, animation, remember, saving, answers } = self;
+        let SaveForWebDialog { name, size, pictures, options, open, presets, animation, remember, saving, answers, slices, view, frame } = self;
+        let mut view_held = view.map(Held::new);
+        let mut frame_held = frame.map(Held::new);
         let env = Env::of(ui);
         let words = env.words::<SaveForWebWords>();
         let sizing = env.words::<SizingWords>();
@@ -369,11 +406,27 @@ impl<'a> SaveForWebDialog<'a> {
         let mut finished = SaveForWebOptions::default();
         let shown = form.show(ui, |ui, cx, options| {
             let mut live = cx.memory::<Live>().clone();
+            let mut restored = false;
             if !live.started {
                 let saved = remember.as_ref().and_then(|key| cx.saved::<Option<Last>>(key).clone());
                 live = Live::open(size, saved.as_ref());
                 if let Some(last) = &saved {
-                    *options = SaveForWebOptions { percent: 100.0, ..last.options.clone() };
+                    // The slices and palette edits belong to one document, so a remembered set leaves them at their defaults.
+                    *options = SaveForWebOptions { percent: 100.0, ..last.options.without_document_fields() };
+                    restored = true;
+                }
+            }
+            // A measuring run reads the view but never writes it, as `FormDialog` does for its own bind.
+            let measuring = crate::runtime::measure::active(ui.ctx());
+            if let Some(held) = view_held.as_mut()
+                && let Some(bound) = held.read(&mut **cx)
+            {
+                if restored {
+                    if !measuring {
+                        held.write(&mut **cx, &bound, live.view, "view");
+                    }
+                } else {
+                    live.view = bound;
                 }
             }
             for answer in cx.take_answers() {
@@ -381,6 +434,12 @@ impl<'a> SaveForWebDialog<'a> {
                     HostAnswer::Color { key, color } if key == MATTE_COLOR_KEY => {
                         let Rgba([r, g, b, _]) = color.to_rgba();
                         options.matte = [r, g, b];
+                    }
+                    HostAnswer::Color { key, color } if key == PALETTE_COLOR_KEY => {
+                        if let Some(at) = live.editing.take() {
+                            let Rgba([r, g, b, _]) = color.to_rgba();
+                            options.palette_edits.insert(at, [r, g, b]);
+                        }
                     }
                     HostAnswer::Path { key, path } if key == SAVE_PATH_KEY => {
                         chosen = Some(path);
@@ -390,10 +449,17 @@ impl<'a> SaveForWebDialog<'a> {
                 }
             }
             let before = (options.clone(), live.link.pixels(), live.view, live.frame);
+            // A frame the host set is a change from the one the last pass showed: the panes are encoded again.
+            if let Some(bound) = frame_held.as_mut().and_then(|held| held.read(&mut **cx)) {
+                live.frame = bound;
+            }
+            let frame_before = live.frame;
             live.advance(&**cx, animation);
             let view_before = live.view;
 
             let mut ask = None;
+            let mut slice_click = None;
+            let palette = palette_of(&pictures, live.selected);
             Row::new().show(ui, |ui, _| {
                 Stack::new().id_salt("preview").show(ui, |ui, _| {
                     let reads = panes::Panes {
@@ -405,14 +471,20 @@ impl<'a> SaveForWebDialog<'a> {
                         animation,
                         hint: &hint,
                         options: &*options,
+                        slices,
+                        chosen: options.slices.selected(),
                     };
-                    panes::show(ui, &reads, &mut live)
+                    panes::show(ui, &reads, &mut live, &mut slice_click)
                 });
                 Stack::new().id_salt("settings").show(ui, |ui, _| {
-                    let kit = options::Kit { words: &words, sizing: &sizing, units: &units, presets: &presets };
-                    options::show(ui, &kit, options, &mut live.link, &mut ask)
+                    let kit =
+                        options::Kit { words: &words, sizing: &sizing, units: &units, presets: &presets, palette, has_slices: !slices.is_empty() };
+                    options::show(ui, &kit, options, &mut live.link, &mut live.table, &mut live.editing, &mut ask)
                 });
             });
+            if let Some(panes::SliceClick { number, add }) = slice_click {
+                options.slices.select(number, add);
+            }
 
             if live.link.pixels() != before.1 {
                 options.percent = percent_of(live.link.pixels(), live.link.original());
@@ -420,12 +492,21 @@ impl<'a> SaveForWebDialog<'a> {
             if (options.clone(), live.link.pixels(), live.view, live.frame) != before {
                 live.revision += 1;
             }
-            if let Some(key) = &remember
-                && live.view != view_before
+            if live.frame != frame_before
+                && !measuring
+                && let Some(held) = frame_held.as_mut()
             {
-                let saved = cx.saved::<Option<Last>>(key);
-                let kept = saved.as_ref().map_or_else(|| options.clone(), |last| last.options.clone());
-                *saved = Some(Last { view: live.view, options: kept });
+                held.write(&mut **cx, &frame_before, live.frame, "frame");
+            }
+            if live.view != view_before {
+                if !measuring && let Some(held) = view_held.as_mut() {
+                    held.write(&mut **cx, &view_before, live.view, "view");
+                }
+                if let Some(key) = &remember {
+                    let saved = cx.saved::<Option<Last>>(key);
+                    let kept = saved.as_ref().map_or_else(|| options.without_document_fields(), |last| last.options.clone());
+                    *saved = Some(Last { view: live.view, options: kept });
+                }
             }
             if let Some(request) = ask {
                 cx.requests().request_color(request);
@@ -444,13 +525,7 @@ impl<'a> SaveForWebDialog<'a> {
         if shown.picked == Some(0) {
             requests.request_path(save_request(&name, finished.format));
         }
-        let result = shown.accepted.zip(chosen).map(|(accepted, path)| SaveForWebResult {
-            options: accepted.clone(),
-            path,
-            width: pixels.width,
-            height: pixels.height,
-            remember: remember.map(|key| (key, Last { view: live.view, options: accepted })),
-        });
+        let result = shown.accepted.zip(chosen).map(|(accepted, path)| result_of(accepted, path, pixels, live.view, remember));
         SaveForWebOutput {
             response: shown.response,
             closed: shown.closed,
@@ -463,6 +538,24 @@ impl<'a> SaveForWebDialog<'a> {
             selected: live.selected,
         }
     }
+}
+
+/// The answer of a confirmed dialog: the settings, the file, the output size, and what the next open remembers (the
+/// settings without the slices and palette edits, which belong to one document).
+fn result_of(options: SaveForWebOptions, path: PathBuf, size: PixelSize, view: WebView, remember: Option<SaveKey>) -> SaveForWebResult {
+    SaveForWebResult {
+        options: options.clone(),
+        path,
+        width: size.width,
+        height: size.height,
+        remember: remember.map(|key| (key, Last { view, options: options.without_document_fields() })),
+    }
+}
+
+/// The palette of the encoded pane `pane`; an Original pane has none.
+fn palette_of(pictures: &WebPictures, pane: WebPane) -> Option<&[[u8; 3]]> {
+    let WebPane::Encoded(index) = pane else { return None };
+    pictures.variants.get(index)?.as_ref()?.palette.as_deref()
 }
 
 /// The percent `size` is of `original`, rounded to two decimals.

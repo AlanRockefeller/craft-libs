@@ -9,15 +9,16 @@ use crate::contract::{
     Props as _, Role, SaveKey, Show as _, Sizing, WordSetCx as _,
 };
 use crate::runtime::env::Label;
-use crate::runtime::memory::Remember as _;
+use crate::runtime::memory::{Remember as _, sub};
 use crate::runtime::overlay::CloseReason;
 use crate::runtime::windows::{WindowAction, WindowHost, WindowSpec};
 use crate::sections::{HeaderAction, HeaderStrength, TitleRow};
 use crate::style::{ComponentStyle, StyleCx, SurfaceKind};
-use craft_behavior::placement::{cascade, monitor_of};
+use craft_behavior::placement::{capped, cascade, monitor_of};
 use craft_behavior::{Metrics, Monitor, Sense};
+use craft_host::target::WindowState;
 use craft_window::{WindowId, WindowList};
-use egui::{Rect, Response, Ui, Vec2};
+use egui::{Rect, Response, Ui, Vec2, ViewportId};
 
 /// The style of a document window: the surface comes from the container.
 #[derive(Clone, Debug, Default, PartialEq, ComponentStyle)]
@@ -45,6 +46,19 @@ pub struct DocumentWindowOutput {
     pub cascade: f32,
     /// The window gained OS focus in this pass.
     pub focus_gained: bool,
+    /// Whether the window took the size a zoom edit asked for in this pass (`Fits`: the host centres the document) or
+    /// the work area capped it (`Capped`: the zoomed spot stays); `None` when nothing was asked or sent.
+    pub wrapped: Option<Wrapped>,
+}
+
+/// How a window answered the size a zoom edit asked for ([`DocumentWindow::wrap_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Wrapped {
+    /// The window took the wanted size.
+    Fits,
+    /// The monitor's work area capped the size.
+    Capped,
 }
 
 impl Outcome for DocumentWindowOutput {
@@ -89,6 +103,39 @@ pub struct DocumentWindow<'a> {
 }
 
 impl<'a> DocumentWindow<'a> {
+    /// Files the zoom edit's size request from the window's body: the window sizes itself so its `canvas` rect becomes
+    /// `wanted`, in the pass `finish` reads it, keeping its centre and staying inside the monitor's work area.
+    pub fn wrap_in(cx: &mut BodyCx<'_>, canvas: Rect, wanted: Vec2) {
+        let id = cx.id;
+        *cx.memory.shown::<WrapAsk>(id) = WrapAsk(Some((canvas, wanted)));
+    }
+
+    /// Sizes the window in `viewport` so the body's `canvas` rect becomes `wanted`: at least the fallback layer's
+    /// minimum, at most the work area of its monitor less its frame, about its centre. `None`, with nothing sent,
+    /// where there is no OS window, it is maximised, minimised or full screen, or it has not reported its facts, its
+    /// outer rect (the frame is unknown without it) and monitor.
+    fn wrap(&self, host: &WindowHost, viewport: ViewportId, canvas: Rect, wanted: Vec2) -> Option<Wrapped> {
+        if !host.viewports_available() {
+            return None;
+        }
+        let facts = host.facts(viewport).filter(|facts| facts.state == WindowState::Normal)?;
+        let scale = facts.scale?;
+        let outer = facts.outer?;
+        let frame = outer.size() - facts.inner.size();
+        let monitors = host.monitors();
+        // `capped` converts the monitor's work area to points itself, so `scale` only finds the monitor here.
+        let monitor = monitor_of(&monitors, Rect::from_min_max(outer.min * scale, outer.max * scale))?;
+        let min = match &self.props.mount {
+            Mount::Viewport { fallback, .. } => fallback.size_limits.min,
+            _ => Vec2::ZERO,
+        };
+        let asked = facts.inner.size() - canvas.size() + wanted;
+        let size = capped(asked, monitor, frame, min);
+        host.set_outer(viewport, Rect::from_center_size(outer.center(), size + frame));
+        // A size the minimum raised still shows the whole document: `Fits`.
+        if size.x < asked.x || size.y < asked.y { Some(Wrapped::Capped) } else { Some(Wrapped::Fits) }
+    }
+
     /// A window titled `title`, resizable, with the installed decision's frame.
     pub fn new(title: impl Into<Label>) -> Self {
         let fallback = Overlay::floating().resizable(true).fit(OverlayFit::Resizable);
@@ -168,6 +215,11 @@ impl<'a> DocumentWindow<'a> {
 #[derive(Clone, Copy, Default)]
 struct HadFocus(bool);
 
+/// The size a zoom edit asked for from the window's body in this pass ([`DocumentWindow::wrap_in`]): the body's canvas
+/// rect and the size it wants. `finish` takes it in the same pass, so no request outlives its pass.
+#[derive(Clone, Copy, Default)]
+struct WrapAsk(Option<(Rect, Vec2)>);
+
 impl Component for DocumentWindow<'_> {
     const ROLE: Role = Role::GROUP;
     const PARTS: bool = false;
@@ -197,7 +249,17 @@ impl Component for DocumentWindow<'_> {
         if focus_gained && let Some(activate) = self.activate.as_mut() {
             activate();
         }
-        DocumentWindowOutput { response: cx.response.clone(), close_requested: self.closed, focused, cascade: cx.style.cascade, focus_gained }
+        let body = sub(cx.core.id, "body");
+        let ask = std::mem::take(cx.core.memory.shown::<WrapAsk>(body)).0;
+        let wrapped = ask.zip(viewport).and_then(|((canvas, wanted), viewport)| self.wrap(&host, viewport, canvas, wanted));
+        DocumentWindowOutput {
+            response: cx.response.clone(),
+            close_requested: self.closed,
+            focused,
+            cascade: cx.style.cascade,
+            focus_gained,
+            wrapped,
+        }
     }
 }
 

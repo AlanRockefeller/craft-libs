@@ -64,6 +64,20 @@ impl<V> Default for Opened<V> {
 #[derive(Clone, Default)]
 struct PreviewOff(bool);
 
+/// The value a binding holds this pass; `None` while it holds none (a kept or mixed binding).
+pub(crate) fn read_bind<T: Value>(bind: &mut Bind<'_, T>) -> Option<T> {
+    match bind.reborrow().get() {
+        Some(Mixed::Same(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// Writes `value` through a binding as one step. A given binding keeps its value: the app takes the dialog's reports.
+pub(crate) fn write_bind<T: Value>(bind: &mut Bind<'_, T>, value: T) {
+    let before = bind.reborrow().get().unwrap_or(Mixed::Mixed);
+    let _ = bind.reborrow().apply(&EditEvent::set(before, value, Arc::from(""), None));
+}
+
 /// What a form body sees: the dialog's body context, whether this is the pass the dialog opened in, the answers the
 /// host gave since the last pass and the requests the body files for the host.
 pub struct FormCx<'a, 'b> {
@@ -172,6 +186,8 @@ pub struct FormDialog<'a, V: Value + Default> {
     answers: Vec<HostAnswer>,
     reset_with: Option<ResetWithFn<'a, V>>,
     on_reset: Option<OnResetFn<'a>>,
+    /// The host's opening values: each pass given them keeps them as the values Reset restores.
+    opening: Option<V>,
 }
 
 impl<'a, V: Value + Default> FormDialog<'a, V> {
@@ -198,6 +214,7 @@ impl<'a, V: Value + Default> FormDialog<'a, V> {
             shaped: None,
             answers: Vec::new(),
             reset_with: None,
+            opening: None,
             on_reset: None,
         }
     }
@@ -317,6 +334,14 @@ impl<'a, V: Value + Default> FormDialog<'a, V> {
         self
     }
 
+    /// The opening values the host keeps: Reset restores them and the edited check compares with them. Each pass given
+    /// them stores them, so a host that moves its baseline (a seed after the open) passes the new one. Without them the
+    /// first pass's values are the opening values.
+    pub fn opening(mut self, opening: V) -> Self {
+        self.opening = Some(opening);
+        self
+    }
+
     /// Runs when Reset is picked, for what the body keeps in its own memory.
     pub fn on_reset(mut self, restore: impl FnMut(&mut BodyCx<'_>) + 'a) -> Self {
         self.on_reset = Some(Box::new(restore));
@@ -347,6 +372,7 @@ impl<'a, V: Value + Default> FormDialog<'a, V> {
             mut answers,
             reset_with,
             on_reset,
+            opening,
         } = self;
         let env = Env::of(ui);
         let common = env.words::<CommonWords>();
@@ -458,8 +484,10 @@ impl<'a, V: Value + Default> FormDialog<'a, V> {
                 let ctx = ui.ctx().clone();
                 crate::runtime::edit::watch_gestures(&ctx, || body(ui, &mut form, &mut values))
             };
-            if first {
-                cx.memory::<Opened<V>>().0 = Some(values.clone());
+            match &opening {
+                Some(opening) if !measuring => cx.memory::<Opened<V>>().0 = Some(opening.clone()),
+                None if first => cx.memory::<Opened<V>>().0 = Some(values.clone()),
+                _ => {}
             }
             if history && !measuring {
                 let mut steps = steps.unwrap_or_else(|| EditHistory::new(&values));

@@ -3,7 +3,9 @@
 use super::context::{Cx, CxCore};
 use crate::contract::{Component, EditResponse, Pointer as _, Validity, ValueOf};
 use crate::primitives::Adopted;
-use craft_behavior::{CancelReason, EditEvent, Gesture, GesturePhase, Mixed, PartRef, PointerButton, PressCancel, PressPhase, Sense, Value};
+use craft_behavior::{
+    CancelReason, EditEvent, Gesture, GestureNote, GesturePhase, Mixed, PartRef, PointerButton, PressCancel, PressPhase, Sense, Value, WheelPhase,
+};
 use egui::{Id, Pos2};
 use std::sync::Arc;
 
@@ -29,8 +31,8 @@ impl CxCore<'_> {
     }
 }
 
-/// Values and edits (chapter 10). `value`, `validity`, `gesture`, `adopt` and `edit_response` take `&self`, so `paint`
-/// can call them.
+/// Values and edits (chapter 10). `value`, `validity`, `gesture`, `gesture_before`, `adopt` and `edit_response` take
+/// `&self`, so `paint` can call them.
 pub trait Edit {
     /// The component's value type.
     type Value: Value;
@@ -44,6 +46,11 @@ pub trait Edit {
 
     /// Where this pass's gesture stands.
     fn gesture(&self) -> Option<GesturePhase>;
+
+    /// The value the running gesture began with, as its `Begin` reported it: the same in every pass of the gesture,
+    /// while [`value`](Self::value) follows each proposal. A control whose proposals count from the press (a drag
+    /// by its travel) reads its start here. `None` while no gesture runs, the pass that ends one included.
+    fn gesture_before(&self) -> Option<Mixed<Self::Value>>;
 
     /// Maps each of the child's events onto a clone of this component's shown value and queues the resulting events, in
     /// the child's order, for step 15. A composite whose own value is mixed or not yet shown maps the edits onto
@@ -79,6 +86,42 @@ impl<C: Component> Cx<'_, C> {
     fn gesture_slot(&mut self) -> &mut Gesture<ValueOf<C>> {
         let id = gesture_key(self.core.id);
         self.core.memory.shown(id)
+    }
+
+    /// [`propose`](Edit::propose), saying whether the component took the proposal: `false` when it refuses edits or
+    /// the gesture was cancelled under its press.
+    fn take_proposal(&mut self, v: ValueOf<C>) -> bool {
+        if self.refuses_edits() {
+            return false;
+        }
+        let before = self.before();
+        let (label, doc_key) = (self.core.label_arc(), self.core.resolved.doc_key);
+        let fresh = crate::runtime::edit::next_gesture_id(&self.core.ctx);
+        let slot = self.gesture_slot();
+        // A gesture cancelled under its press stays cancelled until the release.
+        if slot.dead {
+            return false;
+        }
+        let started = !slot.is_running();
+        if started {
+            slot.id = fresh;
+            slot.before = Some(before.clone());
+        }
+        slot.proposal = Some(v.clone());
+        let id = slot.id;
+        let report = slot.reported.as_ref() != Some(&v);
+        if report {
+            slot.reported = Some(v.clone());
+        }
+        if started {
+            self.events.push(EditEvent::begin(id, before, label, doc_key));
+        }
+        if report {
+            self.events.push(EditEvent::update(id, v.clone()));
+        }
+        self.shown = Some(Arc::new(v));
+        self.mixed = false;
+        true
     }
 
     /// The value before an edit: the shown value, or mixed.
@@ -168,6 +211,10 @@ impl<C: Component> Edit for Cx<'_, C> {
         Some(if began && !updated { GesturePhase::Begin } else { GesturePhase::Update })
     }
 
+    fn gesture_before(&self) -> Option<Mixed<ValueOf<C>>> {
+        self.core.memory.recall::<Gesture<ValueOf<C>>>(gesture_key(self.core.id)).before
+    }
+
     fn adopt<V: Value>(&self, child: &EditResponse<V>, start: &ValueOf<C>, map: impl Fn(&V, &mut ValueOf<C>)) {
         let before = self.before();
         for event in &child.events {
@@ -208,36 +255,7 @@ impl<C: Component> Edit for Cx<'_, C> {
     }
 
     fn propose(&mut self, v: ValueOf<C>) {
-        if self.refuses_edits() {
-            return;
-        }
-        let before = self.before();
-        let (label, doc_key) = (self.core.label_arc(), self.core.resolved.doc_key);
-        let fresh = crate::runtime::edit::next_gesture_id(&self.core.ctx);
-        let slot = self.gesture_slot();
-        // A gesture cancelled under its press stays cancelled until the release.
-        if slot.dead {
-            return;
-        }
-        let started = !slot.is_running();
-        if started {
-            slot.id = fresh;
-            slot.before = Some(before.clone());
-        }
-        slot.proposal = Some(v.clone());
-        let id = slot.id;
-        let report = slot.reported.as_ref() != Some(&v);
-        if report {
-            slot.reported = Some(v.clone());
-        }
-        if started {
-            self.events.push(EditEvent::begin(id, before, label, doc_key));
-        }
-        if report {
-            self.events.push(EditEvent::update(id, v.clone()));
-        }
-        self.shown = Some(Arc::new(v));
-        self.mixed = false;
+        self.take_proposal(v);
     }
 
     fn set(&mut self, v: ValueOf<C>) {
@@ -332,5 +350,46 @@ impl<C: Component> Cx<'_, C> {
             }
             _ => {}
         }
+    }
+}
+
+impl<C: Component> Cx<'_, C> {
+    /// Advances the component's wheel run, one edit gesture through the gesture slot: a notch with `Some(next)`
+    /// proposes it (the first notch begins the run), and a `WheelPhase::End` share, which the runtime hands a value
+    /// control when the wheel gesture ends, commits a running run. A `WheelPhase::Start` share, which the runtime
+    /// hands when a new gesture begins in the pass the last one ended, commits the running run first, so its notch
+    /// begins the next run. A run a host change or a removal cancelled stays cancelled; the end then changes nothing.
+    pub fn wheel_run(&mut self, phase: WheelPhase, next: Option<ValueOf<C>>) {
+        if phase == WheelPhase::Start && self.in_wheel_run() {
+            self.commit();
+        }
+        if let Some(next) = next {
+            let running = self.gesture_slot().is_running();
+            self.propose(next);
+            let slot = self.gesture_slot();
+            // Only a run the wheel began is a wheel run: a notch inside a press-carried gesture joins that gesture.
+            if !running && slot.is_running() {
+                slot.wheel = true;
+            }
+        }
+        if phase == WheelPhase::End && self.in_wheel_run() {
+            self.commit();
+        }
+    }
+
+    /// [`propose`](Edit::propose)s `v` and sets `note` on the running gesture, for readers outside the pass
+    /// ([`gesture_note`](crate::runtime::edit::gesture_note)): what the gesture is doing beyond its value, such as which
+    /// guide a guides drag moves. The note replaces the last one and goes when the gesture ends; a proposal the
+    /// component refuses sets none.
+    pub fn propose_with<N: Send + Sync + 'static>(&mut self, v: ValueOf<C>, note: N) {
+        if self.take_proposal(v) {
+            self.gesture_slot().note = Some(GestureNote::new(note));
+        }
+    }
+
+    /// Whether the running gesture is a wheel run.
+    pub fn in_wheel_run(&self) -> bool {
+        let slot = self.core.memory.recall::<Gesture<ValueOf<C>>>(gesture_key(self.core.id));
+        slot.is_running() && slot.wheel
     }
 }

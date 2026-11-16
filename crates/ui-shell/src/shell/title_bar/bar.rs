@@ -8,7 +8,7 @@ use super::style::TitleBarStyle;
 use super::title::{Title, centre_line};
 use crate::contract::{
     Access, BodyCx, BodyLayout, Common, Component, Container, ContainerProps, Cx, DragBand, EndRegion, Gap, HeaderRegion, NoValue, Outcome, Pad,
-    PaintUi, Role, ShowContainer as _, Sizing, WordSetCx as _,
+    PaintUi, PartsCx, Role, ShowContainer as _, Sizing, WordSetCx as _,
 };
 use crate::layout::{Placed, arrange};
 use crate::primitives::{RectSide, RuleKind};
@@ -19,9 +19,10 @@ use crate::runtime::windows::{self, WindowAction, WindowHost};
 use crate::shell::app_shell::RegionBody;
 use crate::shell::{Caption, CaptionButton, CaptionIcons, Frame, ShellWords, SlotSize};
 use crate::style::{StyleCx, SurfaceKind};
-use craft_behavior::Sense;
+use craft_behavior::{PartKey, Sense};
 use craft_host::target::{DoubleClick, WindowState};
-use egui::{Response, Ui};
+use craft_window::desktop::Desktop;
+use egui::{Rect, Response, Ui};
 
 /// What a title bar reports: the caption clicked and whether the window was asked to close.
 #[derive(Debug)]
@@ -81,9 +82,6 @@ pub struct TitleBar<'a> {
     /// A divider rule along the bar's bottom edge, for a bar whose window draws no edge under it.
     #[prop(flag)]
     separator: bool,
-    /// Glyphs from the desktop's icon theme for the round caption families.
-    #[prop]
-    icons: Option<&'a CaptionIcons>,
     /// The content at the end of the bar, before the caption buttons.
     #[prop(func = "FnMut(&mut Ui, &mut crate::contract::BodyCx<'_>)")]
     trailing: Option<RegionBody<'a>>,
@@ -120,7 +118,6 @@ impl<'a> TitleBar<'a> {
             maximized: None,
             title_when_native: false,
             separator: false,
-            icons: None,
             trailing: None,
             title: None,
             clicked: None,
@@ -167,13 +164,17 @@ impl<'a> TitleBar<'a> {
     /// Close is reported.
     fn show_end(&mut self, ui: &mut Ui, cx: &BodyCx<'_>, end: &End, window: &Window) {
         let height = SlotSize::TitleBar.resolve(&Env::of(ui).tokens);
+        // The running window's captions take the glyphs of the desktop's icon theme; a frame given in place of the
+        // window's (a story, a preview) draws the family's own.
+        let ctx = cx.memory.ctx().clone();
+        let icons = if window.acts && self.frame.is_none() { desktop_icons(&ctx) } else { None };
         let mut buttons: Vec<Placed<'_>> = end
             .captions
             .iter()
             .enumerate()
             .map(|(index, slot)| {
                 let mut button = CaptionButton::new(slot.caption, window.ends.family).maximized(window.maximized);
-                if let Some(icons) = self.icons {
+                if let Some(icons) = &icons {
                     button = button.icons(icons);
                 }
                 if let Some(edge) = slot.end {
@@ -183,7 +184,6 @@ impl<'a> TitleBar<'a> {
             })
             .collect();
         arrange(ui, &Strip::new(end, height), &mut buttons);
-        let ctx = cx.memory.ctx().clone();
         let (host, viewport) = (WindowHost::of(&ctx), pass::current_viewport(&ctx));
         for (slot, placed) in end.captions.iter().zip(&buttons) {
             if !placed.response().is_some_and(Response::clicked) {
@@ -213,7 +213,7 @@ impl Default for TitleBar<'_> {
 
 impl Component for TitleBar<'_> {
     const ROLE: Role = Role::GROUP;
-    const PARTS: bool = false;
+    const PARTS: bool = true;
     const STOPS: bool = false;
     const OVERLAYS: bool = false;
     type Style = TitleBarStyle;
@@ -225,6 +225,13 @@ impl Component for TitleBar<'_> {
 
     fn sense(&self) -> Sense {
         Sense::empty()
+    }
+
+    /// One inert part over the bar's rect. A press anywhere on the bar (its move band, the menu titles, the captions)
+    /// keeps a focused draft (the zoom field) unapplied; sensing nothing, the part leaves presses and hover to the
+    /// members under it.
+    fn parts(&mut self, rect: Rect, cx: &mut PartsCx<'_, Self>) {
+        cx.part(PartKey::new("title_bar"), rect).sense(Sense::empty()).holds_drafts();
     }
 
     fn access(&self, access: &mut Access, cx: &Cx<'_, Self>) {
@@ -274,4 +281,20 @@ impl Container for TitleBar<'_> {
         let window = self.window(cx);
         self.show_end(ui, cx, &window.ends.end, &window);
     }
+}
+
+/// The caption glyphs of the icon theme of the desktop the runtime reports (`WindowHost::desktop`), built with
+/// `CaptionIcons::for_desktop` once per desktop value and kept for the app's bars while the desktop stays the same.
+fn desktop_icons(ctx: &egui::Context) -> Option<CaptionIcons> {
+    let desktop = WindowHost::of(ctx).desktop()?;
+    let key = egui::Id::new("craft_ui.title_bar.desktop_icons");
+    let kept = ctx.data(|data| data.get_temp::<(Desktop, Option<CaptionIcons>)>(key));
+    if let Some((seen, icons)) = &kept
+        && *seen == desktop
+    {
+        return icons.clone();
+    }
+    let icons = CaptionIcons::for_desktop(&desktop, kept.and_then(|(_, icons)| icons));
+    ctx.data_mut(|data| data.insert_temp(key, (desktop, icons.clone())));
+    icons
 }

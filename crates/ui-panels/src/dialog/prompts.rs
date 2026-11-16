@@ -1,7 +1,7 @@
 //! `StandardPrompt` (24.4): the confirmations every app asks the same way, on the dialog host, as configurations of
 //! `Prompt`.
 
-use super::host::{DialogResult, StackDialog};
+use super::host::{DialogResult, FieldRefusal, StackDialog};
 use super::prompt::{Prompt, Reply, buttons};
 use super::stack::{DialogId, DialogStack, dialog_id};
 use super::words::DialogWords;
@@ -144,7 +144,8 @@ impl Outcome for StandardPromptOutput {
 }
 
 /// A standard confirmation on the dialog host: a prompt with the platform's button order, a letter on every answer
-/// and, with `dont_show_again`, a check box under the message. Escape and the close action cancel.
+/// and, with `dont_show_again`, a check box under the message. Escape and the close action cancel, or give the
+/// choice `escape` names.
 ///
 /// The question comes from the `PromptKind` constructor; `title`, `message`, `paragraph` and `button` replace or add
 /// to it. The app's own texts are labels, translated by the scope's catalog before they reach the prompt. The skip
@@ -165,6 +166,8 @@ pub struct StandardPrompt {
     /// `PromptAnswer::tag` or `PromptAnswer::take_tag`.
     #[prop(boxed)]
     tag: Option<Box<dyn Any + Send>>,
+    /// What Escape and the close action answer.
+    escape: PromptChoice,
     /// The counted noun of the delete question, as a count word with `{n}` (one and other forms); the default is
     /// "{n} item" and "{n} items".
     #[prop]
@@ -192,6 +195,11 @@ pub struct StandardPrompt {
 type Content = (Label, Label, Vec<(PromptChoice, Reply)>);
 
 impl StandardPrompt {
+    /// The tag attached with the `tag` builder, when it is a `T`: tells which family's prompt is open.
+    pub fn tag_as<T: Any>(&self) -> Option<&T> {
+        self.tag.as_deref()?.downcast_ref()
+    }
+
     /// A prompt asking `kind`, with no tag and no "Don't show again" box.
     pub fn new(kind: PromptKind) -> Self {
         Self {
@@ -202,6 +210,7 @@ impl StandardPrompt {
             open: true,
             chosen: PromptChoice::Proceed,
             tag: None,
+            escape: PromptChoice::Cancel,
             noun: None,
             title: None,
             message: None,
@@ -229,6 +238,11 @@ impl StandardPrompt {
     /// set. A choice the prompt has no enabled button for gives none.
     pub fn set_choice(&mut self, choice: PromptChoice) {
         self.chosen = choice;
+    }
+
+    /// The choice Escape and the close action answer, when the prompt has a button that takes it; `None` otherwise.
+    pub fn escape_choice(&self) -> Option<PromptChoice> {
+        self.takes(self.escape).then_some(self.escape)
     }
 
     /// The delete confirmation for `count` items; `names` are the first few display names.
@@ -267,7 +281,8 @@ impl StandardPrompt {
 
     /// Adds a button with the app's label; its letter comes from the translated labels of the prompt. The first call
     /// replaces the kind's own buttons. `PromptChoice::Proceed` is the default button (Enter), `PromptChoice::Cancel`
-    /// answers Escape and the close action, and `PromptChoice::Alternate` is a third answer; each is listed once.
+    /// answers Escape and the close action unless `escape` names another choice, and `PromptChoice::Alternate` is a
+    /// third answer; each is listed once.
     #[must_use]
     pub fn button(mut self, choice: PromptChoice, label: impl Into<Label>) -> Self {
         debug_assert!(self.buttons.iter().all(|(listed, _)| *listed != choice), "a prompt answers each choice once");
@@ -301,6 +316,20 @@ impl StandardPrompt {
     pub fn dont_show_again(mut self) -> Self {
         self.skip_box = true;
         self
+    }
+
+    /// Escape and the close action answer `choice` in place of Cancel, for a prompt with no Cancel button ("Switched
+    /// to CPU"). A choice the prompt has no enabled button for leaves the default: Cancel, else the Alternate, else
+    /// the default button.
+    #[must_use]
+    pub fn escape(mut self, choice: PromptChoice) -> Self {
+        self.escape = choice;
+        self
+    }
+
+    /// The framework's damaged-file prompt for the file `name`: Open Anyway or Cancel.
+    pub fn damaged_file(name: impl Into<String>) -> Self {
+        Self::new(PromptKind::DamagedFile { name: name.into() })
     }
 
     /// The question this prompt asks.
@@ -410,7 +439,18 @@ impl StandardPrompt {
         let (title, message, answers) = self.content(&words, &common, env.format());
         let choices: Vec<PromptChoice> = answers.iter().map(|(choice, _)| *choice).collect();
         let replies: Vec<Reply> = answers.into_iter().map(|(_, reply)| reply).collect();
-        let mut prompt = Prompt::new(title, message).answers(buttons(&env, replies));
+        let footer = buttons(&env, replies);
+        // The reply's own role, not `PromptChoice::role`: a kind's Proceed reply can be Destructive, and the prompt
+        // finds the escape answer by its button's role.
+        let escape = self
+            .escape_choice()
+            .and_then(|choice| choices.iter().position(|listed| *listed == choice))
+            .and_then(|at| footer.get(at))
+            .map(|button| button.role());
+        let mut prompt = Prompt::new(title, message).answers(footer);
+        if let Some(role) = escape {
+            prompt = prompt.escape(role);
+        }
         for paragraph in &self.paragraphs {
             prompt = prompt.paragraph(paragraph.clone());
         }
@@ -487,12 +527,14 @@ impl StackDialog for StandardPrompt {
                 let choice = serde_json::from_value(value.clone()).ok().filter(|choice| self.takes(*choice));
                 let Some(choice) = choice else {
                     let taken: Vec<Value> = self.offered().into_iter().filter(|(_, enabled)| *enabled).map(|(choice, _)| json!(choice)).collect();
-                    return Err(format!("`choice` can't take {value}: the prompt answers {}", Value::from(taken)));
+                    return Err(format!("{}: the prompt answers {}", FieldRefusal::Rejects(&value).message(field), Value::from(taken)));
                 };
                 self.set_choice(choice);
             }
-            "skip" if self.skip_box => self.skip = value.as_bool().ok_or("`skip` takes true or false")?,
-            _ => return Err(format!("unknown field `{field}`")),
+            "skip" if self.skip_box => {
+                self.skip = value.as_bool().ok_or_else(|| FieldRefusal::Rejects(&value).message(field))?;
+            }
+            _ => return Err(FieldRefusal::Unknown.message(field)),
         }
         Ok(())
     }

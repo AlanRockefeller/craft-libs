@@ -362,6 +362,14 @@ impl<T> Default for EditEvents<T> {
 }
 
 impl<T> EditEvents<T> {
+    /// The value of the last `Commit` or `Set` in the events; `None` if there is none.
+    pub fn committed(&self) -> Option<&T> {
+        self.0.iter().rev().find_map(|event| match event {
+            EditEvent::Commit { after, .. } | EditEvent::Set { after, .. } => Some(after),
+            _ => None,
+        })
+    }
+
     /// No events.
     pub fn new() -> Self {
         Self::default()
@@ -525,6 +533,41 @@ pub struct Gesture<V> {
     /// The runtime's removal watch holds this gesture's id.
     #[doc(hidden)]
     pub watched: bool,
+    /// The running gesture is a wheel run (`Cx::wheel_run`); cleared when the gesture ends.
+    #[doc(hidden)]
+    pub wheel: bool,
+    /// What the component says its running gesture is doing, beside the value (`Cx::propose_with`); cleared when the
+    /// gesture ends.
+    pub note: Option<GestureNote>,
+}
+
+/// A typed note a component sets on its running gesture for readers outside its pass, such as the guide a guides
+/// drag moves. Notes compare by identity: two notes are equal only when they are the same note.
+#[derive(Clone)]
+pub struct GestureNote(Arc<dyn std::any::Any + Send + Sync>);
+
+impl GestureNote {
+    /// A note holding `note`.
+    pub fn new<N: Send + Sync + 'static>(note: N) -> Self {
+        GestureNote(Arc::new(note))
+    }
+
+    /// The note, when it is an `N`.
+    pub fn get<N: 'static>(&self) -> Option<&N> {
+        self.0.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for GestureNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GestureNote(..)")
+    }
+}
+
+impl PartialEq for GestureNote {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl<V> Default for Gesture<V> {
@@ -539,6 +582,8 @@ impl<V> Default for Gesture<V> {
             dead: false,
             cancel_seen: 0,
             watched: false,
+            wheel: false,
+            note: None,
         }
     }
 }

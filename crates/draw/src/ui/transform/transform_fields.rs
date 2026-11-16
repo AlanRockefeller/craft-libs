@@ -13,6 +13,7 @@ use super::session_bar::TransformBarWords;
 use craft_behavior::geometry::quad::BoxState;
 use craft_behavior::kurbo::Rect;
 use craft_behavior::{EditEvent, EditEvents, GestureId, IconId, Mixed, RulerUnits};
+use craft_ui::buttons::ToggleButton;
 use craft_ui::canvas::RulerText;
 use craft_ui::contract::{
     Bind, BodyCx, Entry, FieldLayout, GlyphLabel, LabelKind, NoValue, Outcome, Props as _, Show as _, ShowContainer as _, SideLabel, Sizing,
@@ -33,6 +34,8 @@ craft_ui::words! {
     pub struct TransformFieldWords {
         x_glyph: "transform.xGlyph" = "X";
         x_name: "transform.xName" = "X position";
+        /// The relative-position toggle between X and Y.
+        relative: "transform.relativePosition" = "Use relative positioning for reference point";
         y_glyph: "transform.yGlyph" = "Y";
         y_name: "transform.yName" = "Y position";
         w_glyph: "transform.wGlyph" = "W";
@@ -49,10 +52,10 @@ craft_ui::words! {
     }
 }
 
-/// The groups of cells the options-bar form shows; [`BarGroups::ALL`] is all of them.
+/// The groups of cells the fields show, in either form; [`TransformGroups::ALL`] is all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct BarGroups {
+pub struct TransformGroups {
     /// The reference point picker.
     pub reference: bool,
     /// X and Y.
@@ -67,12 +70,14 @@ pub struct BarGroups {
     pub interpolation: bool,
 }
 
-impl BarGroups {
+impl TransformGroups {
     /// Every group shown.
     pub const ALL: Self = Self { reference: true, position: true, size: true, angle: true, skew: true, interpolation: true };
+    /// No group shown; a host starts from it and sets fields.
+    pub const NONE: Self = Self { reference: false, position: false, size: false, angle: false, skew: false, interpolation: false };
 }
 
-impl Default for BarGroups {
+impl Default for TransformGroups {
     fn default() -> Self {
         Self::ALL
     }
@@ -155,6 +160,8 @@ pub struct TransformFieldsOutput {
     pub linked: Option<bool>,
     /// The interpolation picked this pass.
     pub interpolation: Option<Interpolation>,
+    /// The relative-position toggle was set to this state.
+    pub relative: Option<bool>,
 }
 
 impl Outcome for TransformFieldsOutput {
@@ -172,10 +179,11 @@ impl Outcome for TransformFieldsOutput {
 ///   [rulers' units](Self::units) and move the box with it; W and H scale it about the reference point, as a
 ///   percentage of the box before the transform or as a length ([`size_unit`](Self::size_unit)); the angle and the two
 ///   skews turn and lean it about the reference point. A flipped box reads as a negative W or H and keeps its sign.
+///   With [`relative`](Self::relative) on, X and Y are the reference point's offset instead of its position.
 ///   Limits: position ±300 000 document units, angle −180° to 180°, skew ±89°, scale as far as the box stays
 ///   within the position limit.
 /// - **Typed text** may carry another unit's spelling ("40px", "2in"); a percentage is read against the box's side
-///   before the transform.
+///   before the transform, in X and Y against the [`document`](Self::document)'s side when it is given.
 /// - **Linked** ([`new`](Self::new)'s binding): W or H also scales the other by the same factor, each kept within its
 ///   limit.
 /// - **One gesture per field gesture.** A scrub or a typing run of a field is one gesture of the row; each value it
@@ -184,9 +192,10 @@ impl Outcome for TransformFieldsOutput {
 /// - **W and H unit.** With [`size_units`](Self::size_units), a secondary click, the Menu key or Shift+F10 on W or H
 ///   opens a menu of the units; a pick is [`TransformFieldsOutput::unit_picked`].
 /// - **Panel form** (the default): the compact reference point with X and Y on one row, W, the link and H on the
-///   next, the angle, then the H and V skews on one row.
+///   next, the angle, then the H and V skews on one row. [`groups`](Self::groups) leaves out the rows of hidden groups.
 /// - **Bar form** ([`bar`](Self::bar)): the compact reference point, then captioned fields in Photoshop's order with a
-///   divider between the groups, the interpolation select last. [`groups`](Self::groups) narrows the strip.
+///   divider between the groups, the Δ toggle between X and Y, the interpolation select last.
+///   [`groups`](Self::groups) narrows the strip.
 #[must_use = "show the fields with `show`"]
 #[derive(craft_ui::contract::Pattern)]
 pub struct TransformFields<'a> {
@@ -198,10 +207,12 @@ pub struct TransformFields<'a> {
     x: RulerText,
     y: RulerText,
     bar: bool,
-    groups: BarGroups,
+    groups: TransformGroups,
     interpolation: Option<Bind<'a, Interpolation>>,
     size_units: Option<&'a [Entry<UnitKind>]>,
     enabled: bool,
+    relative: Option<Bind<'a, bool>>,
+    document: Option<craft_behavior::kurbo::Size>,
 }
 
 impl<'a> TransformFields<'a> {
@@ -217,10 +228,12 @@ impl<'a> TransformFields<'a> {
             x: pixels,
             y: pixels,
             bar: false,
-            groups: BarGroups::ALL,
+            groups: TransformGroups::ALL,
             interpolation: None,
             size_units: None,
             enabled: true,
+            relative: None,
+            document: None,
         }
     }
 
@@ -243,9 +256,21 @@ impl<'a> TransformFields<'a> {
         self
     }
 
-    /// The groups the bar form shows (all by default).
-    pub fn groups(mut self, groups: BarGroups) -> Self {
+    /// The groups shown, in either form (all by default).
+    pub fn groups(mut self, groups: TransformGroups) -> Self {
         self.groups = groups;
+        self
+    }
+
+    /// The Δ toggle between X and Y: X and Y show and move the reference point's offset while it is on.
+    pub fn relative(mut self, on: Bind<'a, bool>) -> Self {
+        self.relative = Some(on);
+        self
+    }
+
+    /// The document's size: X and Y read a typed percentage against its sides.
+    pub fn document(mut self, size: craft_behavior::kurbo::Size) -> Self {
+        self.document = Some(size);
         self
     }
 
@@ -269,7 +294,8 @@ impl<'a> TransformFields<'a> {
 
     /// Shows the fields.
     pub fn show(self, ui: &mut Ui) -> TransformFieldsOutput {
-        let TransformFields { label, row, start, linked, size_unit, x, y, bar, groups, interpolation, size_units, enabled } = self;
+        let TransformFields { label, row, start, linked, size_unit, x, y, bar, groups, interpolation, size_units, enabled, relative, document } =
+            self;
         let env = Env::of(ui);
         let mut cells = Cells {
             words: env.words::<TransformFieldWords>(),
@@ -286,6 +312,8 @@ impl<'a> TransformFields<'a> {
             y,
             groups,
             enabled,
+            relative,
+            document,
             out: Out::default(),
         };
         let response = if bar {
@@ -293,8 +321,8 @@ impl<'a> TransformFields<'a> {
         } else {
             FieldGroup::new(label).enabled(enabled).show(ui, |ui, cx| cells.rows(ui, cx)).output
         };
-        let Out { events, unit_picked, linked, interpolation } = cells.out;
-        TransformFieldsOutput { response, events, unit_picked, linked, interpolation }
+        let Out { events, unit_picked, linked, interpolation, relative } = cells.out;
+        TransformFieldsOutput { response, events, unit_picked, linked, interpolation, relative }
     }
 }
 
@@ -305,6 +333,7 @@ struct Out {
     unit_picked: Option<UnitKind>,
     linked: Option<bool>,
     interpolation: Option<Interpolation>,
+    relative: Option<bool>,
 }
 
 /// The pass's state while the cells are shown.
@@ -321,8 +350,10 @@ struct Cells<'a> {
     size_unit: SizeUnit,
     x: RulerText,
     y: RulerText,
-    groups: BarGroups,
+    groups: TransformGroups,
     enabled: bool,
+    relative: Option<Bind<'a, bool>>,
+    document: Option<craft_behavior::kurbo::Size>,
     out: Out,
 }
 
@@ -341,7 +372,9 @@ impl Cells<'_> {
             _ => start,
         };
         let linked = matches!(self.linked.reborrow().read(cx), Some(Mixed::Same(true)));
-        let conversion = Conversion { rect: self.start, x: self.x, y: self.y, size: self.size_unit.clone(), linked };
+        let relative = self.relative.as_mut().is_some_and(|on| matches!(on.reborrow().read(cx), Some(Mixed::Same(true))));
+        let conversion =
+            Conversion { rect: self.start, x: self.x, y: self.y, size: self.size_unit.clone(), linked, document: self.document, relative };
         Pass { before, conversion, bases: cx.memory::<Bases>().clone() }
     }
 
@@ -438,6 +471,19 @@ impl Cells<'_> {
         }
     }
 
+    /// The Δ toggle between X and Y; shown when the host gave the `relative` binding.
+    fn relative_toggle(&mut self, ui: &mut Ui) {
+        let Some(bind) = self.relative.as_mut() else { return };
+        let toggled = ToggleButton::new(self.words.relative.clone(), bind.reborrowed())
+            .icon(IconId::new("triangle"))
+            .icon_only()
+            .enabled(self.enabled)
+            .show(ui);
+        if let Some(on) = toggled.value().copied() {
+            self.out.relative = Some(on);
+        }
+    }
+
     /// W, the link and H in one row.
     fn size(&mut self, ui: &mut Ui, cx: &mut BodyCx<'_>, pass: &mut Pass) {
         Row::new().show(ui, |ui, _| {
@@ -471,17 +517,30 @@ impl Cells<'_> {
     /// The panel form: the compact reference point with X and Y, W with the link and H, the angle, the two skews.
     fn rows(&mut self, ui: &mut Ui, cx: &mut BodyCx<'_>) {
         let mut pass = self.pass(cx);
-        Row::new().id_salt("position").show(ui, |ui, _| {
-            self.reference(ui, cx, &pass, true);
-            self.field(ui, cx, &mut pass, TransformField::X);
-            self.field(ui, cx, &mut pass, TransformField::Y);
-        });
-        self.size(ui, cx, &mut pass);
-        self.field(ui, cx, &mut pass, TransformField::Angle);
-        Row::new().id_salt("skew").show(ui, |ui, _| {
-            self.field(ui, cx, &mut pass, TransformField::SkewH);
-            self.field(ui, cx, &mut pass, TransformField::SkewV);
-        });
+        let groups = self.groups;
+        if groups.reference || groups.position {
+            Row::new().id_salt("position").show(ui, |ui, _| {
+                if groups.reference {
+                    self.reference(ui, cx, &pass, true);
+                }
+                if groups.position {
+                    self.field(ui, cx, &mut pass, TransformField::X);
+                    self.field(ui, cx, &mut pass, TransformField::Y);
+                }
+            });
+        }
+        if groups.size {
+            self.size(ui, cx, &mut pass);
+        }
+        if groups.angle {
+            self.field(ui, cx, &mut pass, TransformField::Angle);
+        }
+        if groups.skew {
+            Row::new().id_salt("skew").show(ui, |ui, _| {
+                self.field(ui, cx, &mut pass, TransformField::SkewH);
+                self.field(ui, cx, &mut pass, TransformField::SkewV);
+            });
+        }
         *cx.memory::<Bases>() = pass.bases;
     }
 
@@ -502,6 +561,7 @@ impl Cells<'_> {
         }
         if groups.position {
             self.field(ui, cx, &mut pass, TransformField::X);
+            self.relative_toggle(ui);
             self.field(ui, cx, &mut pass, TransformField::Y);
             any.set(true);
         }

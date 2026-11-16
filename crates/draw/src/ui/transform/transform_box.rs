@@ -5,20 +5,20 @@
 #[cfg(feature = "screen-testing")]
 mod stories;
 
-use craft_behavior::geometry::SnapTargets;
-use craft_behavior::geometry::quad::{self, BoxDrag, BoxPart, BoxRules, BoxState, TransformMode};
+use craft_behavior::geometry::SnapLine;
+use craft_behavior::geometry::quad::{self, BoxAllow, BoxDrag, BoxPart, BoxRules, BoxState, ScaleRule, TransformMode};
 use craft_behavior::kurbo::{Point, Rect as DocRect, Vec2 as DocVec};
 use craft_behavior::{
     Axis, CanvasView, Cursor, CursorIcon, CursorPriority, HitLevel, HitPriority, HitShape, Intent, Metrics, NavShape, PaintedCursor, PartKey,
     PartRef, PointerButton, PressPhase, Roving, Sense, resize_cursor,
 };
-use craft_keymap::{Mods, Platform};
-use craft_ui::canvas::{CanvasSpace, canvas_space, readout, snap_tolerance};
+use craft_keymap::Mods;
+use craft_ui::canvas::{CanvasSpace, GestureSnap, Snap, canvas_snap, canvas_space, readout};
 use craft_ui::contract::{
     Access, Bind, BindMut, Common, Component, Cx, Edit as _, EditResponse, Focus as _, MeasureCx, Name, Outcome, PaintUi, PartsCx, Pointer as _,
     Props as _, Remember as _, Role, Styled as _, WordSetCx as _,
 };
-use craft_ui::primitives::{PaintShape, StrokeWidth};
+use craft_ui::primitives::{Handle, PaintShape, StrokeWidth};
 use craft_ui::runtime::env::{Label, UnitKind};
 use craft_ui::runtime::focus::{FocusShape, KeyUse};
 use craft_ui::style::{ComponentStyle, HandleLook, StyleColor, StyleCx};
@@ -30,6 +30,30 @@ pub const BOX: PartKey = PartKey::new("box");
 /// The parts that stand for the outside of the box: `OUTSIDE.at(0)` in [`RotateZone::Outside`], and `OUTSIDE.at(i)`
 /// for the band at corner `i` in [`RotateZone::Band`].
 const OUTSIDE: PartKey = PartKey::new("outside");
+
+/// The pointer-only part of an edge: the whole side, beside the midpoint handle `BOX.at(Edge(k))` that the keyboard
+/// and the focus ring use. One part key carries one shape, so the side cannot reuse the handle's key.
+const EDGE: PartKey = PartKey::new("edge");
+
+/// The pointer-only move part at the centre of a box whose reference point is hidden.
+const CENTRE: PartKey = PartKey::new("centre");
+
+/// The pointer-only strip along side `k`, outside the frame, within the move reach.
+const MOVE_RING: PartKey = PartKey::new("moveRing");
+
+/// The rank of a side among the handles: below corners, midpoints, the reference point and the centre, so a corner
+/// wins where a corner and a side both reach, and the nearest of the others wins among themselves.
+const EDGE_SUB: u8 = 0;
+const HANDLE_SUB: u8 = 1;
+/// The rank of the move strips among the body-level parts: above the rotate bands and the inside, below every handle.
+const RING_SUB: u8 = 1;
+
+/// The keyboard paths of the pointer-only parts: the midpoint handle, and the arrow keys.
+const EDGE_BY_KEY: &str = "the edge's midpoint handle";
+const MOVE_BY_KEY: &str = "the arrow keys";
+
+/// The side of the enlarged corner handle of an overflowing text frame, in standard handle sides.
+const OVERFLOW_IN_HANDLES: f32 = 1.5;
 
 /// The keyboard path of a rotation by the outside parts: the options bar's angle field, which the host shows beside the box.
 const ROTATE_BY_KEY: &str = "the angle field in the options bar";
@@ -115,13 +139,29 @@ pub struct TransformBoxStyle {
     pivot_arm: f32,
 }
 
-/// What the box reports beyond its edit.
-#[derive(Clone, Copy, Debug, Default)]
+/// Why the box asks to apply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ApplyBy {
+    /// Enter.
+    Key,
+    /// A double click inside the box.
+    DoubleClick,
+    /// A click outside the box, at `at` in document units.
+    ClickOutside {
+        /// Where the click landed.
+        at: Point,
+    },
+}
+
+/// What the box reports beyond its edit, from this pass's input only.
+#[derive(Clone, Debug, Default)]
 struct Report {
-    apply: bool,
+    apply: Option<ApplyBy>,
     discard: bool,
     hovered: Option<BoxPart>,
     picked: Option<BoxPart>,
+    snapped: Vec<SnapLine>,
 }
 
 /// The press the box is dragging a part with, kept from the press to its release.
@@ -152,15 +192,20 @@ impl Default for Grip {
 /// - The value is the box in document units. A drag is one gesture (`Begin` on the first move, `Commit` on the
 ///   release); Escape cancels it. The host applies the box on [`TransformBoxOutput::apply`] (Enter, a click outside,
 ///   a double click inside) and closes it on [`discard`](TransformBoxOutput::discard).
-/// - The pointer takes the nearest handle or the reference point, else the inside or the outside. Parts the
-///   [rules](Self::rules) refuse take no press, except the outside in [`RotateZone::Outside`], where a click applies.
-///   An Alt press away from the handles moves the reference point there and drags it.
+/// - The pointer takes the nearest handle or the reference point, else a side (the whole side along its length, a
+///   corner winning where both reach), the inside or the outside. Parts the [rules](Self::rules) refuse take no
+///   press, except the outside in [`RotateZone::Outside`], where a click applies. An Alt press away from the handles
+///   moves the reference point there and drags it, whether it shows or not.
+/// - Snapping is the canvas's ([`canvas_snap`]): a dragged point snaps through [`Snap::point`], and the lines it
+///   snapped to are [`TransformBoxOutput::snapped`] for the host's one drawing site. Without a canvas snap nothing
+///   snaps. A pass reports the lines of its own drag events only.
 /// - The box is one Tab stop with one part group, whose arrival is the picked part. Page Down and Page Up pick the
 ///   next and previous part (the whole box, the corners and edges clockwise from the top left, the reference
 ///   point), Home and End the first and last. The arrows move the picked part as a plain drag of it would, one
 ///   document unit, Shift ten.
 /// - The box holds the canvas's session (`KeyUse::session`): with the canvas focused or nothing focused, Enter, Escape
-///   and the arrows reach it before the canvas's tool, and the arrows move the whole box.
+///   and the arrows reach it before the canvas's tool, and the arrows move the whole box. With
+///   [`session_arrows`](Self::session_arrows) off the arrows stay the tool's (the Move tool nudges the layer).
 /// - Nothing mirrors in a right-to-left interface: the box is the document's.
 #[derive(craft_ui::contract::Component, craft_ui::contract::Props)]
 #[component(canvas_control)]
@@ -173,8 +218,9 @@ pub struct TransformBox<'a> {
     /// The mode, scaling rule, aspect link, what the content allows and the rotate step.
     #[prop]
     rules: BoxRules,
-    /// Whether the reference point shows. Hidden, it is not drawn, hit or picked, and an Alt press away from the
-    /// handles does nothing; its stored position still pivots Alt scaling and rotating.
+    /// Whether the reference point shows. Hidden, it is not hit or picked and is drawn only while it is dragged; an
+    /// Alt press away from the handles still moves it, and its stored position pivots Alt scaling and rotating. A
+    /// hidden point leaves the middle of the box to a move part, so a small box stays movable.
     #[prop]
     reference_point: bool,
     /// Where a press outside rotates.
@@ -190,9 +236,17 @@ pub struct TransformBox<'a> {
     /// The modifiers every test of this box reads in place of the pointer's: a touch host's sticky modifiers.
     #[prop]
     mods: Option<Mods>,
-    /// The host's snapping of a dragged point.
+    /// Enlarges corner 2 with the overflow plus (a text frame whose text does not fit).
     #[prop]
-    snap: Option<&'a SnapTargets>,
+    overflow: bool,
+    /// Whether the arrows the box takes from the canvas's session, while none of its parts has focus, move the whole
+    /// box (the default). Off leaves them to the canvas's tool; a focused part still moves by the arrows.
+    #[prop]
+    session_arrows: bool,
+    /// How far outside the frame, in screen points, a plain press moves the box (0: off); set by `TransformOverlay`.
+    move_reach: f32,
+    /// Whether this pass holds a drag of the reference point, so the hidden point is drawn while it moves.
+    pivot_held: bool,
     report: Report,
 }
 
@@ -211,18 +265,53 @@ impl<'a> TransformBox<'a> {
             inside_moves: true,
             pixel_grid: false,
             mods: None,
-            snap: None,
+            overflow: false,
+            session_arrows: true,
+            move_reach: 0.0,
+            pivot_held: false,
             report: Report::default(),
         }
         .label(label)
     }
 
-    /// The parts the keyboard walks, in order.
+    /// A resize-only box for a text frame: free scaling with the aspect unlinked, sides of at least 4 units, no
+    /// rotating, skewing or distorting, no warp, no reference point and no inside move. The rotate band is declared
+    /// without rotation, so a press outside the frame reaches the tool and the text editor's background commit.
+    pub fn text_frame(label: impl Into<Label>, state: Bind<'a, BoxState>, start: DocRect) -> Self {
+        let rules = BoxRules::default()
+            .with_scale(ScaleRule::Free)
+            .with_aspect_linked(false)
+            .with_allow(BoxAllow::new(false, false, false).with_warp(false))
+            .with_min_side(4.0);
+        Self::new(label, state, start, 0.0).rules(rules).reference_point(false).inside_moves(false).rotate_zone(RotateZone::Band)
+    }
+
+    /// A plain press within `points` screen points outside the frame moves the box (0: off). Crate-private: the
+    /// public entry is `TransformOverlay::move_reach`.
+    #[must_use]
+    pub(crate) fn move_reach(mut self, points: f32) -> Self {
+        self.move_reach = points;
+        self
+    }
+
+    /// Whether the middle of the box is a move part: the reference point is hidden, so it does not take that place.
+    fn declares_centre(&self) -> bool {
+        !self.reference_point && self.inside_moves && self.rules.allows(BoxPart::Inside)
+    }
+
+    /// Whether the strips outside the frame are move parts.
+    fn declares_ring(&self) -> bool {
+        self.move_reach > 0.0 && self.rules.allows(BoxPart::Inside)
+    }
+
+    /// The parts the keyboard walks, in order. A box whose inside does not move has no inside part, so a press or drag
+    /// over its body reaches what lies beneath (a type editor under a paragraph frame).
     fn keyboard_parts(&self) -> Vec<BoxPart> {
         let corners = (0..4u8).map(BoxPart::Corner);
         let edges = (0..4u8).map(BoxPart::Edge);
         let pivot = self.reference_point.then_some(BoxPart::Pivot);
-        [BoxPart::Inside].into_iter().chain(corners).chain(edges).chain(pivot).filter(|&part| self.rules.allows(part)).collect()
+        let inside = self.inside_moves.then_some(BoxPart::Inside);
+        inside.into_iter().chain(corners).chain(edges).chain(pivot).filter(|&part| self.rules.allows(part)).collect()
     }
 
     /// The box after an arrow key moves `part` by `by`: as a plain drag of the part would.
@@ -236,17 +325,31 @@ impl<'a> TransformBox<'a> {
         quad::drag(state, state, part, at, at + by, Mods::NONE, &self.rules)
     }
 
-    /// The box the pointer at screen position `pos` gives a drag, snapped and rounded. The Control key suspends the
-    /// snapping unless it changes what the drag does (off macOS Ctrl is ⌘: a corner distorts, an edge skews).
-    fn proposal(&self, space: &CanvasSpace, grip: &Grip, pos: Pos2, mods: Mods, os: Platform) -> BoxState {
+    /// The box the pointer at screen position `pos` gives a drag, snapped through the canvas's `snap` and rounded, with
+    /// the lines it snapped to. A corner, an edge or the reference point snaps the grabbed point, not the pointer: a
+    /// press a few pixels off the handle still lands the handle on the line. The Control key suspends the snapping
+    /// unless it changes what the drag does (off macOS Ctrl is ⌘: a corner distorts, an edge skews).
+    fn proposal(&self, space: &CanvasSpace, snap: Option<&Snap>, grip: &Grip, pos: Pos2, mods: Mods) -> (BoxState, Vec<SnapLine>) {
         let to = space.view.to_doc(pos);
         let reads_control = self.rules.drag_kind(grip.part, mods) != self.rules.drag_kind(grip.part, Mods { cmd: false, ..mods });
-        let to = match (self.snap, snap_tolerance(&space.view, mods, os, reads_control)) {
-            (Some(targets), Some(tolerance)) => targets.snap_point(to, tolerance).0,
-            _ => to,
+        let quad = &grip.start.quad;
+        let grabbed = match grip.part {
+            BoxPart::Corner(i) => Some(quad[usize::from(i % 4)]),
+            BoxPart::Edge(i) => Some(quad[usize::from(i % 4)].midpoint(quad[usize::from(i + 1) % 4])),
+            BoxPart::Pivot => Some(grip.start.pivot),
+            _ => None,
+        };
+        let (to, lines) = match (snap, grabbed) {
+            (Some(snap), Some(grabbed)) => {
+                let off = grip.from - grabbed;
+                let (at, lines) = snap.point(to - off, mods, GestureSnap { reads_control, ..GestureSnap::default() });
+                (at + off, lines)
+            }
+            (Some(snap), None) => snap.point(to, mods, GestureSnap { reads_control, ..GestureSnap::default() }),
+            (None, _) => (to, Vec::new()),
         };
         let dragged = quad::drag(&grip.start, &grip.last, grip.part, grip.from, to, mods, &self.rules);
-        if self.pixel_grid { on_pixel_grid(dragged) } else { dragged }
+        (if self.pixel_grid { on_pixel_grid(dragged) } else { dragged }, lines)
     }
 
     /// The pointer for `part` at `pointer`, `dragging` during its drag.
@@ -303,15 +406,38 @@ impl<'a> TransformBox<'a> {
             BoxPart::Corner(_) | BoxPart::Edge(_) if now.is_parallelogram() => {
                 let parts = now.parts(self.start, self.skew_v);
                 let percent = |v: f64| units.text(UnitKind::Percent, fixed(v * 100.0, 1), 1..=1);
-                vec![row(&words.readout_width, percent(parts.w)), row(&words.readout_height, percent(parts.h))]
+                // Size in the rulers' unit, as the move rows are; a percent ruler keeps the share of the start box.
+                let rulers = space.rulers();
+                let (across_w, _) = rulers.across(Axis::Y);
+                let (across_h, _) = rulers.across(Axis::X);
+                let width = if across_w.kind == UnitKind::Percent {
+                    percent(parts.w)
+                } else {
+                    across_w.format_value(&units, fixed(parts.w * self.start.width(), 4), 0.0)
+                };
+                let height = if across_h.kind == UnitKind::Percent {
+                    percent(parts.h)
+                } else {
+                    across_h.format_value(&units, fixed(parts.h * self.start.height(), 4), 0.0)
+                };
+                vec![row(&words.readout_width, width), row(&words.readout_height, height)]
             }
             _ => Vec::new(),
         }
     }
 
-    /// The parts that take a press, with the box part each stands for.
+    /// The parts that take a press, with the box part each stands for. Mirrors what [`parts`](Component::parts)
+    /// declares: the keyboard parts, a segment per allowed edge, the centre and the move strips where declared, and the
+    /// outside.
     fn pointer_parts(&self) -> Vec<(PartRef, BoxPart)> {
         let mut parts: Vec<_> = self.keyboard_parts().into_iter().map(|part| (BOX.at(part.index()), part)).collect();
+        parts.extend((0..4u8).filter(|&k| self.rules.allows(BoxPart::Edge(k))).map(|k| (EDGE.at(u64::from(k)), BoxPart::Edge(k))));
+        if self.declares_centre() {
+            parts.push((CENTRE.at(0), BoxPart::Inside));
+        }
+        if self.declares_ring() {
+            parts.extend((0..4).map(|side| (MOVE_RING.at(side), BoxPart::Inside)));
+        }
         parts.extend((0..4).map(|corner| (OUTSIDE.at(corner), BoxPart::Outside)));
         parts
     }
@@ -321,6 +447,7 @@ impl<'a> TransformBox<'a> {
         let screen = on_screen(&space.view, shown);
         let style = cx.style;
         let mut held: Option<Grip> = *cx.press_slot::<Grip>();
+        let snap = canvas_snap(&cx.env);
         for (reference, part) in self.pointer_parts() {
             let Some(result) = cx.part_if_declared(reference) else { continue };
             let (press, hover) = (result.press, result.hover_pos.filter(|_| result.hovered));
@@ -335,7 +462,7 @@ impl<'a> TransformBox<'a> {
             match press.phase {
                 PressPhase::Down { start, .. } if start.button == PointerButton::Primary => {
                     let from = space.view.to_doc(start.origin);
-                    let moves_pivot = mods.alt && self.reference_point && matches!(part, BoxPart::Inside | BoxPart::Outside);
+                    let moves_pivot = mods.alt && matches!(part, BoxPart::Inside | BoxPart::Outside);
                     let (part, begin) = if moves_pivot { (BoxPart::Pivot, BoxState::new(shown.quad, from)) } else { (part, *shown) };
                     held = Some(Grip { part, start: begin, from, began: false, moves_pivot, last: *shown });
                 }
@@ -351,7 +478,8 @@ impl<'a> TransformBox<'a> {
                     if !grip.began {
                         continue;
                     }
-                    let next = self.proposal(space, &grip, pos, mods, cx.env.shell().os);
+                    let (next, lines) = self.proposal(space, snap.as_ref(), &grip, pos, mods);
+                    self.report.snapped = lines;
                     grip.last = next;
                     held = Some(grip);
                     cx.propose(next);
@@ -363,13 +491,13 @@ impl<'a> TransformBox<'a> {
                 PressPhase::Release { start, click, .. } => {
                     // A double click inside applies, whether or not the first press of the release was seen.
                     if click && start.clicks >= 2 && start.button == PointerButton::Primary && part == BoxPart::Inside {
-                        self.report.apply = true;
+                        self.report.apply = Some(ApplyBy::DoubleClick);
                     }
                     let Some(grip) = held.take() else { continue };
                     if grip.began {
                         cx.commit();
                     } else if grip.part == BoxPart::Outside && click && start.clicks <= 1 {
-                        self.report.apply = true;
+                        self.report.apply = Some(ApplyBy::ClickOutside { at: space.view.to_doc(start.origin) });
                     } else if grip.moves_pivot && click {
                         cx.set(grip.start);
                     }
@@ -382,11 +510,12 @@ impl<'a> TransformBox<'a> {
     }
 
     /// The session keys: the arrows nudge the picked part (the whole box when no part has focus), Enter applies and
-    /// Escape closes the box.
+    /// Escape closes the box. Untaken, a session's arrows go back to the canvas's tool.
     fn run_keys(&mut self, cx: &mut Cx<'_, Self>, space: &CanvasSpace, shown: &BoxState, pressing: bool) {
         let picked = cx.active_part().filter(|part| part.key == BOX).and_then(|part| part.index).and_then(BoxPart::from_index);
         self.report.picked = picked;
-        if let Some((direction, mods)) = cx.intents().take_nudge() {
+        let takes_arrows = self.session_arrows || cx.is_focused();
+        if takes_arrows && let Some((direction, mods)) = cx.intents().take_nudge() {
             let step = if mods.shift { NUDGE_FAR } else { NUDGE };
             let doc = space.view.unmap_vec(direction);
             let length = doc.hypot();
@@ -399,7 +528,9 @@ impl<'a> TransformBox<'a> {
                 }
             }
         }
-        self.report.apply |= cx.intents().take(Intent::Submit);
+        if cx.intents().take(Intent::Submit) {
+            self.report.apply = Some(ApplyBy::Key);
+        }
         if !pressing && cx.intents().take(Intent::Cancel) {
             self.report.discard = true;
         }
@@ -445,9 +576,21 @@ impl Component for TransformBox<'_> {
         Some(self.state.reborrow())
     }
 
-    /// The whole box, the corners, the edges and the reference point the rules allow, in keyboard order, then the
-    /// outside. A handle and the reference point rank alike, so the nearest wins where they overlap on a small box; they
-    /// rank above the inside, which ranks above the outside.
+    /// A host keeps the box in f32 (a layer's transform, a text layer's box) and gives a proposal back rounded to
+    /// it: each corner and the pivot within f32 precision of the proposal is the proposal, not a change of the
+    /// document under the drag.
+    fn same_value(&self, proposed: &BoxState, host: &BoxState) -> bool {
+        let near = |a: Point, b: Point| {
+            let tolerance = |u: f64, v: f64| 4.0 * f64::from(f32::EPSILON) * u.abs().max(v.abs()).max(1.0);
+            (a.x - b.x).abs() <= tolerance(a.x, b.x) && (a.y - b.y).abs() <= tolerance(a.y, b.y)
+        };
+        proposed.quad.iter().zip(&host.quad).all(|(a, b)| near(*a, *b)) && near(proposed.pivot, host.pivot)
+    }
+
+    /// The whole box, the corners, the edges and the reference point the rules allow, in keyboard order, then each
+    /// side as a pointer-only segment, the centre and the move strips where declared, and the outside. A handle, the
+    /// reference point and the centre rank alike, so the nearest wins where they overlap on a small box; they rank above
+    /// a side, which ranks above the inside, which ranks above the outside.
     fn parts(&mut self, rect: Rect, cx: &mut PartsCx<'_, Self>) {
         let (Some(space), Some(state)) = (canvas_space(&cx.env), cx.value().copied()) else { return };
         let style = cx.style;
@@ -457,22 +600,51 @@ impl Component for TransformBox<'_> {
         for part in self.keyboard_parts() {
             let (shape, sense, priority, focus) = match part {
                 BoxPart::Inside => {
-                    let sense = if self.inside_moves { Sense::DRAG | Sense::CLICK | Sense::TAKE_FOCUS } else { Sense::TAKE_FOCUS };
+                    let sense = Sense::DRAG | Sense::CLICK | Sense::TAKE_FOCUS;
                     (HitShape::Polygon(quad.to_vec()), sense, HitPriority::new(HitLevel::Body, 0), FocusShape::Rect)
                 }
                 BoxPart::Pivot => (
                     HitShape::circle(pos(screen.pivot), style.hit),
                     Sense::DRAG | Sense::TAKE_FOCUS,
-                    HitPriority::new(HitLevel::Handle, 0),
+                    HitPriority::new(HitLevel::Handle, HANDLE_SUB),
                     FocusShape::Circle,
                 ),
                 handle => {
                     let at = handle_point(&screen, handle).map_or(Pos2::ZERO, pos);
-                    (HitShape::circle(at, style.hit), Sense::DRAG | Sense::TAKE_FOCUS, HitPriority::new(HitLevel::Handle, 0), FocusShape::Circle)
+                    (
+                        HitShape::circle(at, style.hit),
+                        Sense::DRAG | Sense::TAKE_FOCUS,
+                        HitPriority::new(HitLevel::Handle, HANDLE_SUB),
+                        FocusShape::Circle,
+                    )
                 }
             };
             cx.part(BOX.at(part.index()), shape).sense(sense).priority(priority).focus_shape(focus).focusable();
             any = true;
+        }
+        for k in (0..4u8).filter(|&k| self.rules.allows(BoxPart::Edge(k))) {
+            let side = usize::from(k);
+            cx.part(EDGE.at(u64::from(k)), HitShape::segment(quad[side], quad[(side + 1) % 4]))
+                .sense(Sense::DRAG)
+                .priority(HitPriority::new(HitLevel::Handle, EDGE_SUB))
+                .pointer_only(EDGE_BY_KEY);
+        }
+        if self.declares_centre() {
+            let centre = quad.iter().fold(Vec2::ZERO, |sum, corner| sum + corner.to_vec2()) / 4.0;
+            cx.part(CENTRE.at(0), HitShape::circle(centre.to_pos2(), style.hit))
+                .sense(Sense::DRAG | Sense::CLICK)
+                .priority(HitPriority::new(HitLevel::Handle, HANDLE_SUB))
+                .pointer_only(MOVE_BY_KEY);
+        }
+        if self.declares_ring() {
+            let outer = quad::outset(&quad, self.move_reach);
+            for side in 0..4usize {
+                let next = (side + 1) % 4;
+                cx.part(MOVE_RING.at(side as u64), HitShape::Polygon(vec![quad[side], quad[next], outer[next], outer[side]]))
+                    .sense(Sense::DRAG | Sense::CLICK)
+                    .priority(HitPriority::new(HitLevel::Body, RING_SUB))
+                    .pointer_only(MOVE_BY_KEY);
+            }
         }
         if any {
             cx.roving(Roving::new(NavShape::Flat).page(Some(1)));
@@ -500,6 +672,7 @@ impl Component for TransformBox<'_> {
         let (Some(space), Some(shown)) = (canvas_space(&cx.env), cx.value().copied()) else { return };
         let held = cx.press_slot::<Grip>().is_some();
         self.run_pointer(cx, &space, &shown);
+        self.pivot_held = cx.press_slot::<Grip>().is_some_and(|grip| grip.part == BoxPart::Pivot);
         let pressing = held || cx.press_slot::<Grip>().is_some();
         self.run_keys(cx, &space, &shown, pressing);
     }
@@ -516,13 +689,18 @@ impl Component for TransformBox<'_> {
         for i in 0..4u8 {
             for part in [BoxPart::Corner(i), BoxPart::Edge(i)] {
                 let Some(at) = handle_point(&screen, part) else { continue };
-                let square = PaintShape::Rect(Rect::from_center_size(pos(at), Vec2::splat(look.side)), CornerRadius::ZERO);
+                let enlarged = self.overflow && part == BoxPart::Corner(2);
+                let side = if enlarged { look.side * OVERFLOW_IN_HANDLES } else { look.side };
+                let square = PaintShape::Rect(Rect::from_center_size(pos(at), Vec2::splat(side)), CornerRadius::ZERO);
                 let fill = if self.rules.allows(part) { cx.resolve_part(BOX.at(part.index()), &look.fill) } else { cx.resolve(&look.fill) };
                 draw.fill(&square, fill);
                 draw.stroke(&square, StrokeWidth::Thin, look.stroke);
+                if enlarged {
+                    Handle::plus(&draw, look, pos(at), side);
+                }
             }
         }
-        if self.reference_point {
+        if self.reference_point || self.pivot_held {
             let centre = pos(screen.pivot);
             let (radius, arm) = (style.pivot_radius, style.pivot_arm);
             for (width, color) in [(StrokeWidth::Thick, style.halo), (StrokeWidth::Medium, style.line)] {
@@ -551,8 +729,8 @@ impl Component for TransformBox<'_> {
     }
 
     fn finish(self, cx: Cx<'_, Self>) -> TransformBoxOutput {
-        let Report { apply, discard, hovered, picked } = self.report;
-        TransformBoxOutput { edit: cx.edit_response(), apply, discard, picked, hovered }
+        let Report { apply, discard, hovered, picked, snapped } = self.report;
+        TransformBoxOutput { edit: cx.edit_response(), apply, discard, picked, hovered, snapped }
     }
 }
 
@@ -563,14 +741,16 @@ pub struct TransformBoxOutput {
     /// A drag (`Begin` on the first move, `Update`, `Commit` on the release; Escape cancels it) or an arrow key's
     /// `Set`.
     pub edit: EditResponse<BoxState>,
-    /// Apply the box: Enter, a click outside it, a double click inside it.
-    pub apply: bool,
+    /// Apply the box, and why: Enter, a click outside it, a double click inside it.
+    pub apply: Option<ApplyBy>,
     /// Close the box without applying it: Escape while no drag is on.
     pub discard: bool,
     /// The part the keys act on, while the box has the keyboard.
     pub picked: Option<BoxPart>,
     /// The part a press at the pointer would take; `None` where it is the tool's.
     pub hovered: Option<BoxPart>,
+    /// The snap lines of the point being dragged, for the host's one drawing site.
+    pub snapped: Vec<craft_behavior::geometry::SnapLine>,
 }
 
 impl Outcome for TransformBoxOutput {

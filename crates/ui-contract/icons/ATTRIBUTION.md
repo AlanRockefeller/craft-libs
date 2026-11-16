@@ -11,7 +11,7 @@ Each folder holds only the files `icons.toml` lists, unchanged from the pinned s
 
 Carbon's licence file is the repository's root `LICENSE` (the icons package has none of its own).
 
-The corresponding npm packages are `@phosphor-icons/core` 2.0.8, `lucide-static` 1.63.0, `@carbon/icons` 11.91.0 and `@tabler/icons` 3.50.0. These are the same releases as the tags above. Phosphor files are `regular` weight, except `star-filled.svg`, which is Phosphor's `fill` weight (`star-fill.svg`), and `panel-right.svg`, which is Phosphor's `sidebar-simple` mirrored.
+The corresponding npm packages are `@phosphor-icons/core` 2.0.8, `lucide-static` 1.63.0, `@carbon/icons` 11.91.0 and `@tabler/icons` 3.50.0. These are the same releases as the tags above. Phosphor files are `regular` weight, except `star-filled.svg` and `circle-filled.svg`, which are Phosphor's `fill` weight (`star-fill.svg`, `circle-fill.svg`). `panel-left.svg` is Phosphor's `sidebar-simple` unchanged, and `panel-right.svg` is the same glyph mirrored.
 
 Files may come from either the npm package or the matching git tag. Their SVG metadata can differ, including class attributes and header comments.
 
@@ -28,5 +28,6 @@ The added transform and layout files use the npm copies without modification, in
 - `key-linear`, `key-linear-filled`, `key-hold`, `key-bezier`, `key-auto-bezier`, `key-continuous-bezier`, `key-ease-in`, `key-ease-out`, `keyframe-easy-ease` (the timeline's single keyframe marks and the graph editor's Easy Ease button, after FilmCraft's diamond, square and circle and After Effects' keys; solid shapes except the outline diamond and the rings)
 - `font-variable`, `scaling`, `slice-select`, `square-dashed-mouse-pointer`, `text-warp`, `triangle-right`, `type-mask`, `type-mask-vertical`
 - `flip-horizontal`, `flip-vertical`, `shear-horizontal`, `padding-top`, `padding-right`, `padding-bottom`, `padding-left`, `gap-horizontal`, `gap-vertical` (the transform and layout panels' glyphs, drawn after the marks those panels make: a dashed axis between two triangles for a flip, a slanted rectangle for the skew along x, a frame with the space drawn solid on one side for a padding, and two items with a double arrow in the space between them for a gap)
+- `crop-overlay-*` (the crop overlay menu's glyphs), `text-align-top`, `text-align-middle`, `text-align-bottom` (the vertical type options), `dash-align-exact`, `dash-align-corners` (the dash alignment options)
 
 Where a pinned set already draws one of these meanings, that set uses its own file rather than the base set's: Lucide's `flip-horizontal`, `flip-vertical`, `gap-horizontal` and `gap-vertical`, Tabler's `flip-horizontal`, `flip-vertical`, `skew-x`, `spacing-horizontal` and `spacing-vertical`, and Phosphor's own `arrows-out-line-horizontal` and `arrows-out-line-vertical` for the axes of scale. A set without one falls back to the base set's drawing, as it does for every other icon.

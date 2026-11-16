@@ -10,9 +10,7 @@ use egui::{Response, Ui};
 #[cfg(feature = "screen-testing")]
 mod stories;
 
-use super::ramp::GradientRamp;
-use super::stops::{Sampler, default_sampler};
-use super::value::{GradientStops, StopRows};
+use craft_color::ui::gradient::{GradientRamp, GradientStops, Sampler, StopRows, default_sampler};
 
 /// A named group of gradient presets.
 #[derive(Clone, Debug, PartialEq)]
@@ -76,7 +74,8 @@ impl GradientRef {
 ///
 /// ```
 /// use craft_theme::Srgba;
-/// use craft_draw::ui::{ColorStop, GradientGroup, GradientItem, GradientPalette, GradientRef, GradientStops};
+/// use craft_color::ui::gradient::{ColorStop, GradientStops};
+/// use craft_draw::ui::{GradientGroup, GradientItem, GradientPalette, GradientRef};
 /// use craft_ui::contract::{Bind, Show as _};
 /// use craft_ui::patterns::presets::PresetState;
 /// # egui::__run_test_ui(|ui| {

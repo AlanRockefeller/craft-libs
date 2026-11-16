@@ -125,6 +125,11 @@ impl ShapeDragTool {
         self.options.kind
     }
 
+    /// The shape of the last `Update` while a drag has begun; `None` otherwise.
+    pub fn shape(&self) -> Option<&ShapeGeometry> {
+        self.drag.as_ref().filter(|drag| drag.began).and_then(|drag| drag.shape.as_ref())
+    }
+
     /// The events since the last call, in order.
     pub fn take_events(&mut self) -> Vec<ShapeDragEvent> {
         std::mem::take(&mut self.events)
@@ -141,7 +146,7 @@ impl ShapeDragTool {
     /// Star with the options' sides and ratio, Custom a `Custom` box keeping proportions with ⇧),
     /// [`line_drag`] for a Line (weight at least 1, ⇧ turning the end to 45° steps), and
     /// [`RadialFrame::drag`] in the radial frame.
-    fn shape(&self, drag: &Drag, mods: Mods) -> Option<ShapeGeometry> {
+    fn shape_of(&self, drag: &Drag, mods: Mods) -> Option<ShapeGeometry> {
         // pc: crates/ui-egui/src/tools/vector_ui/shapes.rs:50-82 `shape_geometry`.
         // inv-vectorcraft: crates/tools/src/shape.rs:131-145 (the radial kinds).
         let o = &drag.options;
@@ -216,7 +221,7 @@ impl ShapeDragTool {
                 _ => RadialFrame::drag(drag.start, at, mods.shift).map(|f| f.radius * drag.options.star_ratio),
             };
         }
-        let shape = self.shape(&drag, mods);
+        let shape = self.shape_of(&drag, mods);
         if let Some(shape) = &shape {
             if drag.shape.as_ref() != Some(shape) {
                 self.events.push(ShapeDragEvent::Draw(EditEvent::update(drag.id, shape.clone())));

@@ -183,10 +183,11 @@ impl<T: Settings> SettingsStore<T> {
         match store.files.read(&path) {
             Ok(Some(text)) => store.load_text(&path, &text, &mut report),
             Ok(None) => {
-                if let Some((value, from)) = migrate::import_legacy(&options.legacy) {
+                if let Some((value, errors, from)) = migrate::import_legacy(&options.legacy) {
                     store.value = value;
                     store.dirty = true;
                     report.source = Source::Legacy(from);
+                    report.section_errors = errors;
                 }
             }
             Err(e) => store.set_read_only(&mut report, ReadOnlyReason::Unreadable(e)),
@@ -366,7 +367,11 @@ impl<T: Settings> SettingsStore<T> {
                 return;
             }
         }
-        let (value, errors) = document::deserialize_sections::<T>(&doc);
+        // A value the file holds that the type cannot read is taken out, and the file is saved again with its default.
+        let (value, errors) = document::repair_sections::<T>(&mut doc);
+        if !errors.is_empty() {
+            self.dirty = true;
+        }
         self.value = value;
         self.doc = doc;
         self.base = base;

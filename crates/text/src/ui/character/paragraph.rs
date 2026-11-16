@@ -5,13 +5,13 @@ use std::ops::RangeInclusive;
 use crate::ui::length::DocUnit;
 use craft_behavior::EditEvent;
 use craft_ui::choice::Checkbox;
-use craft_ui::contract::{Bind, GlyphLabel, NoValue, Outcome, Props as _, Show as _, ShowContainer as _};
+use craft_ui::contract::{Bind, FieldLayout, GlyphLabel, NoValue, Outcome, Props as _, Show as _, ShowContainer as _};
 use craft_ui::layout_components::{Grid, Stack};
 use craft_ui::runtime::env::{Env, Label};
 use egui::{Response, Ui};
 
 use super::TWO_COLUMNS;
-use super::rows::{LengthRow, Lengths, Toggle, mixed, number_change, toggle_row};
+use super::rows::{LengthRow, Lengths, Toggle, agree, mark, mixed, number_change, toggle_row};
 
 craft_ui::words! {
     /// The Paragraph controls' words, English by default (PhotoCraft's tooltips).
@@ -37,13 +37,16 @@ craft_ui::words! {
         space_before: "paragraph.spaceBefore" = "Add space before paragraph";
         space_after: "paragraph.spaceAfter" = "Add space after paragraph";
         hyphenate: "paragraph.hyphenate" = "Hyphenate";
+        top: "paragraph.top" = "Align text to the top";
+        middle: "paragraph.middle" = "Center text vertically";
+        bottom: "paragraph.bottom" = "Align text to the bottom";
     }
 }
 
 /// The range of the indent fields, points.
-const INDENT_RANGE: RangeInclusive<f64> = -1296.0..=1296.0;
+pub(super) const INDENT_RANGE: RangeInclusive<f64> = -1296.0..=1296.0;
 /// The range of the space fields, points.
-const SPACE_RANGE: RangeInclusive<f64> = 0.0..=1296.0;
+pub(super) const SPACE_RANGE: RangeInclusive<f64> = 0.0..=1296.0;
 
 /// Paragraph alignment, in Photoshop's button order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -108,6 +111,23 @@ pub struct ParagraphValues {
     pub hyphenate: Option<bool>,
 }
 
+impl ParagraphValues {
+    /// The values of two selections together: each field stays where both are equal and becomes `None` where they
+    /// differ.
+    pub fn mixed_with(&self, other: &Self) -> Self {
+        ParagraphValues {
+            align: agree(&self.align, &other.align),
+            direction: agree(&self.direction, &other.direction),
+            start_indent: agree(&self.start_indent, &other.start_indent),
+            end_indent: agree(&self.end_indent, &other.end_indent),
+            first_line_indent: agree(&self.first_line_indent, &other.first_line_indent),
+            space_before: agree(&self.space_before, &other.space_before),
+            space_after: agree(&self.space_after, &other.space_after),
+            hyphenate: agree(&self.hyphenate, &other.hyphenate),
+        }
+    }
+}
+
 /// One change from the Paragraph controls.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -165,48 +185,34 @@ pub struct ParagraphControls<'a> {
     /// Any of the formatted text is point text (no box): the justify buttons are disabled.
     #[prop]
     point_text: bool,
+    /// Vertical text: Left, Center and Right show the top, middle and bottom glyphs and words.
+    #[prop]
+    vertical: bool,
+    /// Shows the Hyphenate check box. Default true.
+    #[prop]
+    hyphenate: bool,
 }
 
 impl<'a> ParagraphControls<'a> {
     /// Controls named `label` for the paragraph attributes `values`.
     pub fn new(label: impl Into<Label>, values: &'a ParagraphValues) -> Self {
-        ParagraphControls { label: label.into(), values, unit: DocUnit::points(), point_text: false }
+        ParagraphControls { label: label.into(), values, unit: DocUnit::points(), point_text: false, vertical: false, hyphenate: true }
     }
 
     /// Shows the controls and returns the changes the user made.
     pub fn show(self, ui: &mut Ui) -> ParagraphControlsOutput {
         let values = self.values;
         let point_text = self.point_text;
+        let vertical = self.vertical;
+        let show_hyphenate = self.hyphenate;
         let env = Env::of(ui);
         let words = env.words::<ParagraphWords>();
         let units = env.units();
         let lengths = Lengths { units: &units, unit: self.unit };
 
-        let aligns: Vec<Toggle<ParagraphChange>> = [
-            (TextAlign::Left, "align_left", &words.left),
-            (TextAlign::Center, "align_center", &words.center),
-            (TextAlign::Right, "align_right", &words.right),
-            (TextAlign::JustifyLeft, "align_justify", &words.justify_left),
-            (TextAlign::JustifyCenter, "align_justify", &words.justify_center),
-            (TextAlign::JustifyRight, "align_justify", &words.justify_right),
-            (TextAlign::JustifyAll, "align_justify", &words.justify_all),
-        ]
-        .into_iter()
-        .map(|(align, icon, name)| {
-            let toggle = Toggle::new(name, icon, Some(values.align == Some(align)), Box::new(move |_| ParagraphChange::Align(align)));
-            if point_text && align.needs_box() { toggle.disabled(&words.justify_needs_box) } else { toggle }
-        })
-        .collect();
-        let directions: Vec<Toggle<ParagraphChange>> = [
-            (ParagraphDirection::Automatic, "pilcrow", &words.direction_auto),
-            (ParagraphDirection::LeftToRight, "pilcrow_right", &words.direction_ltr),
-            (ParagraphDirection::RightToLeft, "pilcrow_left", &words.direction_rtl),
-        ]
-        .into_iter()
-        .map(|(direction, icon, name)| {
-            Toggle::new(name, icon, Some(values.direction == Some(direction)), Box::new(move |_| ParagraphChange::Direction(direction)))
-        })
-        .collect();
+        let aligns: Vec<Toggle<ParagraphChange>> =
+            align_toggles(values, &words, vertical).into_iter().chain(justify_toggles(values, &words, point_text)).collect();
+        let directions = direction_toggles(values, &words);
 
         let mut edits: Vec<EditEvent<ParagraphChange>> = Vec::new();
         let shown = Stack::new().label(self.label).show(ui, |ui, _| {
@@ -216,8 +222,7 @@ impl<'a> ParagraphControls<'a> {
             Grid::new(&TWO_COLUMNS).fill_width().show(ui, |ui, _| {
                 let start = LengthRow {
                     label: words.start_indent.clone(),
-                    glyph: GlyphLabel::text("→|"),
-                    hint: None,
+                    side: mark(GlyphLabel::text("→|"), None, FieldLayout::Inside),
                     value: values.start_indent,
                     range: INDENT_RANGE,
                     presets: &[],
@@ -226,8 +231,7 @@ impl<'a> ParagraphControls<'a> {
                 edits.extend(number_change(event, ParagraphChange::StartIndent));
                 let end = LengthRow {
                     label: words.end_indent.clone(),
-                    glyph: GlyphLabel::text("|←"),
-                    hint: None,
+                    side: mark(GlyphLabel::text("|←"), None, FieldLayout::Inside),
                     value: values.end_indent,
                     range: INDENT_RANGE,
                     presets: &[],
@@ -236,8 +240,7 @@ impl<'a> ParagraphControls<'a> {
                 edits.extend(number_change(event, ParagraphChange::EndIndent));
                 let first = LengthRow {
                     label: words.first_line_indent.clone(),
-                    glyph: GlyphLabel::text("¶→"),
-                    hint: None,
+                    side: mark(GlyphLabel::text("¶→"), None, FieldLayout::Inside),
                     value: values.first_line_indent,
                     range: INDENT_RANGE,
                     presets: &[],
@@ -248,8 +251,7 @@ impl<'a> ParagraphControls<'a> {
             Grid::new(&TWO_COLUMNS).fill_width().show(ui, |ui, _| {
                 let before = LengthRow {
                     label: words.space_before.clone(),
-                    glyph: GlyphLabel::text("↑¶"),
-                    hint: None,
+                    side: mark(GlyphLabel::text("↑¶"), None, FieldLayout::Inside),
                     value: values.space_before,
                     range: SPACE_RANGE,
                     presets: &[],
@@ -258,8 +260,7 @@ impl<'a> ParagraphControls<'a> {
                 edits.extend(number_change(event, ParagraphChange::SpaceBefore));
                 let after = LengthRow {
                     label: words.space_after.clone(),
-                    glyph: GlyphLabel::text("¶↓"),
-                    hint: None,
+                    side: mark(GlyphLabel::text("¶↓"), None, FieldLayout::Inside),
                     value: values.space_after,
                     range: SPACE_RANGE,
                     presets: &[],
@@ -267,9 +268,63 @@ impl<'a> ParagraphControls<'a> {
                 let (event, _) = lengths.row(ui, after);
                 edits.extend(number_change(event, ParagraphChange::SpaceAfter));
             });
-            let out = Checkbox::new(Bind::given(mixed(values.hyphenate))).label(words.hyphenate.clone()).show(ui);
-            edits.extend(out.events.map(ParagraphChange::Hyphenate));
+            if show_hyphenate {
+                let out = Checkbox::new(Bind::given(mixed(values.hyphenate))).label(words.hyphenate.clone()).show(ui);
+                edits.extend(out.events.map(ParagraphChange::Hyphenate));
+            }
         });
         ParagraphControlsOutput { response: shown.output, edits }
     }
+}
+
+/// The Left, Center and Right toggles; with `vertical` they are the Top, Middle and Bottom ones, which set the same
+/// [`TextAlign`] values.
+pub(crate) fn align_toggles(values: &ParagraphValues, words: &ParagraphWords, vertical: bool) -> Vec<Toggle<ParagraphChange>> {
+    let marks: [(TextAlign, &'static str, &Label); 3] = if vertical {
+        [
+            (TextAlign::Left, "text_align_top", &words.top),
+            (TextAlign::Center, "text_align_middle", &words.middle),
+            (TextAlign::Right, "text_align_bottom", &words.bottom),
+        ]
+    } else {
+        [
+            (TextAlign::Left, "align_left", &words.left),
+            (TextAlign::Center, "align_center", &words.center),
+            (TextAlign::Right, "align_right", &words.right),
+        ]
+    };
+    marks
+        .into_iter()
+        .map(|(align, icon, name)| Toggle::new(name, icon, Some(values.align == Some(align)), Box::new(move |_| ParagraphChange::Align(align))))
+        .collect()
+}
+
+/// The four justify toggles; in point text, which has no box to fill, they are disabled.
+pub(crate) fn justify_toggles(values: &ParagraphValues, words: &ParagraphWords, point_text: bool) -> Vec<Toggle<ParagraphChange>> {
+    [
+        (TextAlign::JustifyLeft, &words.justify_left),
+        (TextAlign::JustifyCenter, &words.justify_center),
+        (TextAlign::JustifyRight, &words.justify_right),
+        (TextAlign::JustifyAll, &words.justify_all),
+    ]
+    .into_iter()
+    .map(|(align, name)| {
+        let toggle = Toggle::new(name, "align_justify", Some(values.align == Some(align)), Box::new(move |_| ParagraphChange::Align(align)));
+        if point_text && align.needs_box() { toggle.disabled(&words.justify_needs_box) } else { toggle }
+    })
+    .collect()
+}
+
+/// The three direction toggles.
+pub(crate) fn direction_toggles(values: &ParagraphValues, words: &ParagraphWords) -> Vec<Toggle<ParagraphChange>> {
+    [
+        (ParagraphDirection::Automatic, "pilcrow", &words.direction_auto),
+        (ParagraphDirection::LeftToRight, "pilcrow_right", &words.direction_ltr),
+        (ParagraphDirection::RightToLeft, "pilcrow_left", &words.direction_rtl),
+    ]
+    .into_iter()
+    .map(|(direction, icon, name)| {
+        Toggle::new(name, icon, Some(values.direction == Some(direction)), Box::new(move |_| ParagraphChange::Direction(direction)))
+    })
+    .collect()
 }

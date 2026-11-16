@@ -7,7 +7,7 @@ use std::rc::Rc;
 use craft_behavior::CanvasView;
 use craft_behavior::kurbo::Point;
 use craft_text::quotes::QuoteStyle;
-use craft_text::ui::editor::{CaretLine, EditKind, HostLine, StyleKey, TextEditor, TextEditorHost, TextSelection};
+use craft_text::ui::editor::{CaretLine, EditKind, EditorEnd, HostLine, StyleKey, TextEditor, TextEditorHost, TextSelection};
 use craft_ui::canvas::Canvas;
 use craft_ui::contract::{Bind, Show as _, ShowContainer as _};
 use craft_ui::testing::{Fixture, pointer, trial};
@@ -21,6 +21,8 @@ struct Host {
     formats: bool,
     /// The formatting keys the editor asked for.
     styles: Vec<StyleKey>,
+    /// The editor is shown with Esc cancelling (`TextEditor::esc_commits(false)`).
+    esc_cancels: bool,
 }
 
 /// The chars of one line.
@@ -87,6 +89,11 @@ struct Session {
     host: Rc<RefCell<Host>>,
     selection: Rc<RefCell<TextSelection>>,
     commits: Rc<Cell<u32>>,
+    cancels: Rc<Cell<u32>>,
+    /// Every session end the editor reported (`TextEditorOutput::ended`).
+    ends: Rc<RefCell<Vec<EditorEnd>>>,
+    /// The next pass asks egui for a second pass of its frame.
+    discard: Rc<Cell<bool>>,
 }
 
 fn session(text: &str, quotes: Option<QuoteStyle>) -> Session {
@@ -98,20 +105,30 @@ fn session_on(host: Host, quotes: Option<QuoteStyle>, beside: bool) -> Session {
     let text = host.text.clone();
     let host = Rc::new(RefCell::new(host));
     let selection = Rc::new(RefCell::new(TextSelection::caret_at(text.chars().count())));
-    let commits = Rc::new(Cell::new(0));
+    let (commits, cancels, discard) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(false)));
     let (shown_host, shown_selection, shown_commits) = (Rc::clone(&host), Rc::clone(&selection), Rc::clone(&commits));
+    let (shown_cancels, shown_discard) = (Rc::clone(&cancels), Rc::clone(&discard));
+    let ends = Rc::new(RefCell::new(Vec::new()));
+    let shown_ends = Rc::clone(&ends);
     let mut other = (Host { text: "xyz".to_owned(), ..Host::default() }, TextSelection::caret_at(0));
     let mut fixture = Fixture::new(move |ui| {
+        if shown_discard.take() {
+            ui.ctx().request_discard("the trial reruns the pass");
+        }
         let (mut host, mut selection) = (shown_host.borrow_mut(), shown_selection.borrow_mut());
         let room = ui.available_rect_before_wrap();
         // Document (0, 0) at the room's top left, at 100 %.
         let view = CanvasView::new(room, Point::new(f64::from(room.width()) / 2.0, f64::from(room.height()) / 2.0), 1.0);
         Canvas::new("Document").view(view).show(ui, |ui, body| {
             let bounds = Rect::from_min_size(body.rect.min, vec2(200.0, 20.0));
-            let editor = TextEditor::new("Text", &mut *host, Bind::bound(&mut *selection));
+            let esc_commits = !host.esc_cancels;
+            let editor = TextEditor::new("Text", &mut *host, Bind::bound(&mut *selection)).esc_commits(esc_commits);
             let output = if let Some(style) = quotes { editor.smart_quotes(style) } else { editor }.show_at(ui, bounds);
             let commits = output.edit.events.iter().filter(|event| matches!(event, craft_behavior::EditEvent::Commit { .. })).count() as u32;
             shown_commits.set(shown_commits.get() + commits);
+            let cancels = output.edit.events.iter().filter(|event| matches!(event, craft_behavior::EditEvent::Cancel { .. })).count() as u32;
+            shown_cancels.set(shown_cancels.get() + cancels);
+            shown_ends.borrow_mut().extend(output.ended);
             if beside {
                 let (host, selection) = (&mut other.0, &mut other.1);
                 drop(TextEditor::new("Other", host, Bind::bound(selection)).show_at(ui, bounds.translate(vec2(0.0, 40.0))));
@@ -119,7 +136,7 @@ fn session_on(host: Host, quotes: Option<QuoteStyle>, beside: bool) -> Session {
         });
     });
     fixture.settle();
-    Session { fixture, host, selection, commits }
+    Session { fixture, host, selection, commits, cancels, ends, discard }
 }
 
 impl Session {
@@ -224,6 +241,54 @@ fn a_click_during_composition_keeps_the_marked_text_and_interrupts_the_compositi
     assert_eq!(editor.text(), "aqrbckzk", "the preedit before the press changes the marked text once");
     assert_eq!(*editor.selection.borrow(), TextSelection::caret_at(6), "the press placed the caret after the preedit");
     assert_eq!(editor.commits.get(), 0, "a press in the text keeps the session open");
+}
+
+/// Cmd+. cancels a session with edits, though Esc commits (the default); while a composition is open it does nothing,
+/// and a session without edits gives no `Cancel`. A press frame that runs a second pass cancels once.
+#[trial]
+fn cmd_period_cancels_the_session_but_not_while_composing() {
+    use craft_ui::testing::focus::key_release;
+    use craft_ui::testing::input::key_press;
+
+    let mut editor = session("abc", None);
+    editor.focus();
+    editor.fixture.key(Key::Period, Modifiers::COMMAND).settle();
+    assert_eq!((editor.commits.get(), editor.cancels.get()), (0, 0), "a session without edits ends with nothing to cancel");
+
+    editor.fixture.type_text("d").settle();
+    editor.fixture.frame(vec![preedit("kzk")]).settle();
+    assert_eq!(editor.text(), "abcdkzk", "the composition is open");
+    editor.fixture.key(Key::Period, Modifiers::COMMAND).settle();
+    assert_eq!((editor.commits.get(), editor.cancels.get()), (0, 0), "Cmd+. while composing belongs to the input method");
+
+    editor.fixture.frame(vec![Event::Ime(ImeEvent::Commit("kzk".to_owned()))]).settle();
+    editor.fixture.hold(Modifiers::COMMAND).frame(Vec::new());
+    editor.discard.set(true);
+    editor.fixture.frame(vec![key_press(Key::Period, Modifiers::COMMAND)]);
+    assert_eq!(editor.fixture.passes(), 2, "the press frame ran a second pass");
+    editor.fixture.frame(vec![key_release(Key::Period, Modifiers::COMMAND)]).hold(Modifiers::NONE).settle();
+    assert_eq!(editor.cancels.get(), 1, "Cmd+. cancels the session once");
+    assert_eq!(editor.commits.get(), 0, "Cmd+. cancels though Esc commits");
+}
+
+/// Escape ends a session with no text change (an untouched placeholder, an empty mask) on the editor itself: it
+/// commits or cancels as Esc is set to, and does not first return focus to the canvas. With typed text the session's
+/// gesture ends with it.
+#[trial]
+fn escape_ends_an_untouched_session_and_a_typed_one() {
+    let mut editor = session("abc", None);
+    editor.focus();
+    editor.fixture.key(Key::Escape, Modifiers::NONE).settle();
+    assert_eq!(*editor.ends.borrow(), [EditorEnd::Commit], "Esc commits an untouched session");
+    assert_eq!((editor.commits.get(), editor.cancels.get()), (0, 0), "no text changed, so no gesture ends");
+
+    let mut editor = session_on(Host { text: "abc".to_owned(), esc_cancels: true, ..Host::default() }, None, false);
+    editor.focus();
+    editor.fixture.key(Key::Escape, Modifiers::NONE).settle();
+    assert_eq!(*editor.ends.borrow(), [EditorEnd::Cancel], "Esc cancels an untouched session where it does not commit");
+    editor.fixture.type_text("d").key(Key::Escape, Modifiers::NONE).settle();
+    assert_eq!(*editor.ends.borrow(), [EditorEnd::Cancel, EditorEnd::Cancel], "the focus stayed on the editor");
+    assert_eq!(editor.cancels.get(), 1, "the typed session's gesture is cancelled");
 }
 
 /// In vertical text Alt+Down follows the flow and loosens the tracking; a host that applies no formatting leaves

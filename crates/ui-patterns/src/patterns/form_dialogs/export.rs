@@ -11,6 +11,8 @@ mod path_row;
 #[cfg(feature = "testing")]
 mod stories;
 
+use super::PreviewRequest;
+use crate::contract::SaveKey;
 use crate::runtime::env::Label;
 use craft_behavior::PixelSize;
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use std::path::PathBuf;
 pub use as_dialog::{ExportAsDialog, ExportAsOutput, HostedExportAs};
 pub use options::{
     DdsCompression, DdsOptions, ExportOptionsKind, FormatOptions, FormatOptionsDialog, FormatOptionsOutput, FormatOptionsWords, HostedFormatOptions,
-    JpegFormat, JpegOptions, JpegPreset, TargaOptions, TiffOptions, jpeg_quality_percent,
+    JpegFormat, JpegOptions, JpegPreset, TargaOptions, TiffCompression, TiffOptions, jpeg_quality_percent,
 };
 pub use path_row::{OutputPathOutput, OutputPathRow, OutputPathWords};
 
@@ -54,7 +56,10 @@ craft_ui::words! {
         scale_range: "export.scaleRange" = "Scale must be within 1–1000 percent";
         pixel_range: "export.pixelRange" = "Export size must be within 1–300,000 pixels";
         no_estimate: "export.noEstimate" = "—";
+        estimating: "export.estimating" = "…";
         untitled: "export.untitled" = "Untitled";
+        preset: "export.preset" = "Preset";
+        new_preset_name: "export.newPresetName" = "Export Preset";
         /// `{size}`: the estimated file size, shown while the exact one is computed.
         estimate: template "export.estimate" = "≈ {size}";
         /// `{width}` and `{height}`: the output size in pixels.
@@ -221,15 +226,21 @@ const MIN_SIDE: f64 = 1.0;
 
 impl ExportOptions {
     /// The options as the controls can hold them for a document of size `source`: a format the list has (the first
-    /// when not), a quality of 1 to 100, and a size the document can take. A linked pixel width keeps its width and
+    /// when not), a resample method of `methods` (the first when not; any method when `methods` is empty), a quality
+    /// of 1 to 100, and a size the document can take. A linked pixel width keeps its width and
     /// takes the height from this document (the last export's proportions would stretch another shape); unlinked
     /// pixels stay as asked when in range; anything out of range becomes 100 percent.
     #[must_use]
-    pub fn fitted(mut self, formats: &[ExportFormat], source: PixelSize) -> Self {
+    pub fn fitted(mut self, formats: &[ExportFormat], methods: &[Resample], source: PixelSize) -> Self {
         if let Some(first) = formats.first()
             && !formats.iter().any(|format| format.id == self.format)
         {
             self.format = first.id.to_owned();
+        }
+        if let Some(first) = Resample::ALL.iter().find(|method| methods.contains(method))
+            && !methods.contains(&self.resample)
+        {
+            self.resample = *first;
         }
         self.quality = self.quality.clamp(*QUALITY.start(), *QUALITY.end());
         let in_range = |side: u32| (MIN_SIDE..=MAX_DOCUMENT_SIDE).contains(&f64::from(side));
@@ -325,6 +336,55 @@ pub struct ExportAsResult {
     pub path: PathBuf,
     /// The output size in pixels.
     pub size: PixelSize,
+    remember: Option<(SaveKey, ExportOptions)>,
+}
+
+impl ExportAsResult {
+    /// Stores the settings of a dialog built with [`ExportAsDialog::remember`] for the next open. The app calls it
+    /// after its export succeeds, so a failed export leaves the previous settings; without a key it does nothing.
+    pub fn remember(&self, ctx: &egui::Context) {
+        if let Some((key, options)) = &self.remember {
+            crate::runtime::memory::set_saved_value::<Option<ExportOptions>>(ctx, key, Some(options.clone()));
+        }
+    }
+}
+
+/// The numbering of the settings an app computes something for (a preview, a size estimate): a new revision for each
+/// change of the settings, reported once, and the rule that decides whether an answer is still wanted.
+#[derive(Clone)]
+struct Revisions<T> {
+    /// The newest revision of the settings.
+    revision: u64,
+    /// The settings `revision` numbers.
+    requested: Option<T>,
+    /// The newest revision reported by [`request`](Revisions::request).
+    taken: u64,
+}
+
+impl<T> Default for Revisions<T> {
+    fn default() -> Self {
+        Revisions { revision: 0, requested: None, taken: 0 }
+    }
+}
+
+impl<T: Clone + PartialEq> Revisions<T> {
+    /// Numbers the settings anew when they differ from the ones the newest revision stands for, and returns the request
+    /// when the revision was not reported yet.
+    fn request(&mut self, settings: &T) -> Option<PreviewRequest<T>> {
+        if self.requested.as_ref() != Some(settings) {
+            self.revision += 1;
+            self.requested = Some(settings.clone());
+        }
+        (self.revision != self.taken).then(|| {
+            self.taken = self.revision;
+            PreviewRequest::new(self.revision, settings.clone())
+        })
+    }
+
+    /// Whether an answer for `revision` is not older than the newest one reported.
+    fn adopts(&self, revision: u64) -> bool {
+        revision >= self.taken
+    }
 }
 
 /// A file name safe on every platform: at most 80 characters, control characters and `< > : " / \ | ? *` replaced by

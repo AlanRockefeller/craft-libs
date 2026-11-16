@@ -62,6 +62,12 @@ pub struct DockSizes {
 }
 
 impl DockSizes {
+    /// The sizes in the root scope's style, for code outside a style pass:
+    /// `StyleCx::with_root(ctx, DockSizes::style)`.
+    pub fn of(ctx: &Context) -> Self {
+        StyleCx::with_root(ctx, DockSizes::style)
+    }
+
     /// The sizes of the style context `cx`.
     pub fn style(cx: &StyleCx<'_>) -> Self {
         let size = &cx.tokens.size;

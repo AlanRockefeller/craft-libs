@@ -3,6 +3,7 @@
 mod adjust_editors;
 mod adjust_tone;
 mod blur_pins;
+mod color_range;
 mod contour_field;
 mod curve;
 mod fill;
@@ -14,6 +15,7 @@ mod liquify;
 mod live_preview;
 mod perspective_warp;
 mod pin_warp;
+mod raw_develop;
 mod scopes;
 mod select;
 mod select_mask;

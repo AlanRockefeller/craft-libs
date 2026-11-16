@@ -14,6 +14,9 @@
 //!   diameter, up and down the hardness ([`BrushLevel`]), reported as [`ResizeStep`]s.
 //! - [`TipFalloff`] and [`FalloffPreview`]: the tip's falloff and the canvas control that shows it with the brush
 //!   circle round it.
+//! - [`StrokeTrail`] and [`CoverageMask`]: the footprint of the stroke being painted, a coverage raster the tool
+//!   stamps and the control uploads by its changed rows, in a [`TrailTone`].
+//! - [`SourceMarker`]: the clone source's crosshair at a document point.
 //!
 //! A brush tool returns [`BrushCursor::cursor`] from `CanvasTool::cursor`. The app shows [`BrushResize::preview`] or
 //! [`BrushCursor::tip_cell`] at the canvas rect in the canvas body, and the tool hands
@@ -22,11 +25,15 @@
 mod cursor;
 mod falloff;
 mod resize;
+mod source_marker;
 #[cfg(feature = "testing")]
 mod stories;
 mod tip;
+mod trail;
 
 pub use cursor::{BrushCursor, BrushCursorOptions, PaintingCursor, TipCell, TipCellStyle};
 pub use falloff::{FalloffPreview, FalloffPreviewStyle, TipFalloff};
 pub use resize::{BrushDimensions, BrushLevel, BrushResize, BrushResizeOptions, RESIZE_TRAVEL, ResizeStep};
+pub use source_marker::SourceMarker;
 pub use tip::{BrushTip, BrushTipOutline, TipPose, TipRings};
+pub use trail::{CoverageMask, StrokeTrail, TrailTone};

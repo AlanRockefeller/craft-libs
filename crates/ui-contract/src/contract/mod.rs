@@ -51,10 +51,10 @@ pub use body::pad_of;
 #[doc(hidden)]
 pub use body::{STRIP_BACK, STRIP_FORWARD};
 pub use collection::{
-    ActivateOn, CollectionEvent, CollectionProps, CollectionResponse, ColumnAlign, ColumnEvent, ColumnKind, ColumnRequest, ColumnSort, ColumnSpec,
-    ContextMenuRequest, DragPayload, DropAt, DropKind, DropPayload, DropPlace, EdgePress, HeaderMenuRequest, ItemKeys, LeadOnOpen, LeadSource,
-    ListDrag, OpenChange, PendingDrop, Rename, ReorderMove, ReorderRule, RowHeight, RowPressed, RowState, SelectMode, ShownRow, SpaceAction,
-    ToggleColumn, ToggleEdit,
+    ActivateOn, CollectionEvent, CollectionProps, CollectionResponse, ColumnAlign, ColumnEvent, ColumnKind, ColumnLayout, ColumnRequest, ColumnSort,
+    ColumnSpec, ContextMenuRequest, DragPayload, DropAt, DropKind, DropPayload, DropPlace, EdgePress, HeaderMenuRequest, ItemKeys, LeadOnOpen,
+    LeadSource, ListDrag, OpenChange, PendingDrop, Rename, ReorderMove, ReorderRule, RowHeight, RowPressed, RowState, SelectMode, ShownRow,
+    SpaceAction, ToggleColumn, ToggleEdit,
 };
 #[doc(hidden)]
 pub use container::InBar;
@@ -67,6 +67,7 @@ pub use container::{
 pub use craft_ui_macros::{CommandSet, Component, Pattern, Props, register_contract};
 #[doc(hidden)]
 pub use cx::THUMB;
+pub(crate) use cx::gesture_key;
 pub use cx::{
     Accessible, Activation, BodyCx, Cx, CxCore, Edit, Focus, ItemCx, ItemOpener, MeasureCx, PartBuilder, PartsCx, Pointer, Styled, WordSetCx,
 };
@@ -304,10 +305,25 @@ pub enum DisabledLook {
     /// `Opacity::DISABLED`, each keeping its hue. Controls whose look is chrome (buttons, fields, sliders, a gradient
     /// bar's stops) take it.
     States,
-    /// The component paints its enabled look at `Opacity::DISABLED`: its surface, its paint, its faces and
-    /// `paint_over`, not its focus ring. A component that shows data (a picture, a colour, a plot) takes it, so the
-    /// data dims with the rest. The children it shows are not inside the fade; each shows its own disabled look.
+    /// The component paints its enabled look, and step 13 lays one veil over it: a rect of the surface it sits on at
+    /// `1 - Opacity::DISABLED`, over its surface, its paint, its faces, the children it shows from `paint` and
+    /// `paint_over`, not its focus ring. Each colour under the veil shows mixed toward that surface by the disabled
+    /// share, and its parts do not show through each other. A component that shows data (a picture, a colour, a plot)
+    /// takes it, so the data dims with the rest. The children of its body are not under the veil; each shows its own
+    /// disabled look.
     Faded,
+}
+
+/// What Escape does to a value component's running gesture (step 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EscapeEdit {
+    /// Escape ends the gesture with `Cancel { Escape }`: the value goes back to where the gesture began.
+    #[default]
+    Cancel,
+    /// Escape ends the gesture with `Commit`: the value keeps what the gesture picked. A transient picker that the
+    /// host drives (a HUD over the canvas) closes on Escape and keeps the pick.
+    Commit,
 }
 
 /// The core trait: every UI type is a `Component`.
@@ -318,6 +334,8 @@ pub trait Component: Meta + Sized {
     const ALT_ROLES: &'static [Role] = &[];
     /// How input reaches the component.
     const INPUT: Input = Input::Pointer;
+    /// What Escape does to the running gesture.
+    const ESCAPE: EscapeEdit = EscapeEdit::Cancel;
     /// Whether the component hosts popups: `false` skips the overlay bookkeeping of steps 9, 10, 12, 15 and 16.
     const OVERLAYS: bool = true;
     /// Whether the component declares parts, a text part or an editor part: `false` skips the parts step (the parts
@@ -443,7 +461,7 @@ pub trait Component: Meta + Sized {
         None
     }
 
-    /// App values for content the component does not build: its body or its items. Runs once, at step 13.
+    /// App values for content the component does not build: its body or its items. Runs at step 13, and in a measuring run of the body before it.
     fn content_env(&self, _cx: &Cx<'_, Self>, _values: &mut crate::runtime::env::AppValues) {}
 
     /// After sensing, before paint: value maths, memory, popup triggers.
@@ -476,6 +494,13 @@ pub trait Component: Meta + Sized {
     /// asks it, measuring runs included, so it reads the props, the shown value and the environment only. Step 16
     /// gives it to the node, as the numeric value's text or else as the node's value.
     fn value_text(&self, _cx: &Cx<'_, Self>) -> Option<String> {
+        None
+    }
+
+    /// Words `value` as the control shows it ("40.0", "20 to 60"); `None` for a component that words no value. The
+    /// reset dot's tooltip names the default with it, and `value_text` of a slider or dial calls it with the shown
+    /// value.
+    fn word_value(&self, _value: &ValueOf<Self>, _cx: &Cx<'_, Self>) -> Option<String> {
         None
     }
 
@@ -552,6 +577,12 @@ pub trait Collection: Component + HasProps + Meta<Shape = shape::Items> {
 
     /// The selection binding; `None` keeps it in session memory.
     fn selection(&mut self) -> Option<BindMut<'_, Self::Selection>> {
+        None
+    }
+
+    /// The column arrangement binding; `None` keeps it in the header's own memory. The header starts each pass from
+    /// the bound layout and writes each change into it.
+    fn column_layout(&mut self) -> Option<BindMut<'_, ColumnLayout>> {
         None
     }
 

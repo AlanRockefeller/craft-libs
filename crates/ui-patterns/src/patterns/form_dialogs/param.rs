@@ -5,12 +5,15 @@
 mod parse;
 
 use super::fields::{DialogFields, FieldValue};
+use crate::patterns::blend_keys::BlendKeyEntry;
 use crate::runtime::env::{Label, UnitKind};
-use crate::runtime::requests::{ColorRequest, PathKind};
+use crate::runtime::requests::{ColorRequest, EyedropperRequest, ListingRequest, PathKind};
 use crate::value_drag::SliderScale;
+use craft_host::PickRequest;
 use craft_theme::Srgba;
 use egui::{Response, Ui};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What a parameter is and which control edits it. Defaults are the values a form opens with when nothing is
@@ -142,8 +145,32 @@ pub enum ParamKind {
         /// The text shown; line breaks start new lines.
         text: Label,
     },
-    /// A row the host draws: see [`Param::custom`]. It has no value of its own.
+    /// A row the host draws: see [`Param::custom`]. Its value and its companions' are what `draw` keeps.
     Custom(CustomRow),
+    /// A select of blend modes, each with the Shift+Alt key that picks it.
+    #[non_exhaustive]
+    Blend {
+        /// The modes: their key entries (id and shortcut) and labels.
+        modes: Vec<(BlendKeyEntry<String>, Label)>,
+        /// The id of the mode shown when nothing is remembered; the first mode when `None`.
+        default: Option<String>,
+    },
+    /// A pattern chosen from the dialog's pattern list (`ParamDialog::patterns`); its value is the pattern's id.
+    #[non_exhaustive]
+    Pattern {
+        /// The id of the pattern shown when nothing is remembered.
+        default: Option<String>,
+    },
+    /// A list of files or one folder (a `FileListPicker`); its value is a `{files, folder, useFolder}` object.
+    #[non_exhaustive]
+    Files {
+        /// Whether the list picks a folder.
+        folder_mode: bool,
+        /// The file dialog request Browse makes.
+        request: PickRequest,
+        /// The paths of the documents already open, which the list offers to add.
+        open_files: Vec<PathBuf>,
+    },
     /// A section heading over the rows that follow it: see [`Param::section`]. It has no value.
     Section,
 }
@@ -214,6 +241,16 @@ impl ParamKind {
         ParamKind::OptionalNumber { min, max, default, initial, decimals }
     }
 
+    /// A select of blend `modes` with their keys; `default` is the id of the mode shown at first.
+    pub fn blend(modes: Vec<(BlendKeyEntry<String>, Label)>, default: Option<String>) -> Self {
+        ParamKind::Blend { modes, default }
+    }
+
+    /// A pattern chosen from the dialog's pattern list; `default` is the id shown at first.
+    pub fn pattern(default: Option<String>) -> Self {
+        ParamKind::Pattern { default }
+    }
+
     /// Fields per row of a [`ParamKind::Grid`] of `cells`: `round(sqrt(cells))`, at least 1.
     pub fn grid_side(cells: usize) -> usize {
         ((cells as f32).sqrt().round() as usize).max(1)
@@ -245,7 +282,14 @@ impl ParamKind {
             ParamKind::Channel { default, .. } => FieldValue::Int(i64::try_from(*default).unwrap_or(0)),
             ParamKind::Text { default } => FieldValue::Text(default.clone()),
             ParamKind::OptionalNumber { default, .. } => FieldValue::Number((*default)?),
-            ParamKind::ReadOnlyText { .. } | ParamKind::Custom(_) | ParamKind::Section => return None,
+            ParamKind::Blend { modes, default } => {
+                let initial = default.as_deref().or_else(|| modes.first().map(|(entry, _)| entry.key.as_str()));
+                FieldValue::Text(initial.unwrap_or_default().to_owned())
+            }
+            ParamKind::Pattern { default } => FieldValue::Text(default.clone()?),
+            ParamKind::Files { open_files, .. } => path_list(open_files),
+            ParamKind::Custom(row) => row.opens_with.clone()?,
+            ParamKind::ReadOnlyText { .. } | ParamKind::Section => return None,
         })
     }
 
@@ -273,6 +317,11 @@ impl ParamKind {
             (ParamKind::Channel { names, .. }, FieldValue::Int(i)) => usize::try_from(*i).is_ok_and(|i| i < names.len()),
             (ParamKind::Text { .. }, FieldValue::Text(_)) => true,
             (ParamKind::OptionalNumber { min, max, .. }, v) => number(v).is_some_and(|n| n.is_finite() && n >= *min && n <= *max),
+            // A custom row keeps whatever its `draw` writes.
+            (ParamKind::Custom(_), _) => true,
+            (ParamKind::Blend { modes, .. }, FieldValue::Text(id)) => modes.iter().any(|(entry, _)| entry.key == *id),
+            (ParamKind::Pattern { .. }, FieldValue::Text(_)) => true,
+            (ParamKind::Files { .. }, v) => is_path_list(v),
             _ => false,
         }
     }
@@ -281,31 +330,43 @@ impl ParamKind {
 type CustomDraw = dyn Fn(&mut Ui, &mut DialogFields, &mut CustomContext) -> Response + Send + Sync;
 
 /// What draws a [`ParamKind::Custom`] row: it gets the row's control cell, the form's values and the row's
-/// [`CustomContext`], and returns the response the row label names. Equal only to itself.
+/// [`CustomContext`], and returns the response the row label names. Besides the row's own key, `draw` may keep values
+/// under its companion keys ([`Param::companions`]). Equal only to a clone of itself with the same value and companions.
 #[derive(Clone)]
-pub struct CustomRow(Arc<CustomDraw>);
+pub struct CustomRow {
+    draw: Arc<CustomDraw>,
+    /// The value the row's key opens with ([`Param::opens_with`]).
+    opens_with: Option<FieldValue>,
+    /// The other keys `draw` keeps values under.
+    companions: Vec<String>,
+}
 
 impl CustomRow {
     /// Wraps `draw`, which draws the row and edits the values it owns through the [`DialogFields`].
     pub fn new(draw: impl Fn(&mut Ui, &mut DialogFields, &mut CustomContext) -> Response + Send + Sync + 'static) -> Self {
-        Self(Arc::new(draw))
+        Self { draw: Arc::new(draw), opens_with: None, companions: Vec::new() }
     }
 
     /// Draws the row.
     pub(crate) fn draw(&self, ui: &mut Ui, fields: &mut DialogFields, context: &mut CustomContext) -> Response {
-        (self.0)(ui, fields, context)
+        (self.draw)(ui, fields, context)
+    }
+
+    /// Whether `key` is one of the row's companion keys.
+    pub(crate) fn has_companion(&self, key: &str) -> bool {
+        self.companions.iter().any(|companion| companion == key)
     }
 }
 
 impl fmt::Debug for CustomRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CustomRow")
+        f.debug_struct("CustomRow").field("opens_with", &self.opens_with).field("companions", &self.companions).finish_non_exhaustive()
     }
 }
 
 impl PartialEq for CustomRow {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.draw, &other.draw) && self.opens_with == other.opens_with && self.companions == other.companions
     }
 }
 
@@ -314,23 +375,48 @@ impl PartialEq for CustomRow {
 #[non_exhaustive]
 pub struct CustomContext {
     title: Label,
-    colors: DialogFields,
     request: Option<ColorRequest>,
+    canvas: Option<egui::Id>,
+    eyedropper: Option<EyedropperRequest>,
+    sampling: bool,
 }
 
 impl CustomContext {
-    /// The context of a row labelled `title` over `colors`, the values at the start of the pass.
-    pub(crate) fn new(title: Label, colors: DialogFields) -> Self {
-        CustomContext { title, colors, request: None }
+    /// The context of a row labelled `title`.
+    pub(crate) fn new(title: Label, canvas: Option<egui::Id>) -> Self {
+        CustomContext { title, request: None, canvas, eyedropper: None, sampling: false }
     }
 
-    /// Asks the host for its colour picker for the value under `key`, which needs no row of its own. The picker opens
-    /// at the colour the form holds under `key` (black without one), titled with the row's label. The request is
-    /// reported once, as a colour row's press is (`ParamRowsOutput::pick_color`); the host answers by writing the
-    /// colour under `key`.
-    pub fn pick_color(&mut self, key: &str) {
-        let color = Srgba::from_rgb_array(self.colors.color(key).unwrap_or([0.0; 3]));
+    /// Arms the host's eyedropper for the colour under `request.key`, as a colour row's dropper toggle does.
+    pub fn arm_eyedropper(&mut self, request: EyedropperRequest) {
+        self.eyedropper = Some(request);
+    }
+
+    /// Whether the row's dropper samples now: `true` while the row wants canvas presses to pick colours.
+    pub fn sampling(&mut self, on: bool) {
+        self.sampling = on;
+    }
+
+    /// The canvas the dialog's rows work on (`ParamDialog::canvas`), when it has one.
+    pub fn canvas(&self) -> Option<egui::Id> {
+        self.canvas
+    }
+
+    /// Asks the host for its colour picker, open at `color` (the colour the row shows) and titled with the row's label;
+    /// the host answers by writing the picked colour under `key`, which needs no row of its own. The request is
+    /// reported once, as a colour row's press is (`ParamRowsOutput::pick_color`).
+    pub fn pick_color(&mut self, key: &str, color: Srgba) {
         self.request = Some(ColorRequest::new(key, color).title(self.title.clone()));
+    }
+
+    /// The dropper the row armed, once.
+    pub(crate) fn take_eyedropper(&mut self) -> Option<EyedropperRequest> {
+        self.eyedropper.take()
+    }
+
+    /// Whether the row asked for canvas presses to pick colours.
+    pub(crate) fn is_sampling(&self) -> bool {
+        self.sampling
     }
 
     /// The colour request the row made, once.
@@ -373,6 +459,12 @@ pub(crate) struct RowOptions {
     /// The lines a multi-line text row shows.
     lines: Option<usize>,
     units: Option<UnitChoices>,
+    /// The ids of the options a choice row shows disabled.
+    disabled_options: Vec<String>,
+    /// The row's select has a search field.
+    searchable: bool,
+    /// The keys a change of the row's value removes ([`Param::resets`]).
+    resets: Vec<String>,
 }
 
 /// The units of a number row ([`Param::number_with_units`]).
@@ -382,6 +474,22 @@ pub(crate) struct UnitChoices {
     /// The field key the chosen unit's id is stored under.
     key: String,
     initial: usize,
+    /// The unit id is the value of another row (a choice row), not of a menu of this row.
+    shared: bool,
+}
+
+/// The value that holds `paths`: a list of text, the shape a [`Param::files`] row keeps its files in.
+pub(crate) fn path_list(paths: &[PathBuf]) -> FieldValue {
+    FieldValue::List(paths.iter().map(|path| FieldValue::Text(path.to_string_lossy().into_owned())).collect())
+}
+
+/// Whether `value` is a list of paths. An empty list stored and read back is a `Grid` of no cells.
+fn is_path_list(value: &FieldValue) -> bool {
+    match value {
+        FieldValue::List(items) => items.iter().all(|item| matches!(item, FieldValue::Text(_))),
+        FieldValue::Grid(cells) => cells.is_empty(),
+        _ => false,
+    }
 }
 
 /// Texts a row may carry beyond its label.
@@ -403,8 +511,8 @@ pub struct Param {
     pub kind: ParamKind,
     /// Shown after the number (`px`, `%`, `°`); formats through the locale.
     pub unit: Option<UnitKind>,
-    /// The row takes input only while `fields[key]` equals the value.
-    pub enabled_when: Option<(String, FieldValue)>,
+    /// The row takes input only while `fields[key]` equals one of the values.
+    pub enabled_when: Option<(String, Vec<FieldValue>)>,
     /// The row is shown only while `fields[key]` equals the value ([`Param::visible_when`]). A hidden row takes no
     /// space; its value stays in the fields and in the result.
     pub visible_when: Option<(String, FieldValue)>,
@@ -432,6 +540,77 @@ impl Param {
         }
     }
 
+    /// A row of files or one folder: a [`ParamKind::Files`] list the user fills with Browse.
+    pub fn files(key: impl Into<String>, label: impl Into<Label>) -> Param {
+        let key = key.into();
+        let kind = ParamKind::Files { folder_mode: false, request: PickRequest::open_many(key.clone()), open_files: Vec::new() };
+        Self::new(key, label, kind)
+    }
+
+    /// Whether a [`Param::files`] row picks one folder instead of files.
+    #[must_use]
+    pub fn folder_mode(mut self, on: bool) -> Self {
+        if let ParamKind::Files { folder_mode, .. } = &mut self.kind {
+            *folder_mode = on;
+        }
+        self
+    }
+
+    /// The paths of the documents already open, which a [`Param::files`] row offers to add.
+    #[must_use]
+    pub fn open_files(mut self, paths: Vec<PathBuf>) -> Self {
+        if let ParamKind::Files { open_files, .. } = &mut self.kind {
+            *open_files = paths;
+        }
+        self
+    }
+
+    /// Shows the options `ids` of a choice row disabled.
+    #[must_use]
+    pub fn disabled_options(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.options.get_or_insert_default().disabled_options = ids.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether the option `id` of a choice row takes a pick.
+    pub fn option_enabled(&self, id: &str) -> bool {
+        self.options.as_deref().is_none_or(|options| !options.disabled_options.iter().any(|disabled| disabled == id))
+    }
+
+    /// Gives a choice row's select a search field.
+    #[must_use]
+    pub fn searchable(mut self) -> Self {
+        self.options.get_or_insert_default().searchable = true;
+        self
+    }
+
+    /// The keys of the rows that depend on this one (Match Color's source layer on its source document): changing this
+    /// row's value to a different one, through the row, automation (`set_param_field`) or a host answer, removes them,
+    /// so those rows start over from their default. Setting the value it holds keeps them.
+    #[must_use]
+    pub fn resets(mut self, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.options.get_or_insert_default().resets.extend(keys.into_iter().map(Into::into));
+        self
+    }
+
+    /// Removes the keys the row [`resets`](Param::resets) when its value in `fields` differs from `before`, the value
+    /// it held before the write.
+    pub(crate) fn drop_dependents(&self, before: Option<&FieldValue>, fields: &mut DialogFields) {
+        let Some(options) = self.options.as_deref().filter(|options| !options.resets.is_empty()) else { return };
+        if fields.get(&self.key) != before {
+            for key in &options.resets {
+                fields.remove(key);
+            }
+        }
+    }
+
+    /// The row takes input only while `fields[key]` equals one of `values`; otherwise it is shown disabled.
+    #[must_use]
+    pub fn enabled_when_in(mut self, key: impl Into<String>, values: impl IntoIterator<Item = impl Into<FieldValue>>) -> Self {
+        self.enabled_when = Some((key.into(), values.into_iter().map(Into::into).collect()));
+        self
+    }
+
     /// A bare number row: a [`ParamKind::Number`] open on both sides. Bound it with [`Param::bounds`].
     pub fn number(key: impl Into<String>, label: impl Into<Label>, default: f64, step: f64, decimals: u32) -> Self {
         Self::new(key, label, ParamKind::number(None, None, default, step, decimals))
@@ -447,14 +626,35 @@ impl Param {
     }
 
     /// A row the host draws. `draw` gets the control cell, the form's values and the row's [`CustomContext`] (to ask
-    /// for the host's colour picker); the row label names the response it returns. The row has no default and
-    /// nothing remembered; `draw` reads and writes [`DialogFields`] under whatever keys it likes.
+    /// for the host's colour picker); the row label names the response it returns. Nothing of the row is remembered;
+    /// it opens with no value unless [`opens_with`](Param::opens_with) gives one. `draw` reads and writes the
+    /// [`DialogFields`] under its key and the keys [`companions`](Param::companions) declares; automation
+    /// (`set_json_field`) sets any of those keys to a JSON value, kept as [`FieldValue::Json`] (`null` removes it).
     pub fn custom(
         key: impl Into<String>,
         label: impl Into<Label>,
         draw: impl Fn(&mut Ui, &mut DialogFields, &mut CustomContext) -> Response + Send + Sync + 'static,
     ) -> Self {
         Self::new(key, label, ParamKind::Custom(CustomRow::new(draw)))
+    }
+
+    /// The value a [`Param::custom`] row's key opens with, as another row opens with its default. Other rows ignore it.
+    #[must_use]
+    pub fn opens_with(mut self, value: impl Into<FieldValue>) -> Self {
+        if let ParamKind::Custom(row) = &mut self.kind {
+            row.opens_with = Some(value.into());
+        }
+        self
+    }
+
+    /// The other keys a [`Param::custom`] row keeps values under (Color Lookup's `file` beside its `lut`), so automation
+    /// sets them as it sets the row's own key. Other rows ignore it.
+    #[must_use]
+    pub fn companions(mut self, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        if let ParamKind::Custom(row) = &mut self.kind {
+            row.companions.extend(keys.into_iter().map(Into::into));
+        }
+        self
     }
 
     /// A row of read-only `text` beside the label, wrapped to the form's width: the user can select and copy it, and
@@ -481,7 +681,24 @@ impl Param {
     pub fn number_with_units(key: impl Into<String>, label: impl Into<Label>, base: f64, step: f64, decimals: u32, units: Vec<NumberUnit>) -> Self {
         let key = key.into();
         let mut param = Self::number(key.clone(), label, base, step, decimals);
-        param.options.get_or_insert_default().units = Some(UnitChoices { units, key: format!("{key}.unit"), initial: 0 });
+        param.options.get_or_insert_default().units = Some(UnitChoices { units, key: format!("{key}.unit"), initial: 0, shared: false });
+        param
+    }
+
+    /// A number row shown in the unit another row chooses: `units_key` is the key of a choice row whose options are the
+    /// ids of `units`, so several number rows follow one menu. The value and its conversion are those of
+    /// [`Param::number_with_units`]; the row draws no unit menu of its own and stores no unit key.
+    pub fn number_in_units(
+        key: impl Into<String>,
+        label: impl Into<Label>,
+        base: f64,
+        step: f64,
+        decimals: u32,
+        units_key: impl Into<String>,
+        units: Vec<NumberUnit>,
+    ) -> Self {
+        let mut param = Self::number(key, label, base, step, decimals);
+        param.options.get_or_insert_default().units = Some(UnitChoices { units, key: units_key.into(), initial: 0, shared: true });
         param
     }
 
@@ -499,7 +716,7 @@ impl Param {
 
     /// The key a [`Param::number_with_units`] row stores its chosen unit's id under: `"{key}.unit"`.
     pub fn unit_key(&self) -> Option<&str> {
-        self.options.as_deref()?.units.as_ref().map(|units| units.key.as_str())
+        self.options.as_deref()?.units.as_ref().filter(|units| !units.shared).map(|units| units.key.as_str())
     }
 
     /// The row is shown only while `fields[key]` equals `value`, as [`enabled_when`](Param::enabled_when) enables it;
@@ -510,10 +727,11 @@ impl Param {
         self
     }
 
-    /// The row takes input only while `fields[key]` equals `value`; otherwise it is shown disabled.
+    /// The row takes input only while `fields[key]` equals `value`; otherwise it is shown disabled. The one-value case
+    /// of [`enabled_when_in`](Param::enabled_when_in).
     #[must_use]
     pub fn enabled_when(mut self, key: impl Into<String>, value: impl Into<FieldValue>) -> Self {
-        self.enabled_when = Some((key.into(), value.into()));
+        self.enabled_when = Some((key.into(), vec![value.into()]));
         self
     }
 
@@ -647,15 +865,58 @@ impl Param {
         !self.option().not_remembered
     }
 
-    /// Whether `value` is one the field `key` of this row can hold: the row's own value, or the unit id of a row with
-    /// units.
+    /// Whether `value` is one the field `key` of this row can hold: the row's own value, the unit id of a row with
+    /// units, a Files row's companions, or a custom row's companion.
     pub fn accepts(&self, key: &str, value: &FieldValue) -> bool {
         if self.key == key {
-            return self.kind.fits(value);
+            return self.kind.fits(value) && self.option_allowed(value);
+        }
+        if let ParamKind::Custom(row) = &self.kind {
+            return row.has_companion(key);
+        }
+        if matches!(self.kind, ParamKind::Files { .. }) {
+            return match value {
+                FieldValue::Text(_) => key == self.folder_key(),
+                FieldValue::Bool(_) => key == self.use_folder_key(),
+                other => key == self.folder_files_key() && is_path_list(other),
+            };
         }
         match (self.options.as_deref().and_then(|o| o.units.as_ref()), value) {
-            (Some(units), FieldValue::Text(id)) => units.key == key && units.units.iter().any(|u| &u.id == id),
+            (Some(units), FieldValue::Text(id)) => !units.shared && units.key == key && units.units.iter().any(|u| &u.id == id),
             _ => false,
+        }
+    }
+
+    /// The key a [`Param::files`] row stores its folder under: `"{key}.folder"`.
+    pub(crate) fn folder_key(&self) -> String {
+        format!("{}.folder", self.key)
+    }
+
+    /// The key a [`Param::files`] row stores whether the folder is used under: `"{key}.useFolder"`.
+    pub(crate) fn use_folder_key(&self) -> String {
+        format!("{}.useFolder", self.key)
+    }
+
+    /// The listing a [`Param::files`] row asks for when `before` becomes `after`: one of the folder in `after` when
+    /// that folder is in use and the folder or the use of it differs from `before`.
+    pub(crate) fn listing_after(&self, before: &DialogFields, after: &DialogFields) -> Option<ListingRequest> {
+        let (folder_key, use_key) = (self.folder_key(), self.use_folder_key());
+        let uses = |fields: &DialogFields| fields.bool(&use_key).unwrap_or(false);
+        let folder = after.text(&folder_key).filter(|_| uses(after))?;
+        let changed = before.text(&folder_key) != Some(folder) || !uses(before);
+        changed.then(|| ListingRequest::new(&self.key, PathBuf::from(folder)))
+    }
+
+    /// The key the host's listing of a [`Param::files`] row's folder is written under: `"{key}.folderFiles"`.
+    pub(crate) fn folder_files_key(&self) -> String {
+        format!("{}.folderFiles", self.key)
+    }
+
+    /// Whether `value` names no disabled option of a Radio, Choice or Blend row.
+    fn option_allowed(&self, value: &FieldValue) -> bool {
+        match (&self.kind, value) {
+            (ParamKind::Radio { .. } | ParamKind::Choice { .. } | ParamKind::Blend { .. }, FieldValue::Text(id)) => self.option_enabled(id),
+            _ => true,
         }
     }
 
@@ -666,7 +927,7 @@ impl Param {
 
     /// Whether the row takes input with `fields`.
     pub fn enabled(&self, fields: &DialogFields) -> bool {
-        self.enabled_when.as_ref().is_none_or(|(key, value)| fields.get(key) == Some(value))
+        self.enabled_when.as_ref().is_none_or(|(key, values)| fields.get(key).is_some_and(|held| values.contains(held)))
     }
 }
 
@@ -701,6 +962,11 @@ impl RowOptions {
         self.lines
     }
 
+    /// Whether a choice row's select has a search field.
+    pub(crate) fn searchable(&self) -> bool {
+        self.searchable
+    }
+
     /// The units of a number row.
     pub(crate) fn units(&self) -> Option<&UnitChoices> {
         self.units.as_ref()
@@ -711,6 +977,11 @@ impl UnitChoices {
     /// The units in menu order.
     pub(crate) fn list(&self) -> &[NumberUnit] {
         &self.units
+    }
+
+    /// Whether another row chooses the unit.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared
     }
 
     /// The key the chosen unit's id is stored under.
@@ -765,7 +1036,7 @@ pub(crate) fn fill_defaults(params: &[Param], fields: &mut DialogFields) {
         {
             fields.set(param.key.as_str(), value);
         }
-        if let Some(units) = param.options.as_deref().and_then(|o| o.units())
+        if let Some(units) = param.options.as_deref().and_then(|o| o.units()).filter(|units| !units.is_shared())
             && !fields.contains(units.key())
             && let Some(unit) = units.list().get(units.initial())
         {

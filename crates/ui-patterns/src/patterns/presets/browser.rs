@@ -258,6 +258,9 @@ pub struct PresetBrowser<'a, K: Clone + Eq + Hash + Send + Sync + 'static> {
     /// this many tiles. 0 asks for none.
     #[prop]
     columns: u16,
+    /// What the browser shows when `rows` is empty, in place of the default words.
+    #[prop(into)]
+    empty: Option<Label>,
 }
 
 impl<'a, K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'a, K> {
@@ -290,6 +293,7 @@ impl<'a, K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'a, K> {
             max_rows: None,
             room_height: None,
             columns: 0,
+            empty: None,
         }
     }
 
@@ -485,6 +489,7 @@ enum Seen<K> {
     Menu(K),
     Reorder(EditEvent<ReorderMove<K>>),
     Rename(EditEvent<Rename<K>>),
+    Delete(Vec<K>),
 }
 
 /// The events of a collection that the browser acts on, whatever its items report.
@@ -498,6 +503,7 @@ fn seen<K, E>(events: Vec<CollectionEvent<K, E>>) -> Vec<Seen<K>> {
             CollectionEvent::ContextMenu(request) => Some(Seen::Menu(request.key)),
             CollectionEvent::Reorder(edit) => Some(Seen::Reorder(edit)),
             CollectionEvent::Rename(edit) => Some(Seen::Rename(edit)),
+            CollectionEvent::Delete(keys) => Some(Seen::Delete(keys)),
             _ => None,
         })
         .collect()
@@ -570,7 +576,9 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'_, K> {
             max_rows,
             room_height,
             columns,
+            empty: empty_text,
         } = self;
+
         let env = Env::of(ui);
         let words = env.words::<PresetWords>();
         let list_id = rows_id(browser_id.unwrap_or_else(|| ui.scope_id()));
@@ -667,7 +675,7 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'_, K> {
             };
 
             let (response, displayed, pass) = if shown.is_empty() && actions.is_empty() {
-                let message = if query.is_empty() { words.empty.clone() } else { words.no_match.clone() };
+                let message = if query.is_empty() { empty_text.clone().unwrap_or_else(|| words.empty.clone()) } else { words.no_match.clone() };
                 let response = Notice::new(Tone::Neutral, message).layout(NoticeLayout::Centred).show(ui).response;
                 (response, Vec::new(), Pass { seen: Vec::new(), grid: Vec::new() })
             } else if view == PresetView::Grid {
@@ -689,6 +697,7 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'_, K> {
                     .tail(&tail)
                     .collapsible()
                     .rename(true)
+                    .deletable(true)
                     .rows_stamp(stamp)
                     .can_rename(rename_row)
                     .can_drag(can_drag)
@@ -735,6 +744,7 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'_, K> {
                     .arrows_select(false)
                     .selection(Bind::given(selection))
                     .rename(true)
+                    .deletable(true)
                     .rows_stamp(stamp)
                     .can_rename(rename_row)
                     .can_drag(can_drag)
@@ -880,6 +890,17 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> PresetBrowser<'_, K> {
                             Some(ReorderMove { to, ..mv })
                         };
                         events.extend(edit.filter_map(moved).map(PresetEvent::Reorder));
+                    }
+                    // Delete and Backspace give the same event as the row menu's Delete and the footer button; an
+                    // open rename field takes the keys itself.
+                    Seen::Delete(keys) => {
+                        for key in keys {
+                            if let BrowserKey::Preset(key) = key
+                                && can_delete.as_ref().is_none_or(|test| test.passes(&key))
+                            {
+                                events.push(PresetEvent::Delete(key));
+                            }
+                        }
                     }
                     Seen::Rename(edit) => {
                         let ended = matches!(edit.phase(), Some(GesturePhase::Commit) | None);

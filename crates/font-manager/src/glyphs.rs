@@ -1,6 +1,6 @@
 //! [`GlyphsPanel`]: Photoshop's Glyphs panel. A family and style picker, a category list (Entire Font, Punctuation,
 //! Currency, ...), a grid of glyph cells drawn by the app's text engine, a zoom slider, and the recently used
-//! glyphs in a row at the top. Double-click or Enter inserts the glyph into the text being edited.
+//! glyphs in a row at the top. Double-click or Enter inserts the glyph where the app can insert.
 
 #[cfg(feature = "screen-testing")]
 mod stories;
@@ -13,7 +13,7 @@ use craft_ui::contract::{
     ActivateOn, Bind, CollectionEvent, Entry, NoValue, Outcome, Pad, Pattern, Props, Remember as _, SelectMode, Show as _, ShowCollection as _,
     ShowContainer as _,
 };
-use craft_ui::display::Text;
+use craft_ui::display::{Shade, Spinner, Text};
 use craft_ui::layout_components::{Row, Stack};
 use craft_ui::list::ThumbAspect;
 use craft_ui::list::ThumbSize;
@@ -26,6 +26,7 @@ use craft_ui::tile_grid::{CaptionPlace, ThumbnailSlider, Tile, TileGrid, TileZoo
 use egui::{ColorImage, Rect, Response, Ui};
 use serde::{Deserialize, Serialize};
 
+use crate::panel::browse::SCAN_POLL_SECONDS;
 use crate::picker::{read_bind, write_bind};
 
 craft_ui::words! {
@@ -38,6 +39,7 @@ craft_ui::words! {
         style: "glyphs.style" = "Style";
         zoom: "glyphs.zoom" = "Zoom";
         no_text: "glyphs.noText" = "Edit text to insert glyphs";
+        loading: "glyphs.loading" = "Loading fonts…";
         font: "glyphs.font" = "Font";
         category: "glyphs.category" = "Category";
         grid: "glyphs.grid" = "Glyphs";
@@ -116,6 +118,15 @@ pub trait GlyphSource: Send + Sync {
     fn glyph(&self, family: &str, style: &str, c: char, px: u32) -> Option<ColorImage>;
     /// Whether `c` is in `category` (one of [`CATEGORIES`]).
     fn in_category(&self, c: char, category: &str) -> bool;
+    /// Whether the fonts are read. Not ready, the panel shows a spinner and muted text and no grid, and asks for a
+    /// repaint after the poll interval.
+    fn ready(&self) -> bool {
+        true
+    }
+    /// Changes when the source's faces change, so the pictures and the character lists are read again.
+    fn revision(&self) -> u64 {
+        0
+    }
 }
 
 /// The panel's remembered state (`[glyphs_panel]`): category, zoom and the recent glyphs.
@@ -142,7 +153,7 @@ impl Section for GlyphsPanelSettings {
 pub struct GlyphsPanelOutput {
     /// The panel's response.
     pub response: Response,
-    /// A glyph to insert at the caret (double-click, Enter on the focused cell); only while text is edited.
+    /// A glyph to insert at the caret (double-click, Enter on the focused cell); only where the app can insert.
     pub insert: Option<String>,
     /// The family or style changed in the panel's own pickers.
     pub font_changed: bool,
@@ -178,7 +189,7 @@ struct GlyphPictures<'a>(&'a dyn GlyphSource);
 
 impl ThumbSource<GlyphKey> for GlyphPictures<'_> {
     fn revision(&self, _: &GlyphKey, _: &ThumbRequest) -> Revision {
-        Revision::new(0)
+        Revision::new(self.0.revision())
     }
 
     fn render(&self, key: &GlyphKey, request: &ThumbRequest) -> ThumbRender {
@@ -193,6 +204,7 @@ impl ThumbSource<GlyphKey> for GlyphPictures<'_> {
 #[derive(Clone, Default)]
 struct CharsCache {
     key: (String, String, String),
+    revision: u64,
     chars: Arc<Vec<char>>,
 }
 
@@ -216,10 +228,11 @@ fn category_chars(cache: &mut CharsCache, source: &dyn GlyphSource, family: &str
         return Arc::new(seen);
     }
     let key = (family.to_owned(), style.to_owned(), category.to_owned());
-    if cache.key != key {
+    let revision = source.revision();
+    if cache.key != key || cache.revision != revision {
         let charmap = source.charmap(family, style);
         let chars = if category == CATEGORIES[0] { charmap } else { charmap.into_iter().filter(|c| source.in_category(*c, category)).collect() };
-        *cache = CharsCache { key, chars: Arc::new(chars) };
+        *cache = CharsCache { key, revision, chars: Arc::new(chars) };
     }
     Arc::clone(&cache.chars)
 }
@@ -250,7 +263,8 @@ impl craft_behavior::ItemSource<usize> for Chars<'_> {}
 ///   Enter inserts. Hovering a cell shows its character and code point as a tooltip.
 /// - A cell is drawn from [`GlyphSource::glyph`] at the zoom size, cached per face and character. The grid shows
 ///   only the current category; a cell the source returns no image for stays empty.
-/// - Without text being edited the cells still show, Enter and double-click do nothing and the footer says so.
+/// - Where the app cannot insert, the cells still show, Enter and double-click do nothing and the footer says so.
+/// - While the source is not [ready](GlyphSource::ready) the panel shows a spinner and "Loading fonts…" only.
 /// - The font and style lists come from the app ([`families`](GlyphsPanel::families),
 ///   [`styles`](GlyphsPanel::styles)); without a list the name is shown as text.
 #[must_use = "show the panel with `show`"]
@@ -267,9 +281,9 @@ pub struct GlyphsPanel<'a> {
     /// The styles of the family, for the style list.
     #[prop]
     styles: &'a [String],
-    /// Whether text is being edited (inserting is possible).
+    /// Whether the app has a place to insert a glyph: a double click or Enter inserts.
     #[prop]
-    editing: bool,
+    can_insert: bool,
 }
 
 impl<'a> GlyphsPanel<'a> {
@@ -281,14 +295,24 @@ impl<'a> GlyphsPanel<'a> {
         style: Bind<'a, String>,
         settings: Bind<'a, GlyphsPanelSettings>,
     ) -> Self {
-        GlyphsPanel { label: label.into(), source, family, style, settings, families: &[], styles: &[], editing: false }
+        GlyphsPanel { label: label.into(), source, family, style, settings, families: &[], styles: &[], can_insert: false }
     }
 
     /// Shows the panel.
     pub fn show(self, ui: &mut Ui) -> GlyphsPanelOutput {
-        let GlyphsPanel { label, source, mut family, mut style, mut settings, families, styles, editing } = self;
+        let GlyphsPanel { label, source, mut family, mut style, mut settings, families, styles, can_insert } = self;
         let env = Env::of(ui);
         let words = env.words::<GlyphsWords>();
+        if !source.ready() {
+            let shown = Stack::new().label(label).show(ui, |ui, _| {
+                Row::new().show(ui, |ui, _| {
+                    Spinner::new().label(words.loading.clone()).show(ui);
+                    Text::new(words.loading.clone()).shade(Shade::Muted).show(ui);
+                });
+            });
+            craft_ui::runtime::frame::request_repaint_after(ui.ctx(), SCAN_POLL_SECONDS);
+            return GlyphsPanelOutput { response: shown.output, insert: None, font_changed: false };
+        }
         let thumbs = Thumbnails::<GlyphKey>::in_context(ui.ctx(), "craft-font-manager-glyphs", ThumbnailOptions::new());
         let pictures = GlyphPictures(source);
         let mut insert: Option<String> = None;
@@ -414,13 +438,13 @@ impl<'a> GlyphsPanel<'a> {
                 Text::new(info.clone()).show(ui);
                 ThumbnailSlider::new(words.zoom.clone(), Bind::bound(&mut zoom_value), ZOOM).show(ui);
             });
-            if !editing {
+            if !can_insert {
                 Text::new(words.no_text.clone()).show(ui);
             }
 
             state.zoom = zoom_value as f32;
             if let Some(glyph) = activated
-                && editing
+                && can_insert
             {
                 state.recent.retain(|g| *g != glyph);
                 state.recent.insert(0, glyph.clone());

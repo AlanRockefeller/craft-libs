@@ -1,5 +1,5 @@
 //! Stories of `GlyphsPanel`: the panel over Ubuntu Light and Hack with three recent glyphs, while text is edited and
-//! while it is not. The glyph source draws the shipped faces' outlines with skrifa.
+//! while it is not, and while the source is not ready. The glyph source draws the shipped faces' outlines with skrifa.
 
 use craft_ui::contract::Bind;
 use craft_ui::testing::{Drive, StoryData, StoryOutput, story};
@@ -32,7 +32,7 @@ fn show_panel(ui: &mut Ui, data: &mut StoryData, editing: bool) -> StoryOutput {
     let styles = [if family == "Hack" { "Regular" } else { "Light" }.to_owned()];
     style.clone_from(&styles[0]);
     GlyphsPanel::new("Glyphs", &FaceGlyphs, Bind::bound(family), Bind::bound(style), Bind::bound(settings))
-        .editing(editing)
+        .can_insert(editing)
         .families(&families)
         .styles(&styles)
         .show(ui)
@@ -49,6 +49,35 @@ fn glyphs_panel(ui: &mut Ui, data: &mut StoryData) -> StoryOutput {
 #[story(GlyphsPanel<'static>, covers = [], drive = Drive::Never)]
 fn glyphs_panel_not_editing(ui: &mut Ui, data: &mut StoryData) -> StoryOutput {
     show_panel(ui, data, false)
+}
+
+/// The panel while the app is still reading its fonts: a spinner and the loading line, no grid.
+#[story(GlyphsPanel<'static>, covers = [], drive = Drive::Never)]
+fn glyphs_panel_loading(ui: &mut Ui, data: &mut StoryData) -> StoryOutput {
+    let Demo { family, style, settings } =
+        data.value("loading", Demo { family: String::new(), style: String::new(), settings: GlyphsPanelSettings::default() });
+    GlyphsPanel::new("Glyphs", &NotReady, Bind::bound(family), Bind::bound(style), Bind::bound(settings)).can_insert(true).show(ui).into()
+}
+
+/// A source whose fonts are not read yet.
+struct NotReady;
+
+impl GlyphSource for NotReady {
+    fn charmap(&self, _: &str, _: &str) -> Vec<char> {
+        Vec::new()
+    }
+
+    fn glyph(&self, _: &str, _: &str, _: char, _: u32) -> Option<ColorImage> {
+        None
+    }
+
+    fn in_category(&self, _: char, _: &str) -> bool {
+        false
+    }
+
+    fn ready(&self) -> bool {
+        false
+    }
 }
 
 /// Glyphs of the shipped faces, drawn by skrifa's outlines.

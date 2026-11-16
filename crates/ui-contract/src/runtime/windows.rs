@@ -11,6 +11,7 @@ use crate::runtime::overlay;
 use crate::runtime::pass_state;
 use craft_behavior::{Cursor, CursorIcon, CursorPriority};
 use craft_host::target::{Caps, EdgeInsets, Os, ShellInfo, WindowChrome, WindowKind};
+use craft_window::desktop::Desktop;
 use craft_window::native::NativeWindow;
 use craft_window::policy::{Captions, Decision, Frame, LayoutWatch};
 use craft_window::restore::Store;
@@ -18,7 +19,7 @@ use craft_window::system::WindowSystem;
 use egui::{Context, Id, Pos2, Rect, Vec2, ViewportId};
 use std::sync::{Arc, Mutex};
 
-pub use crate::runtime::egui::injected::Released;
+pub use crate::runtime::egui::injected::{InjectedPointer, Released};
 pub use crate::runtime::egui::screenshot::{ScreenshotError, ScreenshotFacts, ScreenshotSlot};
 
 mod hit;
@@ -51,7 +52,7 @@ use shell::{refresh, window_info};
 pub(crate) use shell::{set_chrome, set_os};
 use spec::chrome_of;
 pub use spec::{WindowLevel, WindowSpec};
-pub(crate) use viewport::{ViewportOpen, show_viewport, take_close_request};
+pub(crate) use viewport::{ViewportOpen, show_viewport, take_close_request, unplaced};
 
 /// Seconds between writes of a changed placement store.
 const FLUSH_SECONDS: f64 = 1.0;
@@ -63,6 +64,8 @@ pub(crate) struct Shared {
     #[cfg(feature = "testing")]
     sent: Vec<(ViewportId, WindowAction)>,
     shell: Option<ShellInfo>,
+    /// The app id from `InstallSpec::app_id`, which every OS window carries; empty when the app set none.
+    app_id: String,
     system: Option<Arc<dyn WindowSystem>>,
     store: Option<Arc<Mutex<Store>>>,
     /// The system pointer read in `set_input`.
@@ -81,6 +84,8 @@ pub(crate) struct Shared {
     /// The root window's frame and its caption layout watch, from `InstallSpec::frame`.
     root_frame: Option<Frame>,
     layouts: Option<LayoutWatch>,
+    /// The desktop the installed frame decision was made for (`Decision::desktop`); `None` without a decision.
+    desktop: Option<Desktop>,
     /// Whether the root window had focus in the last root pass.
     root_focused: bool,
     /// Whether no window of the app had focus when the last frame's windows had all reported.
@@ -179,8 +184,15 @@ pub(crate) fn app_moves(ctx: &Context, viewport: ViewportId) -> bool {
     PerViewport::<Record>::with(ctx, viewport, |record| record.app_drag)
 }
 
-/// Called by `install`: keeps the shell, the OS services and the placement store.
-pub(crate) fn install(ctx: &Context, shell: ShellInfo, system: Arc<dyn WindowSystem>, store: Option<Arc<Mutex<Store>>>, frame: Option<Decision>) {
+/// Called by `install`: keeps the shell, the app id, the OS services and the placement store.
+pub(crate) fn install(
+    ctx: &Context,
+    shell: ShellInfo,
+    system: Arc<dyn WindowSystem>,
+    store: Option<Arc<Mutex<Store>>>,
+    frame: Option<Decision>,
+    app_id: String,
+) {
     let layouts = frame.as_ref().map(LayoutWatch::new);
     let shell = match &frame {
         Some(decision) => {
@@ -191,8 +203,10 @@ pub(crate) fn install(ctx: &Context, shell: ShellInfo, system: Arc<dyn WindowSys
     };
     shared(ctx, |shared| {
         shared.shell = Some(shell);
+        shared.app_id = app_id;
         shared.system = Some(system);
         shared.store = store;
+        shared.desktop = frame.as_ref().map(|decision| decision.desktop.clone());
         shared.root_frame = frame.map(|decision| decision.frame);
         shared.layouts = layouts;
     });
@@ -263,12 +277,17 @@ pub(crate) fn input_hook(ctx: &Context, input: &mut RawInput) -> bool {
 }
 
 /// The begin hook (H5), where the viewport is current: refreshes its window info, and raises the modal's window
-/// when the input hook dropped a press under a modal in another viewport.
+/// when the input hook dropped a press under a modal in another viewport, or when this viewport gained focus while
+/// a modal in another viewport blocks it (the modal's window then comes forward with the window the user clicked).
 pub(crate) fn begin(ctx: &Context) {
     let viewport = pass::current_viewport(ctx);
-    refresh(ctx, viewport, viewports::current(ctx));
+    // A viewport's first pass has no previous facts and is not a focus gain.
+    let had_focus_before = PerViewport::<Record>::with(ctx, viewport, |record| record.facts.map(|facts| facts.focused));
+    let facts = viewports::current(ctx);
+    refresh(ctx, viewport, facts);
     reshow_cursor(ctx, viewport);
-    if overlay::take_dropped_press(ctx, viewport)
+    let gained_focus = facts.focused && had_focus_before == Some(false);
+    if (overlay::take_dropped_press(ctx, viewport) || gained_focus)
         && let Some(modal) = blocking_modal(ctx)
     {
         act(ctx, modal, WindowAction::Focus);

@@ -61,14 +61,35 @@ pub(super) struct Glide {
     pub(super) running: bool,
 }
 
-/// The offsets `scroll_input` moved scroll bodies to, with the frame that queued each, for step 4 of each body's next
-/// pass. An entry no body took in that frame or the next belongs to a body that is no longer shown: it is dropped.
+/// The offsets the update step moved scroll bodies to (`scroll_input`, a reveal), with the frame that queued each, for
+/// step 4 of each body's next pass. An entry no body took in that frame or the next belongs to a body that is no longer
+/// shown: it is dropped.
 #[derive(Default)]
 pub(crate) struct Jumps(pub(super) Vec<(Id, ScrollPos, u64)>);
 
 /// The frame a jump is queued and taken in: the root's, since one store serves the bodies of every viewport.
 pub(super) fn jump_frame(ctx: &Context) -> u64 {
     pass::root_frame_nr(ctx)
+}
+
+/// The offset the update step of this pass queued for the body `id`, if it queued one.
+pub(super) fn queued_jump(ctx: &Context, id: Id) -> Option<ScrollPos> {
+    pass_state::with::<Jumps, _>(ctx, |jumps| jumps.0.iter().find(|(owner, ..)| *owner == id).map(|(_, offset, _)| *offset))
+}
+
+/// Queues `offset` for step 4 of the body `id`'s next pass, in place of one queued before, and repeats the pass to show
+/// it.
+pub(super) fn queue_jump(ctx: &Context, id: Id, offset: ScrollPos) {
+    let frame = jump_frame(ctx);
+    pass_state::with::<Jumps, _>(ctx, |jumps| {
+        jumps.0.retain(|(owner, _, queued)| *owner != id && queued + 1 >= frame);
+        jumps.0.push((id, offset, frame));
+    });
+    // A bound offset reaches the app in the repeated pass.
+    sizing::request_discard(ctx, sizing::Rerun::HeldUpdate);
+    if !ctx.will_discard() {
+        repaint::request(ctx);
+    }
 }
 
 /// The room the scroll bars of `scroll` take from a view of `view` over content of `extent`: `bar` across the view
@@ -184,22 +205,20 @@ impl BodyHooks<'_> {
     /// Thumb drags, track presses and AccessKit scroll actions. They move the view at step 4 of the next pass, as the
     /// wheel does there, and that pass repeats this frame: the pass that paints an offset is the one whose step 4 set
     /// it, so the content laid out for the view (out-of-view children skip their run, `runtime::lazy`) is the content
-    /// shown. A pass that repeats a frame carries no input, and a press held since the frame's first pass adds nothing
-    /// there.
+    /// shown. Every input read here is the pass's own, and the strips step by the pass's elapsed time, so a pass that
+    /// repeats a frame moves nothing.
     pub(super) fn scroll_input<C: Container>(&self, props: &ContainerProps, cx: &mut Cx<'_, C>) {
         use crate::contract::Pointer as _;
         let Some(scroll) = scroll_of(props) else { return };
         let ctx = cx.core.ctx.clone();
-        if ctx.current_pass_index() > 0 {
-            return;
-        }
         let mut offset = self.offset;
         if let Some(range) = cx.scroll_moved(SCROLL_Y) {
             offset.y = range.start;
         }
-        // Resting the pointer on a strip scrolls toward it at a steady speed, frame by frame.
+        // Resting the pointer on a strip scrolls toward it at a steady speed.
         if self.last.view.is_some_and(|at| self.strips(scroll, rect_of(at)).is_some()) {
-            let step = f64::from(STRIP_ROWS_PER_SECOND * self.row * ctx.input(|input| input.stable_dt).clamp(0.0, 0.1));
+            let elapsed = crate::runtime::frame::facts(&ctx).elapsed.clamp(0.0, 0.1);
+            let step = f64::from(STRIP_ROWS_PER_SECOND * self.row) * elapsed;
             for (strip, toward) in [(STRIP_BACK, -1.0), (STRIP_FORWARD, 1.0)] {
                 if cx.core.results.get(&(strip, None)).is_some_and(|result| result.hovered) {
                     offset.y += toward * step;
@@ -213,17 +232,7 @@ impl BodyHooks<'_> {
         let view = self.last.view.map_or(Vec2::ZERO, |view| self.shown_view(scroll, rect_of(view)).size());
         let offset = self.clamped(scroll, view, offset);
         if offset != self.offset {
-            let id = cx.core.id;
-            let frame = jump_frame(&ctx);
-            pass_state::with::<Jumps, _>(&ctx, |jumps| {
-                jumps.0.retain(|(owner, _, queued)| *owner != id && queued + 1 >= frame);
-                jumps.0.push((id, offset, frame));
-            });
-            // A bound offset reaches the app in the repeated pass.
-            sizing::request_discard(&ctx, sizing::Rerun::HeldUpdate);
-            if !ctx.will_discard() {
-                repaint::request(&ctx);
-            }
+            queue_jump(&ctx, cx.core.id, offset);
         }
     }
 

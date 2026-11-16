@@ -163,6 +163,26 @@ impl<'a> StyleCx<'a> {
         }
     }
 
+    /// Runs `f` with the style context of the root scope (`Env::of_root(ctx)`), for code with no `Ui` that reads a
+    /// component's style, such as the dock's sizes outside a style pass.
+    pub fn with_root<R>(ctx: &Context, f: impl FnOnce(&StyleCx<'_>) -> R) -> R {
+        let env = crate::runtime::env::Env::of_root(ctx);
+        let cx = StyleCx::new(
+            ctx,
+            &env.tokens,
+            &env.values,
+            env.size,
+            Variant::SECONDARY,
+            env.direction,
+            env.scale,
+            env.os,
+            env.active,
+            env.key,
+            env.line_ratio,
+        );
+        f(&cx)
+    }
+
     /// The same context with another variant.
     #[doc(hidden)]
     pub fn with_variant(&self, variant: Variant) -> StyleCx<'a> {

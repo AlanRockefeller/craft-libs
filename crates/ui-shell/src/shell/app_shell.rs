@@ -25,6 +25,7 @@ use crate::runtime::focus::FocusPolicy;
 use crate::runtime::frame::{note_shell, take_chrome_toggles};
 use crate::runtime::overlay::{OpenFilter, any_open};
 use crate::runtime::pointer;
+use crate::runtime::windows::{WindowAction, WindowHost};
 use crate::shell::Slot;
 use crate::style::{ComponentStyle, StyleCx, SurfaceKind, UiTokens};
 use craft_behavior::{Metrics, Sense};
@@ -91,6 +92,9 @@ pub struct ShellRegion {
     #[container]
     props: ContainerProps,
     shell: Option<ShellCx>,
+    /// Whether the region senses a press on its own surface, where no child or part takes it (`Sense::SURFACE`).
+    #[prop(flag)]
+    senses_surface: bool,
 }
 
 impl ShellRegion {
@@ -99,7 +103,7 @@ impl ShellRegion {
     /// window's clear colour.
     pub fn window() -> Self {
         let props = ContainerProps::new().mount(Mount::window(Resize::GRIPS)).command_scope(ScreenModeCommands::SCOPE);
-        ShellRegion { common: Common::new(), props, shell: None }
+        ShellRegion { common: Common::new(), props, shell: None, senses_surface: false }
     }
 
     /// The content of a shell shown inside a region of another window: it fills its room, answers the screen-mode
@@ -107,19 +111,19 @@ impl ShellRegion {
     pub fn embedded() -> Self {
         let props =
             ContainerProps::new().sizing(crate::contract::Sizing::Fill).surface(SurfaceKind::Background).command_scope(ScreenModeCommands::SCOPE);
-        ShellRegion { common: Common::new(), props, shell: None }
+        ShellRegion { common: Common::new(), props, shell: None, senses_surface: false }
     }
 
     /// An inline region that fills its room and sets `shell` for everything inside it.
     pub fn scope(shell: ShellCx) -> Self {
         let props = ContainerProps::new().sizing(crate::contract::Sizing::Fill).command_scope(crate::runtime::commands::CommandScope::APP);
-        ShellRegion { common: Common::new(), props, shell: Some(shell) }
+        ShellRegion { common: Common::new(), props, shell: Some(shell), senses_surface: false }
     }
 
     /// A pane of the window; it fills the room its edge gives it.
     pub fn pane(pane: ShellPane) -> Self {
         let props = ContainerProps::new().mount(Mount::Pane(pane)).focus(FocusPolicy::PANE);
-        ShellRegion { common: Common::new(), props, shell: None }
+        ShellRegion { common: Common::new(), props, shell: None, senses_surface: false }
     }
 }
 
@@ -136,7 +140,7 @@ impl Component for ShellRegion {
     }
 
     fn sense(&self) -> Sense {
-        Sense::empty()
+        if self.senses_surface { Sense::SURFACE } else { Sense::empty() }
     }
 
     fn content_env(&self, _: &Cx<'_, Self>, values: &mut AppValues) {
@@ -281,6 +285,10 @@ pub struct AppShell<'a, S> {
     /// The host's flag for the document tabs, read back through `ShellCx::tabs_visible`.
     #[prop]
     document_tabs: bool,
+    /// The window's title: the shell sends `WindowAction::SetTitle` every pass and the window host drops a title equal
+    /// to the last one it set. Not in an embedded shell.
+    #[prop(into)]
+    window_title: Option<String>,
     /// The name of the body region; the translated "Document" without it.
     #[prop(into)]
     body_label: Option<Label>,
@@ -303,6 +311,7 @@ impl<'a, S> AppShell<'a, S> {
             allow_reveal: true,
             edge_reveal: true,
             document_tabs: true,
+            window_title: None,
             body_label: None,
             title: None,
             slots: Vec::new(),
@@ -348,10 +357,11 @@ impl<'a, S> AppShell<'a, S> {
         self
     }
 
-    /// The tool rail, a start slot keyed `"tools"` that reveals in body-only mode.
-    pub fn tools(mut self, visible: bool, add: impl FnMut(&mut Ui, &mut BodyCx<'_>, &mut S) + 'a) -> Self {
+    /// The tool rail, a slot keyed `"tools"` at `edge` (the reading start or end) that reveals in body-only mode. It
+    /// is the Tools region on either edge.
+    pub fn tools(mut self, edge: PaneEdge, visible: bool, add: impl FnMut(&mut Ui, &mut BodyCx<'_>, &mut S) + 'a) -> Self {
         let slot = Slot::new(keys::TOOLS).visible(visible).reveal();
-        self.slots.push(Placed { slot, edge: PaneEdge::Start, title: false, named: Some(|words| words.tools.clone()), add: Box::new(add) });
+        self.slots.push(Placed { slot, edge, title: false, named: Some(|words| words.tools.clone()), add: Box::new(add) });
         self
     }
 
@@ -410,12 +420,21 @@ impl<'a, S> AppShell<'a, S> {
             allow_reveal,
             edge_reveal,
             document_tabs,
+            window_title,
             body_label,
             title,
             slots,
             mut body,
         } = self;
         let embedded = embedded || content_room.is_some();
+        if let Some(title) = window_title
+            && !embedded
+            && !ui.is_sizing_pass()
+        {
+            // The window host skips a title equal to the one it last set for the viewport.
+            let ctx = ui.ctx();
+            WindowHost::of(ctx).act(pass::current_viewport(ctx), WindowAction::SetTitle(title));
+        }
         let env = Env::of(ui);
         let outer = env.get::<ShellEntry>().0;
         let words = env.words::<ShellWords>();

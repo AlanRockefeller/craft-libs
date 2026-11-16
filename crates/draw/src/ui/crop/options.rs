@@ -85,7 +85,7 @@ impl CropLength {
     }
 
     /// The length when it is positive, finite and at most [`FIELD_MAX`].
-    fn usable(length: Option<CropLength>) -> Option<CropLength> {
+    pub(super) fn usable(length: Option<CropLength>) -> Option<CropLength> {
         length.filter(|l| l.value.is_finite() && l.value > 0.0 && l.value <= FIELD_MAX)
     }
 
@@ -189,6 +189,8 @@ pub enum CropPresetChoice {
     User(usize),
     /// "Front Image": W, H and the resolution from the document, at once (never kept as a mode).
     FrontImage,
+    /// "From Selection": the frame from the document's selection.
+    Selection,
     /// "New Crop Preset…": the app opens its dialog.
     NewPreset,
     /// "Delete Crop Preset…": the app opens its dialog.
@@ -264,7 +266,7 @@ impl Default for CropSettings {
             delete_pixels: true,
             fill: CropFill::Background,
             guide: CropGuide::default(),
-            guide_show: GuideShow::default(),
+            guide_show: GuideShow::Always,
             guide_orientation: 0,
             shield: CropShield::default(),
         }
@@ -272,7 +274,7 @@ impl Default for CropSettings {
 }
 
 /// `value` with up to `decimals` decimals, trailing zeros and a bare point dropped.
-fn trim_number(value: f64, decimals: usize) -> String {
+pub(super) fn trim_number(value: f64, decimals: usize) -> String {
     let text = format!("{value:.decimals$}");
     if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_owned() } else { text }
 }
@@ -297,6 +299,12 @@ fn ratio_text(value: f64) -> String {
 }
 
 impl CropSettings {
+    /// Image mode (Classic Mode off): the gestures move and turn the image under an upright frame.
+    /// The one rule for the tool and the app's view handling.
+    pub fn image_mode(&self) -> bool {
+        !self.shield.classic_mode
+    }
+
     /// The width-to-height ratio every frame gesture holds: the document's for
     /// [`CropRatio::Original`], the sides' for [`CropRatio::Sides`], W : H of the
     /// [`target`](Self::target) for [`CropRatio::Size`]; `None` for a free ratio and for any
@@ -320,19 +328,11 @@ impl CropSettings {
     /// convert at the typed resolution, else at the document's; points and picas at the
     /// the environment's points per inch (`units`). A bare number is in pixels.
     pub fn target(&self, document: &CropDocument, units: &Units) -> Option<CropTarget> {
-        // pc: crates/ui-egui/src/tools/crop_size.rs:131 `target`, :122 `resolution_ppi` (px/cm × 2.54),
-        // :71 `parse_length` (positive, at most 1e9, no percent, ',' read as '.').
         if self.ratio != CropRatio::Size {
             return None;
         }
-        let resolution = self.size.resolution_ppi();
-        let dpi = resolution.unwrap_or(document.resolution);
-        let pixels = |length: Option<CropLength>| {
-            let length = CropLength::usable(length)?;
-            let px = length.unit.to_pixels(length.value, 0.0, dpi, units.points_per_inch())?;
-            (px.is_finite() && px > 0.0).then_some(px)
-        };
-        Some(CropTarget { width: pixels(self.size.width)?, height: pixels(self.size.height)?, resolution })
+        let target = self.size.target(document, units);
+        Some(CropTarget { width: target.width?, height: target.height?, resolution: target.resolution })
     }
 
     /// Applies a pick from the preset list: Free clears the ratio fields; Size turns W × H ×
@@ -346,7 +346,8 @@ impl CropSettings {
         // crop_presets.rs:180 `apply_choice`.
         let before = self.clone();
         match choice {
-            CropPresetChoice::Free => {
+            // The frame from the selection is the tool's (`CropTool::take_selection_frame`); the ratio is free.
+            CropPresetChoice::Free | CropPresetChoice::Selection => {
                 self.ratio = CropRatio::Free;
                 self.ratio_fields = [0.0, 0.0];
             }
@@ -416,9 +417,7 @@ impl CropSettings {
     pub fn clear(&mut self) {
         // pc: crates/ui-egui/src/tools/crop_size.rs:230 `clear_ratio`.
         if self.ratio == CropRatio::Size {
-            self.size.width = None;
-            self.size.height = None;
-            self.size.resolution.clear();
+            self.size.clear_size();
         } else {
             self.ratio = CropRatio::Free;
             self.ratio_fields = [0.0, 0.0];
@@ -455,7 +454,7 @@ impl CropSettings {
         // pc: crates/ui-egui/src/tools/crop_size.rs:249 `swap_fields`; panels/options_bar.rs:483 (the
         // ratio pair).
         if self.ratio == CropRatio::Size {
-            std::mem::swap(&mut self.size.width, &mut self.size.height);
+            self.size.swap();
             return;
         }
         // Ratio fields: Original has none of its own (the document's size is swapped by `swap`).
@@ -468,15 +467,8 @@ impl CropSettings {
     /// Front Image (the list entry and the I key): W × H × Resolution with W and H the document's
     /// size in px and the resolution the document's in the field's unit.
     pub fn front_image(&mut self, document: &CropDocument) {
-        // pc: crates/ui-egui/src/tools/crop_size.rs:211 `front_image`.
         self.ratio = CropRatio::Size;
-        self.size.width = Some(CropLength::new(document.size.width, UnitKind::Pixels));
-        self.size.height = Some(CropLength::new(document.size.height, UnitKind::Pixels));
-        let resolution = match self.size.resolution_unit {
-            ResolutionUnit::PixelsPerInch => document.resolution,
-            ResolutionUnit::PixelsPerCentimetre => document.resolution / 2.54,
-        };
-        self.size.resolution = trim_number(resolution, 2);
+        self.size.front_image(document, None);
     }
 
     /// Sets one ratio field as typed or scrubbed (`side` 0 is the width), keeping the other: a
