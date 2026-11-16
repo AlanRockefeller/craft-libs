@@ -4,7 +4,7 @@
 //! the squares fit a room of any size; the trials below read that of both presentations.
 
 use craft_behavior::Anchor9;
-use craft_ui::contract::{Bind, Props as _, Show as _};
+use craft_ui::contract::{Bind, Show as _};
 use craft_ui::pickers::{PointPresentation, ReferencePoint};
 use craft_ui::testing::Fixture;
 use craft_ui::testing::focus::AccessActionKind;
