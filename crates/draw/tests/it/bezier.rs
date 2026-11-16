@@ -3,10 +3,10 @@
 use craft_behavior::kurbo::{ParamCurve as _, Point, Size, Vec2};
 use craft_behavior::{CanvasView, EditEvent};
 use craft_draw::ui::{
-    AnchorDelete, AnchorsShown, BezierHit, BezierOverlay, BezierTool, EditPath, EditSubpath, HandleSide, HandlesShown, Knot, KnotRef, PathEdit,
-    PathSelection, SegmentMark,
+    AnchorDelete, AnchorTool, AnchorsShown, BezierHit, BezierOverlay, BezierTool, EditPath, EditSubpath, HandleSide, HandlesShown, Knot, KnotRef,
+    PathEdit, PathSelection, PathTool, SegmentMark,
 };
-use craft_ui::canvas::{Canvas, Guide};
+use craft_ui::canvas::{Canvas, Guide, ToolHost};
 use craft_ui::canvas_controls::Guides;
 use craft_ui::contract::{Bind, Props as _, Show as _, ShowContainer as _};
 use craft_ui::testing::{Fixture, pointer, trial};
@@ -159,6 +159,8 @@ struct State {
     flip: bool,
     /// The canvas shows a document and keeps the view it reports, so page keys move it.
     pans: bool,
+    /// The canvas's precise cursors (Preferences > Cursors > Other Cursors).
+    precise: bool,
     view: Option<CanvasView>,
     id: Id,
     seen: Vec<Seen>,
@@ -170,6 +172,10 @@ struct State {
     lone_selects: usize,
     /// Presses the overlay left to the canvas's tool.
     tool_clicks: usize,
+    /// The anchor tool the canvas runs under the overlay, if any.
+    canvas_tool: Option<PathTool>,
+    /// Passes in which that tool ran a gesture.
+    tool_gestures: usize,
 }
 
 struct Harness {
@@ -222,6 +228,7 @@ fn harness_with(paths: Vec<EditPath>, pans: bool) -> Harness {
         rotation: 0.0,
         flip: false,
         pans,
+        precise: false,
         view: None,
         id: Id::NULL,
         seen: Vec::new(),
@@ -231,6 +238,8 @@ fn harness_with(paths: Vec<EditPath>, pans: bool) -> Harness {
         hover: None,
         lone_selects: 0,
         tool_clicks: 0,
+        canvas_tool: None,
+        tool_gestures: 0,
     }));
     let shown = Rc::clone(&state);
     let mut fixture = Fixture::new(move |ui| {
@@ -248,8 +257,8 @@ fn harness_with(paths: Vec<EditPath>, pans: bool) -> Harness {
         };
         st.view = Some(view);
         let selection = st.selection.clone();
-        let canvas_id = ui.id().with("document canvas");
-        let canvas = Canvas::new("Document").id(canvas_id).view(view);
+        let canvas_id = ui.scope_id().with("document canvas");
+        let canvas = Canvas::new("Document").id(canvas_id).view(view).precise_cursors(st.precise);
         let canvas = if st.pans { canvas.document(Size::new(4000.0, 4000.0)) } else { canvas };
         let canvas = canvas.show(ui, |ui, body| {
             // The guides lie under the paths: a stack position hides the levels of the ones below it.
@@ -265,6 +274,10 @@ fn harness_with(paths: Vec<EditPath>, pans: bool) -> Harness {
         });
         if canvas.output.click_at().is_some() {
             st.tool_clicks += 1;
+        }
+        if let Some(tool) = st.canvas_tool {
+            let reply = ToolHost::new().run(ui, &canvas.output, &mut AnchorTool::new(tool));
+            st.tool_gestures += usize::from(reply.gesture.is_some());
         }
         if st.pans {
             st.view = canvas.output.view.or(st.view);
@@ -550,4 +563,237 @@ fn insert_on_a_picked_anchor_adds_one_halfway_along_the_segment_leaving_it() {
     // End picks the last anchor of path 2's open line: no segment leaves it.
     h.fixture.key(egui::Key::End, egui::Modifiers::NONE).key(egui::Key::Insert, egui::Modifiers::NONE).settle();
     assert_eq!(h.state.borrow().inserts.len(), 1, "nothing to insert after the last anchor of an open subpath");
+}
+
+// ⇧ during an anchor drag: a 5:12 move stays on the horizontal, also with the f32 noise of the screen mapping, a 12:5
+// one on the vertical, a 45° move goes on the diagonal; the drag proposes what it commits (#13684).
+#[trial]
+fn shift_keeps_an_anchor_drag_on_the_axis_or_the_diagonal() {
+    let cases =
+        [((60.0, -25.0), p(220.0, 60.0)), ((60.0, -25.00005), p(220.0, 60.0)), ((25.0, 60.0), p(160.0, 120.0)), ((50.0, -50.0), p(210.0, 10.0))];
+    for ((dx, dy), want) in cases {
+        let mut h = two_paths();
+        let anchor = h.screen(p(160.0, 60.0));
+        let to = anchor + vec2(dx, dy);
+        h.press_at(anchor);
+        // ⇧ at the press would add the anchor to the selection: it comes once the drag is under way.
+        h.move_to(anchor + vec2(dx, dy) * 0.5);
+        h.fixture.hold(egui::Modifiers::SHIFT);
+        h.move_to(to);
+        let Some(PathEdit::MoveAnchors { by, .. }) = h.last_change() else { panic!("an anchor move: {:?}", h.last_change()) };
+        let proposed = p(160.0, 60.0) + by;
+        h.release_at(to);
+        h.fixture.hold(egui::Modifiers::NONE);
+        let st = h.state.borrow();
+        let committed = st.paths[0].subpaths[0].knots[1].anchor;
+        assert!(proposed.distance(want) < 1e-3, "({dx}, {dy}) proposes {proposed:?}, wants {want:?}");
+        assert!(committed.distance(proposed) < 1e-9, "({dx}, {dy}) commits {committed:?}, proposed {proposed:?}");
+        assert_eq!(st.seen.last(), Some(&Seen::Commit));
+    }
+}
+
+// Delete Anchor with only some subpaths' anchors shown (#12769): a click on a hidden anchor deletes nothing and
+// edits nothing, selects that anchor and shows only its subpath; the next click on it deletes it.
+#[trial]
+fn a_delete_anchor_click_on_a_hidden_anchor_shows_its_subpath_and_deletes_nothing() {
+    let mut h = harness(vec![path_b()]);
+    h.update(|st| (st.tool, st.selection) = (BezierTool::DeleteAnchor, PathSelection::new(Some(2), Vec::new(), None).shown(Some(vec![0]))));
+    let hidden = h.screen(p(200.0, 220.0));
+    h.press_at(hidden);
+    h.release_at(hidden);
+    {
+        let st = h.state.borrow();
+        assert!(st.deletes.is_empty() && st.changes.is_empty() && st.seen.is_empty(), "{:?} {:?} {:?}", st.deletes, st.changes, st.seen);
+        assert_eq!(st.selection, sel(2, &[(1, 0)]).shown(Some(vec![1])));
+    }
+    h.press_at(hidden);
+    h.release_at(hidden);
+    assert_eq!(h.state.borrow().deletes, [AnchorDelete::new(2, vec![KnotRef::new(1, 0)], false)]);
+}
+
+// The keyboard reaches only the anchors shown: with the square hidden, Home picks the line's first anchor, and the
+// selection keeps showing only the line.
+#[trial]
+fn hidden_anchors_take_no_keyboard_stop() {
+    let mut h = harness(vec![path_b()]);
+    h.update(|st| st.selection = PathSelection::new(Some(2), Vec::new(), None).shown(Some(vec![1])));
+    h.fixture
+        .key(egui::Key::Tab, egui::Modifiers::NONE)
+        .key(egui::Key::Tab, egui::Modifiers::NONE)
+        .key(egui::Key::Home, egui::Modifiers::NONE)
+        .settle();
+    assert_eq!(h.state.borrow().selection, sel(2, &[(1, 0)]).shown(Some(vec![1])));
+}
+
+// After the host deleted an anchor of a Delete Anchor click: the anchor that followed is selected with only its
+// subpath shown, the first of a closed subpath after its last, none after an open subpath's last; when the delete
+// removed a subpath nothing is selected and every subpath shows.
+#[trial]
+fn after_a_delete_the_following_anchor_is_selected_and_its_subpath_shown() {
+    let deleted = |subpath: usize, knot: usize| {
+        let mut path = path_b();
+        assert!(path.subpaths[subpath].remove_knot(knot));
+        PathSelection::after_delete(&path, KnotRef::new(subpath, knot), 2)
+    };
+    assert_eq!(deleted(0, 1), sel(2, &[(0, 1)]).shown(Some(vec![0])));
+    assert_eq!(deleted(0, 3), sel(2, &[(0, 0)]).shown(Some(vec![0])), "a closed subpath wraps to its first anchor");
+    assert_eq!(deleted(1, 1), sel(2, &[]).shown(Some(vec![1])), "nothing follows an open subpath's last anchor");
+    let mut path = path_b();
+    path.subpaths.remove(1);
+    assert_eq!(PathSelection::after_delete(&path, KnotRef::new(1, 0), 2), sel(2, &[]));
+}
+
+// Direct Selection's ⌥ drag on a segment drags a copy of its subpath (#13756): the copy goes last, moved by the drag,
+// the source stays, and the copy ends selected, its anchors shown beside those already shown. ⇧ during the drag takes
+// the anchor ⇧ rule. A ⌥ click selects the subpath and edits nothing; on a path that takes no copies the drag moves
+// the subpath.
+#[trial]
+fn an_alt_drag_on_a_segment_drags_a_copy_of_its_subpath() {
+    let on_square = |h: &Harness| h.screen(p(100.0, 200.0));
+    let square = || path_b().subpaths[0].clone();
+
+    let mut h = harness(vec![path_b()]);
+    h.update(|st| st.selection = PathSelection::new(Some(2), Vec::new(), None).shown(Some(vec![1])));
+    let on = on_square(&h);
+    h.fixture.hold(egui::Modifiers::ALT);
+    h.drag(on, vec2(0.0, 80.0));
+    h.fixture.hold(egui::Modifiers::NONE);
+    {
+        let st = h.state.borrow();
+        assert!(matches!(st.changes.last(), Some(PathEdit::DuplicateSubpath { path: 2, subpath: 0, .. })), "{:?}", st.changes);
+        let subpaths = &st.paths[0].subpaths;
+        assert_eq!(subpaths.len(), 3);
+        assert_eq!(subpaths[..2], path_b().subpaths[..], "the source stays");
+        let moved =
+            subpaths[2].knots.iter().zip(&square().knots).all(|(copy, source)| copy.anchor.distance(source.anchor + Vec2::new(0.0, 80.0)) < 1e-3);
+        assert!(moved && subpaths[2].closed, "{:?}", subpaths[2]);
+        assert_eq!(st.selection, sel(2, &[(2, 0), (2, 1), (2, 2), (2, 3)]).shown(Some(vec![1, 0, 2])));
+        assert_eq!((st.seen.first(), st.seen.last()), (Some(&Seen::Begin), Some(&Seen::Commit)), "{:?}", st.seen);
+    }
+
+    // ⇧ once the drag is under way: a 5:12 move stays on the horizontal.
+    let mut h = harness(vec![path_b()]);
+    let on = on_square(&h);
+    h.fixture.hold(egui::Modifiers::ALT);
+    h.press_at(on);
+    h.move_to(on + vec2(30.0, -12.5));
+    h.fixture.hold(egui::Modifiers::ALT | egui::Modifiers::SHIFT);
+    h.move_to(on + vec2(60.0, -25.0));
+    h.release_at(on + vec2(60.0, -25.0));
+    h.fixture.hold(egui::Modifiers::NONE);
+    let first = h.state.borrow().paths[0].subpaths[2].knots[0].anchor;
+    assert!(first.distance(p(120.0, 200.0)) < 1e-3, "{first:?}");
+
+    // A ⌥ click selects the subpath.
+    let mut h = harness(vec![path_b()]);
+    let on = on_square(&h);
+    h.fixture.hold(egui::Modifiers::ALT);
+    h.press_at(on);
+    h.release_at(on);
+    h.fixture.hold(egui::Modifiers::NONE);
+    {
+        let st = h.state.borrow();
+        assert_eq!(st.selection, sel(2, &[(0, 0), (0, 1), (0, 2), (0, 3)]));
+        assert!(st.changes.is_empty() && st.seen.is_empty(), "{:?} {:?}", st.changes, st.seen);
+        assert_eq!(st.paths, [path_b()]);
+    }
+
+    // A path that takes no copies: the subpath moves.
+    let mut h = harness(vec![path_b().copies(false)]);
+    let on = on_square(&h);
+    h.fixture.hold(egui::Modifiers::ALT);
+    h.drag(on, vec2(0.0, 80.0));
+    h.fixture.hold(egui::Modifiers::NONE);
+    let st = h.state.borrow();
+    assert!(matches!(st.changes.last(), Some(PathEdit::MoveAnchors { path: 2, anchors, .. }) if anchors.len() == 4), "{:?}", st.changes);
+    assert_eq!(st.paths[0].subpaths.len(), 2);
+}
+
+// Add Anchor's cursor says what a click does (#13292): the pen with "+" over a segment a click splits, the arrow over
+// an anchor; under ⌘ the cursor is the host tool's; the canvas's precise cursor makes it the crosshair.
+#[trial]
+fn add_anchor_shows_the_pen_with_plus_over_a_segment_and_the_arrow_over_an_anchor() {
+    use craft_behavior::{Cursor, CursorBadge, PaintedCursor};
+    let cursor_at = |h: &mut Harness, at: Point, mods: egui::Modifiers| {
+        let at = h.screen(at);
+        h.fixture.hold(mods);
+        h.fixture.frame(vec![pointer::moved(at)]);
+        h.fixture.frame(Vec::new());
+        h.fixture.hold(egui::Modifiers::NONE);
+        craft_ui::runtime::cursor::current(h.fixture.ctx())
+    };
+    let pen_plus = |cursor: &Option<Cursor>| matches!(cursor, Some(Cursor::Painted(PaintedCursor::Tool { badge: Some(CursorBadge::Add), .. })));
+    let (segment, anchor) = (p(110.0, 60.0), p(160.0, 60.0));
+
+    let mut h = two_paths();
+    h.update(|st| st.tool = BezierTool::AddAnchor);
+    let over_segment = cursor_at(&mut h, segment, egui::Modifiers::NONE);
+    assert!(pen_plus(&over_segment), "{over_segment:?}");
+    assert_eq!(cursor_at(&mut h, anchor, egui::Modifiers::NONE), Some(Cursor::Painted(PaintedCursor::arrow(false))));
+    let with_cmd = cursor_at(&mut h, segment, egui::Modifiers::COMMAND);
+    assert!(!pen_plus(&with_cmd), "{with_cmd:?}");
+
+    h.update(|st| st.precise = true);
+    for at in [segment, anchor] {
+        assert_eq!(cursor_at(&mut h, at, egui::Modifiers::NONE), Some(Cursor::Painted(PaintedCursor::Crosshair)), "{at:?}");
+    }
+}
+
+// The anchor tools' canvas tool: a press off the paths begins nothing (it never starts a path), and off the paths the
+// cursor says what a click does: the arrow for Add Anchor (the pen with "-" under ⌥, where a click deletes), the pen
+// with "-" for Delete Anchor, the Convert Point icon, the arrow for Direct Selection and under ⌘, the crosshair when
+// the canvas's cursor is precise.
+#[trial]
+fn the_anchor_tools_take_no_press_off_the_paths_and_show_their_own_cursor() {
+    use craft_behavior::{Cursor, CursorBadge, PaintedCursor};
+    let empty = p(320.0, 250.0);
+    let cursor_at = |h: &mut Harness, mods: egui::Modifiers| {
+        let at = h.screen(empty);
+        h.fixture.hold(mods);
+        h.fixture.frame(vec![pointer::moved(at)]);
+        h.fixture.frame(Vec::new());
+        h.fixture.hold(egui::Modifiers::NONE);
+        craft_ui::runtime::cursor::current(h.fixture.ctx())
+    };
+    let pen = |badge: CursorBadge, cursor: &Option<Cursor>| matches!(cursor, Some(Cursor::Painted(PaintedCursor::Tool { badge: b, .. })) if *b == Some(badge));
+    let arrow = Some(Cursor::Painted(PaintedCursor::arrow(false)));
+
+    let mut h = two_paths();
+    h.update(|st| {
+        st.tool = BezierTool::AddAnchor;
+        st.canvas_tool = Some(PathTool::AddAnchor);
+    });
+    let before = h.state.borrow().paths.clone();
+    let at = h.screen(empty);
+    h.press_at(at);
+    h.fixture.frame(vec![pointer::release(at)]);
+    h.fixture.settle();
+    assert_eq!(h.state.borrow().tool_gestures, 0, "a press off the paths begins no gesture");
+    assert_eq!(h.state.borrow().paths, before);
+
+    assert_eq!(cursor_at(&mut h, egui::Modifiers::NONE), arrow);
+    let with_alt = cursor_at(&mut h, egui::Modifiers::ALT);
+    assert!(pen(CursorBadge::Subtract, &with_alt), "{with_alt:?}");
+    assert_eq!(cursor_at(&mut h, egui::Modifiers::COMMAND), arrow);
+
+    h.update(|st| {
+        st.tool = BezierTool::DeleteAnchor;
+        st.canvas_tool = Some(PathTool::DeleteAnchor);
+    });
+    let delete = cursor_at(&mut h, egui::Modifiers::NONE);
+    assert!(pen(CursorBadge::Subtract, &delete), "{delete:?}");
+
+    h.update(|st| {
+        st.tool = BezierTool::Convert;
+        st.canvas_tool = Some(PathTool::ConvertPoint);
+    });
+    let convert = cursor_at(&mut h, egui::Modifiers::NONE);
+    assert!(matches!(convert, Some(Cursor::Painted(PaintedCursor::Tool { badge: None, .. }))), "{convert:?}");
+
+    h.update(|st| {
+        st.tool = BezierTool::AddAnchor;
+        st.canvas_tool = Some(PathTool::AddAnchor);
+        st.precise = true;
+    });
+    assert_eq!(cursor_at(&mut h, egui::Modifiers::NONE), Some(Cursor::Painted(PaintedCursor::Crosshair)));
 }

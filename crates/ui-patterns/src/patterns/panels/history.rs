@@ -32,6 +32,7 @@ const THUMB_POINTS: f32 = 32.0;
 
 /// What a history row stands for: a named snapshot or a state of the undo stack, by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HistoryKey {
     /// The snapshot with this number.
     Snapshot(u64),
@@ -85,6 +86,7 @@ impl HistoryRow {
 
 /// Which buttons the history footer shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HistoryFooter {
     /// The Delete button.
     pub delete: bool,
@@ -92,6 +94,26 @@ pub struct HistoryFooter {
     pub new_snapshot: bool,
     /// The New Document button.
     pub new_document: bool,
+}
+
+impl HistoryFooter {
+    /// This footer with the Delete button shown when `shown`.
+    pub const fn delete(mut self, shown: bool) -> Self {
+        self.delete = shown;
+        self
+    }
+
+    /// This footer with the New Snapshot button shown when `shown`.
+    pub const fn new_snapshot(mut self, shown: bool) -> Self {
+        self.new_snapshot = shown;
+        self
+    }
+
+    /// This footer with the New Document button shown when `shown`.
+    pub const fn new_document(mut self, shown: bool) -> Self {
+        self.new_document = shown;
+        self
+    }
 }
 
 /// What the user did in the history panel.
@@ -103,6 +125,7 @@ pub enum HistoryEvent {
     /// The user set the row as the source of the history brush.
     SetSource(HistoryKey),
     /// The user renamed a snapshot.
+    #[non_exhaustive]
     Rename {
         /// The snapshot's number.
         snapshot: u64,
@@ -112,6 +135,7 @@ pub enum HistoryEvent {
     /// The user deleted the row, or the picked one when `None`.
     Delete(Option<HistoryKey>),
     /// The user asked for a new snapshot; `mods` were held.
+    #[non_exhaustive]
     NewSnapshot {
         /// The modifiers held with the press.
         mods: Mods,
@@ -120,7 +144,20 @@ pub enum HistoryEvent {
     NewDocument,
 }
 
+impl HistoryEvent {
+    /// Renames snapshot `snapshot` to `text`.
+    pub fn rename(snapshot: u64, text: impl Into<String>) -> Self {
+        HistoryEvent::Rename { snapshot, text: text.into() }
+    }
+
+    /// Asks for a new snapshot with `mods` held.
+    pub const fn new_snapshot(mods: Mods) -> Self {
+        HistoryEvent::NewSnapshot { mods }
+    }
+}
+
 /// What [`HistoryPanel`] reports.
+#[non_exhaustive]
 pub struct HistoryPanelOutput {
     /// The panel's response.
     pub response: Response,
@@ -137,6 +174,9 @@ impl Outcome for HistoryPanelOutput {
 }
 
 /// The row a context menu was asked for; it lives in the panel's stack memory while the menu is open.
+/// Whether a row may be deleted.
+type DeletePredicate<'a> = Box<dyn Fn(&HistoryKey) -> bool + 'a>;
+
 #[derive(Clone, Copy, Default)]
 struct MenuTarget(Option<HistoryKey>);
 
@@ -157,7 +197,7 @@ pub struct HistoryPanel<'a> {
     source: Option<HistoryKey>,
     has_source: bool,
     thumbs: Option<(&'a Thumbnails<u64>, &'a dyn ThumbSource<u64>)>,
-    can_delete: Option<Box<dyn Fn(&HistoryKey) -> bool + 'a>>,
+    can_delete: Option<DeletePredicate<'a>>,
     footer: HistoryFooter,
     reveal: Option<HistoryKey>,
     rename: Option<u64>,
@@ -182,7 +222,6 @@ impl<'a> HistoryPanel<'a> {
     }
 
     /// Shows the source column and marks the row that is the source of the history brush.
-    #[must_use]
     pub fn source(mut self, source: Option<HistoryKey>) -> Self {
         self.source = source;
         self.has_source = true;
@@ -190,42 +229,36 @@ impl<'a> HistoryPanel<'a> {
     }
 
     /// Shows the pictures of the snapshot rows from `source`.
-    #[must_use]
     pub fn thumbnails(mut self, thumbnails: &'a Thumbnails<u64>, source: &'a dyn ThumbSource<u64>) -> Self {
         self.thumbs = Some((thumbnails, source));
         self
     }
 
     /// Which rows the Delete button and key take; the others refuse. Without it every row is taken.
-    #[must_use]
     pub fn can_delete(mut self, can: impl Fn(&HistoryKey) -> bool + 'a) -> Self {
         self.can_delete = Some(Box::new(can));
         self
     }
 
     /// Which footer buttons show.
-    #[must_use]
     pub fn footer(mut self, footer: HistoryFooter) -> Self {
         self.footer = footer;
         self
     }
 
     /// Scrolls to `key` and shows it.
-    #[must_use]
     pub fn reveal(mut self, key: HistoryKey) -> Self {
         self.reveal = Some(key);
         self
     }
 
     /// Opens the rename field of the snapshot `snapshot`.
-    #[must_use]
     pub fn start_rename(mut self, snapshot: u64) -> Self {
         self.rename = Some(snapshot);
         self
     }
 
     /// Whether the panel takes input.
-    #[must_use]
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self

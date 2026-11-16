@@ -387,7 +387,6 @@ pub struct ToolHost<'m> {
     command_stand_in: Option<&'m mut (dyn CanvasTool + 'm)>,
     alt_stand_in: Option<&'m mut (dyn CanvasTool + 'm)>,
     smart_guide_color: Option<DataColor>,
-    precise_cursors: bool,
 }
 
 impl<'m> ToolHost<'m> {
@@ -433,17 +432,10 @@ impl<'m> ToolHost<'m> {
         self
     }
 
-    /// Preferences > Cursors > Other Cursors (Precise); reaches [`ToolContext::precise`].
-    #[must_use]
-    pub fn precise_cursors(mut self, on: bool) -> Self {
-        self.precise_cursors = on;
-        self
-    }
-
     /// Delivers the pass's pointer and key events to `tool`, paints it over the canvas, and paints the readout it
     /// asked for beside the pointer.
     pub fn run(self, ui: &Ui, canvas: &CanvasOutput, tool: &mut dyn CanvasTool) -> ToolHostResponse {
-        let ToolHost { disabled, mut momentary, mut command_stand_in, mut alt_stand_in, smart_guide_color, precise_cursors } = self;
+        let ToolHost { disabled, mut momentary, mut command_stand_in, mut alt_stand_in, smart_guide_color } = self;
         let ctx = ui.ctx().clone();
         let env = Env::of(ui);
         let key = state_id(canvas.response.id);
@@ -512,7 +504,6 @@ impl<'m> ToolHost<'m> {
             lent: None,
             stand_ins: momentary_tool.is_none(),
             momentary: momentary_tool,
-            precise: precise_cursors,
             space,
             slop: input.slop,
             down: &down,
@@ -579,7 +570,7 @@ impl<'m> ToolHost<'m> {
         let current = state.gesture.map(|active| active.last).or_else(|| over.then(|| hover_pointer(&input, canvas.press)).flatten());
         // The tool of hover, cursor, paint and claims: the one the running gesture latched, else the stand-in lent for
         // the held key, else the momentary tool in effect, else the selected tool.
-        let pass: &dyn CanvasTool = run_as(momentary.as_deref_mut(), momentary_tool, &mut *tool);
+        let pass: &dyn CanvasTool = run_as(momentary, momentary_tool, &mut *tool);
         let effective: &dyn CanvasTool = match state.gesture.map_or(lent, |active| active.stand_in) {
             Some(StandInKey::Command) => command_stand_in.as_deref().unwrap_or(pass),
             Some(StandInKey::Alt) => alt_stand_in.as_deref().unwrap_or(pass),
@@ -593,7 +584,6 @@ impl<'m> ToolHost<'m> {
                 .slop(input.slop)
                 .down(&down)
                 .caps_lock(caps)
-                .precise_cursors(precise_cursors)
                 .gesture(state.gesture.map(|active| active.id))
                 .env(&env);
             match canvas.snap.as_ref() {
@@ -657,10 +647,10 @@ impl<'m> ToolHost<'m> {
         let host = WindowHost::of(ctx);
         match input {
             ToolInput::Down { button, pos, sample, mods } => {
-                host.inject_pointer(viewport, InjectedPointer::Down { button, at: pos, mods, pen: sample });
+                host.inject_pointer(viewport, InjectedPointer::down(button, pos, mods, sample));
             }
-            ToolInput::Move { pos, sample, mods } => host.inject_pointer(viewport, InjectedPointer::Move { at: pos, mods, pen: sample }),
-            ToolInput::Up { pos, mods } => host.inject_pointer(viewport, InjectedPointer::Up { at: pos, mods }),
+            ToolInput::Move { pos, sample, mods } => host.inject_pointer(viewport, InjectedPointer::move_to(pos, mods, sample)),
+            ToolInput::Up { pos, mods } => host.inject_pointer(viewport, InjectedPointer::up(pos, mods)),
             ToolInput::Hold { key } => host.inject_hold(viewport, key),
             ToolInput::LetGo { key } => host.inject_let_go(viewport, key),
         }
@@ -720,7 +710,7 @@ impl<'m> ToolHost<'m> {
     /// controls' own gesture records in the viewport the canvas last ran in; false before the canvas's first pass.
     pub fn controls_pressing(ctx: &Context, canvas: Id) -> bool {
         let viewport = with_session(ctx, state_id(canvas), |state: &mut HostState| state.viewport);
-        crate::runtime::edit::member_gesture_running(ctx, viewport, canvas)
+        crate::primitives::member_gesture_running(ctx, viewport, canvas)
     }
 
     /// The canvas space the host of `canvas` used in its last pass, `None` before its first.
@@ -910,8 +900,6 @@ struct Run<'a, 't> {
     stand_ins: bool,
     /// The momentary tool in effect in the pass.
     momentary: Option<MomentaryTool>,
-    /// Preferences > Cursors > Other Cursors is Precise.
-    precise: bool,
 }
 
 impl<'a, 't: 'a> Run<'a, 't> {
@@ -923,7 +911,6 @@ impl<'a, 't: 'a> Run<'a, 't> {
             .slop(self.slop)
             .down(self.down)
             .caps_lock(self.caps)
-            .precise_cursors(self.precise)
             .gesture(self.state.gesture.map(|active| active.id).or(self.ending));
         let cx = cx.env(self.env);
         match self.snap {
@@ -1113,7 +1100,7 @@ impl<'a, 't: 'a> Run<'a, 't> {
             pass.events[from..]
                 .iter()
                 .filter_map(|event| match event {
-                    PointerEvent::Moved { at, sample } => Some((*at, *sample)),
+                    PointerEvent::Moved { at, sample, .. } => Some((*at, *sample)),
                     _ => None,
                 })
                 .collect()
@@ -1272,7 +1259,9 @@ impl<'a, 't: 'a> Run<'a, 't> {
 
     /// The keys the canvas holds: intents routed to it while it has focus, the arrows, Enter and Escape while nothing
     /// in the window has focus, and the chords the tool claimed at the end of the last pass. A session control in the
-    /// canvas body (`KeyUse::session`) has taken the arrows, Enter and Escape it acts on before this runs.
+    /// canvas body (`KeyUse::session`) has taken the arrows, Enter and Escape it acts on before this runs. The Escape
+    /// of the focused canvas reaches the tool once, through the window's intents (`with_window_intents` offers the
+    /// focused document canvas's Escape); one the tool leaves stays the canvas's, for the scopes around it.
     fn keys(&mut self, ctx: &Context, canvas: Id, rtl: bool) {
         keys::with_window_intents(ctx, rtl, |window| {
             let mut taken = self.offer(window, |intents| intents.take_nudge().map(|(direction, mods)| ToolKey::Nudge { direction, mods }));
@@ -1295,9 +1284,6 @@ impl<'a, 't: 'a> Run<'a, 't> {
             });
         }
         taken |= self.offer(&mut intents, |intents| intents.take(Intent::Submit).then_some(ToolKey::Submit));
-        if !self.cancelled {
-            taken |= self.offer(&mut intents, |intents| intents.take(Intent::Cancel).then_some(ToolKey::Cancel));
-        }
         if taken {
             keys::settle(ctx, Some(canvas), &intents);
         }
@@ -1321,11 +1307,6 @@ impl<'a, 't: 'a> Run<'a, 't> {
             if self.call(None, |tool, cx| tool.key(&kept, cx)) {
                 self.response.took_key = Some(kept);
             }
-        }
-        // An Escape the focused canvas's sessions and tool were offered and left is the window's, as it is with
-        // nothing focused.
-        if !self.cancelled {
-            keys::leave_to_window(ctx, canvas, |intent| *intent == Intent::Cancel);
         }
     }
 }

@@ -13,6 +13,7 @@ use crate::runtime::env::{Env, Label, UnitKind, Units};
 use crate::runtime::overlay::CloseReason;
 use crate::text::{LinkMode, LinkedWords, link_toggle};
 use craft_behavior::PixelSize;
+use craft_keymap::Key;
 use craft_theme::variant::Tone;
 use egui::{Response, Ui};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,20 @@ impl Resample {
         Resample::NearestNeighbor,
         Resample::Bilinear,
         Resample::Lanczos,
+    ];
+
+    /// The Alt+digit keys that pick a method, Photoshop's: Alt+3 (Preserve Details 2.0 there) picks nothing and
+    /// Lanczos has no key. The dialog takes every one of them, also when it picks nothing, so no digit reaches a
+    /// focused field.
+    pub const KEYS: [(Key, Option<Resample>); 8] = [
+        (Key::Num1, Some(Resample::Automatic)),
+        (Key::Num2, Some(Resample::PreserveDetails)),
+        (Key::Num3, None),
+        (Key::Num4, Some(Resample::BicubicSmoother)),
+        (Key::Num5, Some(Resample::BicubicSharper)),
+        (Key::Num6, Some(Resample::Bicubic)),
+        (Key::Num7, Some(Resample::NearestNeighbor)),
+        (Key::Num8, Some(Resample::Bilinear)),
     ];
 
     /// The method's name in the list.
@@ -350,9 +365,10 @@ impl Kit {
         });
     }
 
-    /// The size of a picture of `size` pixels at `bytes_per_pixel`, as a file size.
+    /// The size of a flat picture of `size` pixels at `bytes_per_pixel`, as a file size. A row takes whole bytes, so a
+    /// Bitmap row of `w` pixels at 1/8 byte each takes `ceil(w / 8)` bytes.
     pub(super) fn file_size(&self, size: PixelSize, bytes_per_pixel: f64) -> String {
-        let bytes = f64::from(size.width) * f64::from(size.height) * bytes_per_pixel;
+        let bytes = (f64::from(size.width) * bytes_per_pixel).ceil() * f64::from(size.height);
         self.units.file_size(bytes.max(0.0).round() as u64)
     }
 

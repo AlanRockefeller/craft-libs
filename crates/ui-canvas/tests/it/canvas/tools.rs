@@ -18,21 +18,20 @@ const DOCUMENT: Size = Size::new(1200.0, 900.0);
 const FRAME: f64 = 1.0 / 60.0;
 
 /// A tool on a canvas whose view the rig keeps across frames as the host reports it, with the pans the host reported.
-struct Rig<T: CanvasTool + 'static> {
+struct Rig {
     fixture: Fixture,
-    tool: Rc<RefCell<T>>,
     view: Rc<Cell<Option<CanvasView>>>,
     pans: Rc<RefCell<Vec<(DocVec, bool)>>>,
 }
 
-impl<T: CanvasTool + 'static> Rig<T> {
-    fn new(tool: T, start: impl Fn(egui::Rect) -> CanvasView + 'static) -> Self {
+impl Rig {
+    fn new<T: CanvasTool + 'static>(tool: T, start: impl Fn(egui::Rect) -> CanvasView + 'static) -> Self {
         Self::scaled(tool, 1.0, NavigationOptions::default(), start)
     }
 
     /// A rig whose canvas shows at `ppp` pixels per point from its first frame, with the canvas's navigation options
     /// `navigation`.
-    fn scaled(tool: T, ppp: f32, navigation: NavigationOptions, start: impl Fn(egui::Rect) -> CanvasView + 'static) -> Self {
+    fn scaled<T: CanvasTool + 'static>(tool: T, ppp: f32, navigation: NavigationOptions, start: impl Fn(egui::Rect) -> CanvasView + 'static) -> Self {
         let tool = Rc::new(RefCell::new(tool));
         let view = Rc::new(Cell::new(None::<CanvasView>));
         let pans = Rc::new(RefCell::new(Vec::<(DocVec, bool)>::new()));
@@ -49,7 +48,7 @@ impl<T: CanvasTool + 'static> Rig<T> {
         });
         fixture.ctx().set_pixels_per_point(ppp);
         fixture.settle();
-        Rig { fixture, tool, view, pans }
+        Rig { fixture, view, pans }
     }
 
     fn view(&self) -> CanvasView {
@@ -271,6 +270,31 @@ fn a_hand_pan_reports_its_document_distance_and_its_scroll_all_choice() {
     assert!(pans.iter().any(|(delta, _)| *delta != DocVec::ZERO), "the drag moves the view before it reaches the limit");
     assert_eq!(pans.last().map(|(delta, _)| *delta), Some(DocVec::ZERO), "a drag on past the limit reports no distance: {pans:?}");
     rig.release(c + egui::vec2(240.0, 0.0), FRAME);
+}
+
+/// Rotate View Clockwise turns the image clockwise on screen (screen y points down, so the angle grows), and
+/// Counterclockwise the other way, in a mirrored view as in a plain one (#4931).
+#[trial]
+fn the_rotate_commands_step_fifteen_degrees_on_screen_in_a_flipped_view_too() {
+    let room = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+    let probe = Point::new(700.0, 480.0);
+    let angle = |view: &CanvasView| {
+        let v = view.to_screen(probe) - view.rect.center();
+        f64::from(v.y).atan2(f64::from(v.x)).to_degrees()
+    };
+    let target = ViewTarget::from(DOCUMENT);
+    for flip_x in [false, true] {
+        for (command, screen_turn) in [(ViewCommands::RotateClockwise, 15.0), (ViewCommands::RotateCounterclockwise, -15.0)] {
+            let before = turned(room, 20.0, flip_x);
+            let mut view = before;
+            assert!(command.apply(&mut view, &target, 1.0), "{command:?} turns the view");
+            let turned_by = (angle(&view) - angle(&before) + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                (turned_by - screen_turn).abs() < 0.01,
+                "flip {flip_x}: {command:?} turns the image {screen_turn} degrees on screen, got {turned_by}"
+            );
+        }
+    }
 }
 
 #[trial]

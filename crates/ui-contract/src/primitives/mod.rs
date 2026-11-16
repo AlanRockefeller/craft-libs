@@ -12,6 +12,8 @@ mod icon;
 mod ime_surface;
 mod kit;
 mod marker;
+mod paint_slot;
+pub(crate) mod pointer_art;
 mod record;
 mod reset_mark;
 mod rule;
@@ -19,6 +21,7 @@ mod scroll_bar;
 pub(crate) mod sensing;
 mod state_layer;
 mod surface;
+mod surround;
 mod svg_set;
 #[doc(hidden)]
 pub mod svg_tree;
@@ -41,13 +44,15 @@ pub use kit::{
     fill_polygon, grid_lines, grid_lines_with, marching_ants, outline, ramp, ticks,
 };
 pub use marker::{Marker, MarkerSize};
+pub use paint_slot::PaintSlot;
 pub use reset_mark::ResetMark;
 pub use rule::{RectSide, Rule, RuleKind};
 pub use scroll_bar::{HiddenContent, ScrollBar};
-pub use sensing::{PartResult, TextOutcome};
+pub use sensing::{PartResult, TextOutcome, member_gesture_running};
 pub use state_layer::{StateLayer, StateLayerKind};
 pub use surface::Surface;
 pub(crate) use surface::SurfaceSlot;
+pub use surround::paint_surround;
 pub use svg_set::{AppIcons, register_app_icons};
 pub use text::{ChordText, HAlign, LayoutRun, ReadingMeasure, Span, TextLayout, TextRun, Wrap};
 pub use text_input::{Completer, Completion, EditorLine, EditorPurpose, EditorRun, EditorState, TextKey, TextOptions};

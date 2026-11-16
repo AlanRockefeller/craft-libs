@@ -191,6 +191,30 @@ impl Finished {
     }
 }
 
+/// A screenshot request as the control surface received it.
+#[non_exhaustive]
+pub struct ScreenshotRequest {
+    /// The caller's token: one per pending request.
+    pub token: u64,
+    /// Where to write the PNG, when the reply is a file.
+    pub path: Option<String>,
+    /// The viewport to capture.
+    pub viewport: ViewportId,
+    /// Where the reply goes.
+    pub reply: Sender<ControlResponse>,
+    /// The document the capture belongs to.
+    pub document: Option<DocumentId>,
+    /// The settle delay in milliseconds of animation time.
+    pub settle_ms: f64,
+}
+
+impl ScreenshotRequest {
+    /// A request for `viewport` answered on `reply`: no file, no document, no settle delay.
+    pub fn new(token: u64, viewport: ViewportId, reply: Sender<ControlResponse>) -> Self {
+        Self { token, path: None, viewport, reply, document: None, settle_ms: 0.0 }
+    }
+}
+
 /// A request not yet queued: it waits while its viewport's geometry is not recorded.
 struct WaitingAdmit {
     token: u64,
@@ -290,16 +314,8 @@ impl Captures {
     /// expected bytes / 1 MiB, integer division), or
     /// `screenshot budget exhausted: {total} bytes reserved of a {MAX_TOTAL_BYTES}-byte aggregate limit`.
     /// While the viewport's geometry is not recorded the request waits.
-    pub fn admit(
-        &mut self,
-        token: u64,
-        path: Option<String>,
-        viewport: ViewportId,
-        reply: Sender<ControlResponse>,
-        document: Option<DocumentId>,
-        settle_ms: f64,
-        now: Instant,
-    ) -> Result<(), (Sender<ControlResponse>, String)> {
+    pub fn admit(&mut self, request: ScreenshotRequest, now: Instant) -> Result<(), (Sender<ControlResponse>, String)> {
+        let ScreenshotRequest { token, path, viewport, reply, document, settle_ms } = request;
         if self.records.iter().any(|r| r.token == token) || self.waiting.iter().any(|w| w.token == token) {
             return Err((reply, format!("screenshot token {token} is already pending")));
         }

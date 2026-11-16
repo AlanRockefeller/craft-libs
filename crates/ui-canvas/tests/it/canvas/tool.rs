@@ -7,7 +7,7 @@ use craft_behavior::{Axis, CancelReason, CanvasView, Cursor, CursorIcon, Gesture
 use craft_keymap::Mods;
 use craft_ui::canvas::{
     Autoscroll, Canvas, CanvasScrollbars, CanvasTool, ContextRequest, CropOverlay, HandTool, Momentary, MomentaryCommands, MomentaryTool,
-    NavigationOptions, Snap, StandInKey, ToolAction, ToolClaims, ToolContext, ToolHost, ToolInput, ToolKey, ToolPath, ToolPointer,
+    NavigationOptions, Snap, StandInKey, ToolAction, ToolClaims, ToolContext, ToolHost, ToolInput, ToolKey, ToolPath, ToolPointer, canvas_space,
 };
 use craft_ui::contract::{Bind, Sampler as _, Show as _, ShowContainer as _};
 use craft_ui::dialog::Dialog;
@@ -322,7 +322,7 @@ enum Crowd {
 
 /// A `Band` canvas inset in the room with one `Crowd` around it. Returns the fixture, the app's view and the canvas's
 /// rect.
-fn crowded_canvas(crowd: Crowd) -> (Fixture, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Rect>>) {
+fn crowded_canvas(crowd: Crowd) -> CanvasRig<Rect> {
     let view = Rc::new(Cell::new(None::<CanvasView>));
     let canvas = Rc::new(Cell::new(Rect::NOTHING));
     let (shown_view, shown_canvas) = (Rc::clone(&view), Rc::clone(&canvas));
@@ -405,6 +405,12 @@ fn an_open_polygon_keeps_its_vertices_while_the_view_scrolls_under_a_resting_poi
     assert!(after.x > before.x, "the view scrolls while the polygon is open: {before:?} -> {after:?}");
     assert_eq!(tool.borrow().vertices, inside, "the vertices stay where they were clicked");
 }
+
+/// A fixture with the view the canvas reported and the last value the body saw.
+type CanvasRig<Seen> = (Fixture, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Seen>>);
+
+/// `CanvasRig` with the context requests the canvas raised.
+type MenuRig = (Fixture, Rc<RefCell<Vec<ContextRequest>>>, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Rect>>);
 
 type Log = Rc<RefCell<Vec<String>>>;
 
@@ -801,15 +807,12 @@ fn an_injected_pen_reading_reaches_the_tool() {
 /// press after its release runs the selected tool.
 /// A canvas with the momentary set and `main` as the selected tool, zoomed in, so the document is larger than the
 /// canvas and the Hand has room to pan: returns the fixture, the app's view and the canvas's id.
-fn momentary_canvas(main: Probe) -> (Fixture, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Id>>) {
+fn momentary_canvas(main: Probe) -> CanvasRig<Id> {
     momentary_canvas_with(main, |_, _| {})
 }
 
 /// `momentary_canvas` with `body` as the canvas's body.
-fn momentary_canvas_with(
-    main: Probe,
-    mut body: impl FnMut(&mut egui::Ui, &mut craft_ui::contract::BodyCx<'_>) + 'static,
-) -> (Fixture, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Id>>) {
+fn momentary_canvas_with(main: Probe, mut body: impl FnMut(&mut egui::Ui, &mut craft_ui::contract::BodyCx<'_>) + 'static) -> CanvasRig<Id> {
     let main = RefCell::new(main);
     let (view, canvas) = (Rc::new(Cell::new(None::<CanvasView>)), Rc::new(Cell::new(Id::NULL)));
     let (shown_view, shown_canvas) = (Rc::clone(&view), Rc::clone(&canvas));
@@ -857,7 +860,7 @@ fn a_queued_space_held_over_a_press_pans_with_the_hand_and_the_press_after_its_r
 fn a_held_space_pans_over_a_canvas_control_and_leaves_it_unchanged() {
     // Around the document's centre, which the zoomed-in view shows.
     let start = craft_behavior::geometry::CropBox::upright(craft_behavior::kurbo::Rect::new(580.0, 430.0, 620.0, 470.0));
-    let crop = Rc::new(RefCell::new(start.clone()));
+    let crop = Rc::new(RefCell::new(start));
     let shown = Rc::clone(&crop);
     let log = Log::default();
     let (mut fixture, view, canvas) = momentary_canvas_with(Probe::new("main", &log), move |ui, body| {
@@ -917,7 +920,7 @@ fn a_queued_space_whose_hand_the_gate_refuses_leaves_the_press_to_the_selected_t
 }
 
 /// A canvas under a dialog that keeps the canvas: returns the fixture, the app's view and the canvas's rect.
-fn kept_canvas<T: CanvasTool + 'static>(tool: Rc<RefCell<T>>) -> (Fixture, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Rect>>) {
+fn kept_canvas<T: CanvasTool + 'static>(tool: Rc<RefCell<T>>) -> CanvasRig<Rect> {
     let view = Rc::new(Cell::new(None::<CanvasView>));
     let rect = Rc::new(Cell::new(Rect::NOTHING));
     let (shown_view, shown_rect) = (Rc::clone(&view), Rc::clone(&rect));
@@ -1115,7 +1118,7 @@ fn a_secondary_click_with_the_momentary_hand_asks_for_its_menu() {
 
 /// A canvas with the Hand selected, with the momentary set when `momentary` and scroll bars in its body when `bars`.
 /// Returns the fixture, the menu requests, the app's view and the canvas's rect.
-fn menu_canvas(momentary: bool, bars: bool) -> (Fixture, Rc<RefCell<Vec<ContextRequest>>>, Rc<Cell<Option<CanvasView>>>, Rc<Cell<Rect>>) {
+fn menu_canvas(momentary: bool, bars: bool) -> MenuRig {
     let (contexts, view, rect) = (Rc::new(RefCell::new(Vec::new())), Rc::new(Cell::new(None::<CanvasView>)), Rc::new(Cell::new(Rect::NOTHING)));
     let (shown_contexts, shown_view, shown_rect) = (Rc::clone(&contexts), Rc::clone(&view), Rc::clone(&rect));
     let mut hand = HandTool::new(NavigationOptions::default());
@@ -1202,4 +1205,118 @@ fn a_focused_canvas_leaves_the_cancel_no_tool_took_to_the_window() {
         let want = if takes { 0 } else { 1 };
         assert_eq!(cancels.get(), want, "the window sees the Escape only when the tool leaves it (tool takes it: {takes})");
     }
+}
+
+/// A tool that records whether its context shows the precise cursor, in each pass.
+struct PreciseProbe(Rc<Cell<Option<bool>>>);
+
+impl CanvasTool for PreciseProbe {
+    fn each_pass(&mut self, cx: &mut ToolContext<'_>) {
+        self.0.set(Some(cx.precise()));
+    }
+
+    fn press(&mut self, _: &ToolPointer, _: &mut ToolContext<'_>) -> ToolAction {
+        ToolAction::Ignored
+    }
+
+    fn drag(&mut self, _: &ToolPointer, _: &mut ToolContext<'_>) {}
+
+    fn release(&mut self, _: &ToolPointer, _: &mut ToolContext<'_>) {}
+
+    fn cancel(&mut self, _: CancelReason, _: &mut ToolContext<'_>) {}
+
+    fn paint(&self, _: &Draw<'_>, _: &ToolContext<'_>) {}
+
+    fn command_form(&self) -> ToolPath {
+        ToolPath::Command("no command")
+    }
+}
+
+/// The precise cursor has one source, the canvas: its Precise preference, toggled by Caps Lock, reaches the tool and the
+/// body's controls alike.
+#[trial]
+fn the_tool_and_the_canvas_controls_read_one_precise_cursor_from_the_canvas() {
+    for preference in [false, true] {
+        let (tool, body) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
+        let (tool_seen, body_seen) = (Rc::clone(&tool), Rc::clone(&body));
+        let mut fixture = Fixture::new(move |ui| {
+            let view = CanvasView::new(ui.available_rect_before_wrap(), Point::new(600.0, 450.0), 1.0);
+            let canvas = Canvas::new("Document").document(DOCUMENT).view(view).precise_cursors(preference).show(ui, |_, cx| {
+                body_seen.set(canvas_space(&cx.env).map(|space| space.precise()));
+            });
+            let _ = ToolHost::new().run(ui, &canvas.output, &mut PreciseProbe(Rc::clone(&tool_seen)));
+        });
+        let ctx = fixture.ctx().clone();
+        for caps_lock in [false, true] {
+            WindowHost::of(&ctx).set_caps_lock(Some(caps_lock));
+            fixture.frame(Vec::new());
+            let precise = preference != caps_lock;
+            assert_eq!(tool.get(), Some(precise), "the tool: Precise {preference}, Caps Lock {caps_lock}");
+            assert_eq!(body.get(), Some(precise), "the controls: Precise {preference}, Caps Lock {caps_lock}");
+        }
+    }
+}
+
+/// A tool that asks for a readout, or a hud, on every drag step.
+struct Measuring {
+    hud: bool,
+}
+
+impl CanvasTool for Measuring {
+    fn press(&mut self, _: &ToolPointer, _: &mut ToolContext<'_>) -> ToolAction {
+        ToolAction::Claimed
+    }
+
+    fn drag(&mut self, _: &ToolPointer, cx: &mut ToolContext<'_>) {
+        let rows = vec![(craft_ui::runtime::env::Label::from("W"), "123 px".to_owned())];
+        if self.hud { cx.hud(rows) } else { cx.readout(rows) }
+    }
+
+    fn release(&mut self, _: &ToolPointer, _: &mut ToolContext<'_>) {}
+
+    fn cancel(&mut self, _: CancelReason, _: &mut ToolContext<'_>) {}
+
+    fn paint(&self, _: &Draw<'_>, _: &ToolContext<'_>) {}
+
+    fn command_form(&self) -> ToolPath {
+        ToolPath::Command("the Measure command")
+    }
+}
+
+/// Holds a drag of a `Measuring` tool under Show Transformation Values `shown`: whether the value painted and whether
+/// the host reported the rows.
+fn readout_during_a_drag(hud: bool, shown: Option<bool>) -> (bool, bool) {
+    let reported = Rc::new(Cell::new(false));
+    let seen = Rc::clone(&reported);
+    let tool = RefCell::new(Measuring { hud });
+    let mut fixture = Fixture::new(move |ui| {
+        let room = ui.available_rect_before_wrap();
+        let shown = Canvas::new("Document").document(DOCUMENT).view(CanvasView::new(room, Point::new(600.0, 450.0), 0.5)).show(ui, |_, _| {});
+        let reply = ToolHost::new().run(ui, &shown.output, &mut *tool.borrow_mut());
+        seen.set(reply.readout.is_some_and(|readout| readout.rows.iter().any(|(_, value)| value == "123 px")));
+    });
+    if let Some(shown) = shown {
+        fixture.root_value(craft_ui::canvas::ShowReadouts(shown));
+    }
+    fixture.settle();
+    let centre = fixture.by_role(Role::CANVAS).into_iter().next().expect("a canvas").center();
+    // The last frame is a move, so the tool's drag asks for its rows in the frame the texts are read from.
+    fixture.frame(vec![pointer::moved(centre)]);
+    fixture.frame(vec![pointer::press(centre)]);
+    for step in 1..=4 {
+        fixture.frame(vec![pointer::moved(centre + BY * (step as f32 / 4.0))]);
+    }
+    let painted = fixture.texts().iter().any(|run| run.text.contains("123 px"));
+    (painted, reported.get())
+}
+
+#[trial]
+fn show_transformation_values_gates_the_readouts_paint_and_never_the_hud() {
+    assert_eq!(readout_during_a_drag(false, None), (true, true), "by default a tool's readout paints and is reported");
+    assert_eq!(
+        readout_during_a_drag(false, Some(false)),
+        (false, true),
+        "Show Transformation Values off: nothing paints, the rows are still reported"
+    );
+    assert_eq!(readout_during_a_drag(true, Some(false)), (true, true), "a hud paints with Show Transformation Values off");
 }

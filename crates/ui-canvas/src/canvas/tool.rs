@@ -14,7 +14,7 @@ use craft_behavior::geometry::{SnapKinds, SnapLine};
 use craft_behavior::kurbo::{self, Point};
 use craft_behavior::{Axis, CancelReason, CanvasView, Cursor, CursorIcon, GestureId, PointerButton, PointerSample};
 use craft_i18n::{Digits, Format, Region};
-use craft_keymap::{Chord, Key, Mods, Platform};
+use craft_keymap::{Chord, Key, Mods};
 use egui::{Pos2, Rect, Vec2};
 use std::sync::{Arc, OnceLock};
 
@@ -241,7 +241,6 @@ pub struct ToolContext<'a> {
     /// Whether Caps Lock is on now (a brush shows its precise cursor): the platform's toggle state, read once per
     /// pass, not a count of key presses.
     pub caps_lock: bool,
-    precise_cursors: bool,
     space: Option<CanvasSpace>,
     gesture: Option<GestureId>,
     down: &'a [Key],
@@ -274,7 +273,6 @@ impl<'a> ToolContext<'a> {
             gesture: None,
             down: &[],
             caps_lock: false,
-            precise_cursors: false,
             painter: None,
             style: None,
             env: None,
@@ -326,16 +324,9 @@ impl<'a> ToolContext<'a> {
         self
     }
 
-    /// Whether Preferences > Cursors > Other Cursors is Precise.
-    #[must_use]
-    pub fn precise_cursors(mut self, on: bool) -> Self {
-        self.precise_cursors = on;
-        self
-    }
-
-    /// Whether the tool shows its precise cursor now: `precise_cursors` differs from Caps Lock.
+    /// Whether the tool shows its precise cursor now: the canvas's [`CanvasSpace::precise`]; never without a space.
     pub fn precise(&self) -> bool {
-        self.precise_cursors != self.caps_lock
+        self.space.is_some_and(|space| space.precise())
     }
 
     /// The press arena's slop.
@@ -441,7 +432,7 @@ impl<'a> ToolContext<'a> {
         self.requests.snapped.extend(lines);
     }
 
-    /// Sets the view for a pan (as [`set_view`](Self::set_view)); the host reports it as [`ViewPan`].
+    /// Sets the view for a pan (as [`set_view`](Self::set_view)); the host reports it as [`ViewPan`](super::ViewPan).
     pub fn pan_view(&mut self, view: CanvasView, scroll_all: bool) {
         self.set_view(view);
         self.requests.pan = Some(scroll_all);
@@ -451,11 +442,6 @@ impl<'a> ToolContext<'a> {
     /// tool's drag rule.
     pub fn autoscroll_at(&mut self, pointer: Pos2) {
         self.requests.autoscroll_at = Some(pointer);
-    }
-
-    /// The OS the pass runs on: the env's; the build's for a context built without an env.
-    fn os(&self) -> Platform {
-        self.env.map_or_else(Platform::current, |env| env.os)
     }
 
     /// The scope's number format and unit words, to write the values of a readout in the document's units and the

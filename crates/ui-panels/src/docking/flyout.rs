@@ -66,7 +66,11 @@ pub struct Flyout {
     edge: DockEdge,
     size: Vec2,
     auto_collapse: bool,
+    /// The rect the flyout and every resize of it stay inside.
+    #[prop]
     within: Rect,
+    /// The least size a resize leaves the flyout.
+    #[prop(quantity = "least room a resize leaves, from the dock's measured sizes, in points")]
     least: Vec2,
     placed: Option<PlacementChange>,
 }
@@ -77,20 +81,6 @@ impl Flyout {
     pub fn new(edge: DockEdge, size: Vec2, auto_collapse: bool) -> Self {
         let props = ContainerProps::new().surface(SurfaceKind::Popup).pad(Pad::None).sizing(Sizing::Content);
         Flyout { common: Common::new(), props, edge, size, auto_collapse, within: Rect::EVERYTHING, least: Vec2::ZERO, placed: None }
-    }
-
-    /// The rect the flyout and every resize of it stay inside.
-    #[must_use]
-    pub fn within(mut self, within: Rect) -> Self {
-        self.within = within;
-        self
-    }
-
-    /// The least size a resize leaves the flyout.
-    #[must_use]
-    pub fn least(mut self, least: Vec2) -> Self {
-        self.least = least;
-        self
     }
 
     /// The layer the flyout shows in, its top left at `top_left`: placed by the caller, resizable on every edge but
@@ -111,10 +101,10 @@ impl Flyout {
         if bounded { overlay.bounds(self.within) } else { overlay }
     }
 
-    /// Shows the flyout of `popup` while it is open, its top left at `anchor` (a point, or a rect's top left), and
-    /// returns what it showed; `None` while it is closed. `body` returns the height it measures for
+    /// Shows the flyout as the layer of `popup` while it is open, its top left at `anchor` (a point, or a rect's top
+    /// left), and returns what it showed; `None` while it is closed. `body` returns the height it measures for
     /// `GroupAt::Measure`, or `None` to take the flyout's own height.
-    pub fn show(
+    pub fn show_popup(
         mut self,
         ui: &mut OverlayUi<'_>,
         popup: PopupHandle,

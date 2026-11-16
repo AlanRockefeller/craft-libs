@@ -176,6 +176,8 @@ pub enum PressPhase {
     Held {
         /// The press.
         start: PressStart,
+        /// The pointer position this pass.
+        pos: Pos2,
     },
     /// The press moved past slop on a part that senses a drag.
     #[non_exhaustive]
@@ -225,7 +227,7 @@ impl PressPhase {
     pub const fn start(&self) -> Option<PressStart> {
         match self {
             PressPhase::Down { start }
-            | PressPhase::Held { start }
+            | PressPhase::Held { start, .. }
             | PressPhase::DragStart { start, .. }
             | PressPhase::Drag { start, .. }
             | PressPhase::Release { start, .. }
@@ -259,7 +261,7 @@ impl PressPhase {
         match self {
             PressPhase::Idle | PressPhase::Hover => self,
             PressPhase::Down { start } => PressPhase::Down { start: at(start) },
-            PressPhase::Held { start } => PressPhase::Held { start: at(start) },
+            PressPhase::Held { start, pos } => PressPhase::Held { start: at(start), pos: point(pos) },
             PressPhase::DragStart { start, pos } => PressPhase::DragStart { start: at(start), pos: point(pos) },
             PressPhase::Drag { start, pos, delta: d } => PressPhase::Drag { start: at(start), pos: point(pos), delta: delta(d) },
             PressPhase::Release { start, pos, click } => PressPhase::Release { start: at(start), pos: point(pos), click },
@@ -344,6 +346,7 @@ pub fn count_clicks(previous: Option<(Pos2, f64, u32, Mods)>, pos: Pos2, time: f
 #[non_exhaustive]
 pub enum PointerEvent {
     /// The pointer moved, with the pen's reading for the move when the runtime has one.
+    #[non_exhaustive]
     Moved {
         /// Where the pointer is.
         at: Pos2,
@@ -375,6 +378,11 @@ pub enum PointerEvent {
 }
 
 impl PointerEvent {
+    /// The pointer moved to `at`, with the pen's reading for the move when the runtime has one.
+    pub const fn moved(at: Pos2, sample: Option<PointerSample>) -> Self {
+        PointerEvent::Moved { at, sample }
+    }
+
     /// The primary button going down at `pos`, `time`, as the `clicks`th press in a row.
     pub const fn pressed(pos: Pos2, time: f64, clicks: u32) -> Self {
         PointerEvent::Pressed { button: PointerButton::Primary, pos, time, clicks }
@@ -642,7 +650,7 @@ impl<T: Copy> PressMachine<T> {
         } else if open.dragging {
             PressPhase::Drag { start: open.start, pos, delta: input.delta }
         } else {
-            PressPhase::Held { start: open.start }
+            PressPhase::Held { start: open.start, pos }
         };
         open.reported = true;
         PressStep { target: Some(open.target), phase: Some(phase), dragging: open.drag_reported, activated: None }
@@ -701,6 +709,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn held_reports_the_pointer_of_its_pass_within_slop() {
+        let mut machine = PressMachine::new();
+        pass(&mut machine, &[press(0.0, 1.0)], Sense::DRAG);
+        let near = pos2(SLOP / 2.0, 0.0);
+        let step = pass(&mut machine, &[PointerEvent::Moved { at: near, sample: None }], Sense::DRAG);
+        assert!(matches!(step.phase, Some(PressPhase::Held { pos, .. }) if pos == near), "{:?}", step.phase);
     }
 
     #[test]

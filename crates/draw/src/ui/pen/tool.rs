@@ -18,7 +18,7 @@ use craft_ui::style::{HandleLook, StyleColor, StyleCx};
 use egui::{CornerRadius, Pos2, Rect, Vec2};
 
 /// The side of the box a tool icon is drawn on; an icon's hotspot is in these units.
-const ICON_BOX: f32 = 24.0;
+pub(super) const ICON_BOX: f32 = 24.0;
 
 /// Why a draft ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,25 @@ pub enum PenEvent {
     /// A press on the end point of an open path while no draft is open: the host makes that path's subpath the draft
     /// with the knot of that end last (reversing it for its first knot).
     Resumed(u64, KnotRef),
+}
+
+/// The host's open draft as [`PenTool::draft`] hands it in, with whose anchors they are to take back.
+#[derive(Clone, Copy, Debug)]
+pub enum PenDraft<'a> {
+    /// The selected tool's draft: Backspace, Delete and [`PenTool::remove_last`] take back its anchors.
+    Own(&'a EditSubpath),
+    /// A draft the app keeps open for another tool (a refused draft kept after a tool switch): drawn, and ended by
+    /// Enter and Escape, but its anchors are not the selected tool's to take back, so Backspace, Delete and
+    /// [`PenTool::remove_last`] leave it to the app.
+    Foreign(&'a EditSubpath),
+}
+
+impl<'a> PenDraft<'a> {
+    fn path(self) -> &'a EditSubpath {
+        match self {
+            Self::Own(path) | Self::Foreign(path) => path,
+        }
+    }
 }
 
 /// The pen draft's look in a paint call, from the theme and the Path Options.
@@ -132,8 +151,8 @@ struct Run {
 ///   [`PenEvent::Resumed`].
 /// - Keys while a draft is open: Enter and Escape end it open and keep it (a draft of one anchor is discarded, as no
 ///   path has fewer than two anchors); Backspace and Delete remove the last anchor, the only one discarding the
-///   draft; the host's Undo does the same through [`remove_last`](Self::remove_last). Each ending is
-///   [`PenEvent::Finished`].
+///   draft, and the host's Undo does the same through [`remove_last`](Self::remove_last), except on a
+///   [`PenDraft::Foreign`] draft, whose anchors both leave to the app. Each ending is [`PenEvent::Finished`].
 /// - Look: the path so far, a dashed rubber band from the last anchor to where a click would land (with Path
 ///   Options' Rubber Band), the last anchor's handles, the anchors with the last one filled, and over the first
 ///   anchor the close cue.
@@ -156,6 +175,8 @@ struct Run {
 pub struct PenTool {
     pub(super) mode: PenMode,
     pub(super) sensing: bool,
+    /// The draft is [`PenDraft::Foreign`]: Backspace, Delete and `remove_last` leave its anchors to the app.
+    foreign: bool,
     pub(super) auto_add_delete: bool,
     options: PathOptionsSettings,
     pub(super) ends: Vec<(u64, KnotRef, Point)>,
@@ -186,6 +207,7 @@ impl PenTool {
         Self {
             mode: PenMode::default(),
             sensing: true,
+            foreign: false,
             auto_add_delete: false,
             options: PathOptionsSettings::default(),
             ends: Vec::new(),
@@ -201,12 +223,15 @@ impl PenTool {
         }
     }
 
-    /// The host's open draft. The tool keeps the draft it is drawing and reads this only while it has none: a
-    /// non-empty draft with none open (a resumed path) becomes the draft and begins its gesture at once. Hand in
-    /// `None` once [`PenEvent::Finished`] came. `None` while a run is open and no press is down means the host ended
-    /// the draft itself (a commit, a menu command): the tool drops its run and draft with no event, and the next press
-    /// starts a new draft. A press that is down keeps its run.
-    pub fn draft(&mut self, draft: Option<&EditSubpath>) -> &mut Self {
+    /// The host's open draft. The tool keeps the draft it is drawing and reads its path only while it has none: a
+    /// non-empty draft with none open (a resumed path) becomes the draft and begins its gesture at once. Whose
+    /// anchors it is to take back ([`PenDraft`]) is read on every call, as the selected tool can change while the
+    /// draft stays open. Hand in `None` once [`PenEvent::Finished`] came. `None` while a run is open and no press is
+    /// down means the host ended the draft itself (a commit, a menu command): the tool drops its run and draft with
+    /// no event, and the next press starts a new draft. A press that is down keeps its run.
+    pub fn draft(&mut self, draft: Option<PenDraft<'_>>) -> &mut Self {
+        self.foreign = matches!(draft, Some(PenDraft::Foreign(_)));
+        let draft = draft.map(PenDraft::path);
         let host_ended = draft.is_none_or(|draft| draft.knots.is_empty()) && self.run.is_some() && self.drag.is_none();
         if self.run.is_none() || host_ended {
             self.run = None;
@@ -288,13 +313,19 @@ impl PenTool {
     }
 
     /// Removes the draft's last anchor: the host's Undo while a draft is open. The only anchor discards the draft.
-    /// Returns whether it did anything; a press that is still down keeps the request from running.
+    /// Returns whether it did anything: false, leaving Undo to the app, with no draft, a [`PenDraft::Foreign`] one,
+    /// or a press that is still down.
     pub fn remove_last(&mut self) -> bool {
-        if self.shown.knots.is_empty() || self.drag.is_some() {
+        if !self.takes_back() {
             return false;
         }
         self.remove_last_anchor(CancelReason::UndoDuringGesture);
         true
+    }
+
+    /// Whether Backspace, Delete and the host's Undo remove the draft's last anchor now.
+    fn takes_back(&self) -> bool {
+        !self.foreign && !self.shown.knots.is_empty() && self.drag.is_none()
     }
 
     /// The events since the last call, in order.
@@ -371,6 +402,7 @@ impl PenTool {
         self.resume = false;
         self.own = 0;
         self.kept = 0;
+        self.foreign = false;
     }
 
     /// Cancels the run back to its start (the handed-in path of a resumed draft) and ends the draft as `Discarded`.
@@ -617,7 +649,7 @@ impl CanvasTool for PenTool {
                 self.end(CancelReason::Escape, PenEnd::Escape);
                 true
             }
-            ToolKey::Delete { .. } => {
+            ToolKey::Delete { .. } if self.takes_back() => {
                 self.remove_last_anchor(CancelReason::UndoDuringGesture);
                 true
             }
@@ -626,7 +658,7 @@ impl CanvasTool for PenTool {
     }
 
     fn claims(&self) -> ToolClaims {
-        if !self.shown.knots.is_empty() && self.drag.is_none() { ToolClaims::NONE.deletes() } else { ToolClaims::NONE }
+        if self.takes_back() { ToolClaims::NONE.deletes() } else { ToolClaims::NONE }
     }
 
     fn takes(&self, button: PointerButton, mods: Mods) -> bool {

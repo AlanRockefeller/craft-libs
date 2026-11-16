@@ -32,8 +32,6 @@ pub(crate) use input::{input_hook, queue_nav, take_menu_keys, take_nav};
 pub use intents::Intents;
 #[doc(hidden)]
 pub use intents::intents_of;
-#[doc(hidden)]
-pub use intents::leave_to_window;
 #[cfg(feature = "testing")]
 pub(crate) use intents::lent_taken;
 #[doc(hidden)]
@@ -123,7 +121,10 @@ struct Batch {
     shortcuts: Vec<Shortcut>,
     /// The text of the paste the focused component takes.
     paste: Option<String>,
-    texts: Vec<String>,
+    /// Every text event of the pass, in order.
+    texts: Vec<Typed>,
+    /// How many text events the strip left in egui's input.
+    egui_texts: usize,
     clips: Vec<EditCommand>,
     access: Vec<Action>,
     escapes: usize,
@@ -132,9 +133,9 @@ struct Batch {
     menu: Vec<MenuKey>,
     /// Whether the last Enter event of the pass was a press (`true`) or a release, `None` when there was none.
     enter_down: Option<bool>,
-    /// The latest key press of the pass, which a following text event was typed by, and its place in `presses`; its
-    /// release or a clipboard event ends it.
-    last_press: Option<(KeyInput, Option<usize>)>,
+    /// The latest key press of the pass, which a following text event was typed by; its release or a clipboard event
+    /// ends it.
+    last_press: Option<LastPress>,
     /// What this pass's typed text taught: the physical key, the modifiers and the text.
     learned: Vec<(Key, Mods, String)>,
     /// The bare Tab presses the input hook took from egui: each toggles the window's panels or moves focus, which
@@ -142,6 +143,24 @@ struct Batch {
     tabs: Vec<TabPress>,
     /// A lone Alt in a field that holds drafts was refused: the input hook calls `frame::refuse`.
     refused: bool,
+}
+
+/// One text event of the pass.
+struct Typed {
+    text: String,
+    /// A claim took the press that typed it: the text is the claim's too, so it reaches no field.
+    claimed: bool,
+    /// The text's place among the text events the strip left in egui's input, `None` when the strip took it.
+    in_egui: Option<usize>,
+}
+
+/// A key press a following text event may belong to.
+struct LastPress {
+    input: KeyInput,
+    /// Its place in `Batch::presses`, when the strip recorded it there.
+    pressed: Option<usize>,
+    /// A claim took it: its text is the claim's too, so it reaches no field.
+    claimed: bool,
 }
 
 /// A bare Tab or Shift+Tab press.

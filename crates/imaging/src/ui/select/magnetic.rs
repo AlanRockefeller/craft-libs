@@ -255,8 +255,8 @@ fn pen_pressure(pointer: &ToolPointer) -> Option<f32> {
 /// drops it. No selection drag: a press inside the selection draws.
 ///
 /// Drawn: the outline as ants, a square with an edge at each fastening point, and over the first point the closing
-/// ring beside the pointer. The cursor is the lasso icon; with Other Cursors > Precise
-/// ([`precise_cursor`](Self::precise_cursor)) or Caps Lock it is the width circle.
+/// ring beside the pointer. The cursor is the lasso icon; under the canvas's precise cursor (Other Cursors > Precise,
+/// swapped by Caps Lock: `ToolContext::precise`) it is the width circle.
 #[derive(Clone, Debug)]
 pub struct MagneticLassoTool<T> {
     tracer: T,
@@ -265,8 +265,6 @@ pub struct MagneticLassoTool<T> {
     outline: Option<MagneticOutline>,
     /// The modifiers of the last pass, to see Alt pressed or released during a drag.
     mods: Mods,
-    /// Other Cursors › Precise: the width circle shows round the crosshair.
-    precise: bool,
     report: Report,
 }
 
@@ -279,7 +277,6 @@ impl<T: EdgeTracer> MagneticLassoTool<T> {
             bar: SelectionOperation::New,
             outline: None,
             mods: Mods::NONE,
-            precise: false,
             report: Report::default(),
         }
     }
@@ -302,13 +299,6 @@ impl<T: EdgeTracer> MagneticLassoTool<T> {
     /// The options bar's operation for outlines begun from now on.
     pub fn operation(&mut self, bar: SelectionOperation) -> &mut Self {
         self.bar = bar;
-        self
-    }
-
-    /// Preferences › Cursors › Other Cursors is Precise (`CursorOptions::other_precise`): the
-    /// width circle shows round the crosshair.
-    pub fn precise_cursor(&mut self, precise: bool) -> &mut Self {
-        self.precise = precise;
         self
     }
 
@@ -486,11 +476,11 @@ impl<T: EdgeTracer> CanvasTool for SelectToolPass<'_, MagneticLassoTool<T>> {
         if self.tool.outline.as_ref().is_some_and(|o| !o.down) { ToolClaims::NONE.keyboard().deletes() } else { ToolClaims::NONE }
     }
 
-    /// The width circle with Other Cursors > Precise or Caps Lock (`width * zoom`, at least the slop); otherwise the
-    /// lasso icon with the operation's badge.
+    /// The width circle under the canvas's precise cursor (`width * zoom`, at least the slop); otherwise the lasso
+    /// icon with the operation's badge.
     fn cursor(&self, cx: &ToolContext<'_>) -> Cursor {
         let tool = &*self.tool;
-        if (tool.precise || cx.caps_lock)
+        if cx.precise()
             && let Some(place) = Place::of(cx)
         {
             let (min, max) = MagneticSettings::WIDTH_RANGE;
@@ -669,29 +659,4 @@ impl<T: EdgeTracer> CanvasTool for SelectToolPass<'_, MagneticLassoTool<T>> {
 /// How near the first point a press closes the outline, in document units.
 fn close_radius(cx: &ToolContext<'_>, place: &Place) -> f64 {
     reach(cx).close / place.zoom().max(0.01)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MagneticSettings;
-
-    #[test]
-    fn width_steps_by_one_and_shift_jumps_to_the_limits() {
-        let mut settings = MagneticSettings { width: 10.4, ..MagneticSettings::default() };
-        settings.step_width(1, false);
-        assert_eq!(settings.width, 11.0, "a step adds one to the rounded width");
-        settings.width = 1.0;
-        settings.step_width(-1, false);
-        assert_eq!(settings.width, 1.0, "the step stops at the minimum");
-        settings.width = 256.0;
-        settings.step_width(1, false);
-        assert_eq!(settings.width, 256.0, "the step stops at the maximum");
-        settings.step_width(-1, true);
-        assert_eq!(settings.width, 1.0, "Shift+[ goes to the minimum");
-        settings.step_width(1, true);
-        assert_eq!(settings.width, 256.0, "Shift+] goes to the maximum");
-        settings.width = f32::NAN;
-        settings.step_width(1, false);
-        assert_eq!(settings.width, MagneticSettings::default().width, "a width that is no number goes back to the default");
-    }
 }

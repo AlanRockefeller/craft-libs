@@ -54,7 +54,8 @@ mod new_document;
 
 pub use new_document::{
     BACKGROUND_COLOR_KEY, BackgroundContents, BitDepth, ColorMode, ColorProfiles, DocumentOptions, DocumentPreset, HostedNewDocument,
-    NewDocumentDialog, NewDocumentOutput, NewDocumentPresetWords, NewDocumentResult, NewDocumentWords, Orientation, PresetCategory,
+    NewDocumentDialog, NewDocumentOutput, NewDocumentPresetWords, NewDocumentResult, NewDocumentWords, Orientation, PIXEL_ASPECTS, PresetCategory,
+    SQUARE_PIXELS,
 };
 
 mod about;
@@ -85,9 +86,9 @@ mod export;
 
 pub use export::{
     DdsCompression, DdsOptions, ExportAsDialog, ExportAsOutput, ExportAsResult, ExportFormat, ExportFormatDefaults, ExportMetadata, ExportOptions,
-    ExportOptionsKind, ExportPreview, ExportProfile, ExportSize, ExportWords, FormatOptions, FormatOptionsDialog, FormatOptionsOutput,
+    ExportOptionsKind, ExportOutput, ExportPreview, ExportProfile, ExportSize, ExportWords, FormatOptions, FormatOptionsDialog, FormatOptionsOutput,
     FormatOptionsWords, HostedExportAs, HostedFormatOptions, JpegFormat, JpegOptions, JpegPreset, OutputPathOutput, OutputPathRow, OutputPathWords,
-    SizeEstimate, TargaOptions, TiffCompression, TiffOptions, jpeg_quality_percent,
+    ScaleRow, ScaleSize, SizeEstimate, TargaOptions, TiffCompression, TiffOptions, jpeg_quality_percent,
 };
 
 // Save PDF.
