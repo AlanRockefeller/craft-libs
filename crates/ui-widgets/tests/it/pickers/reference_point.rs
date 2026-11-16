@@ -23,7 +23,7 @@ const CENTRE: usize = 4;
 /// The slack a painted shape is compared with: the rounding of the layout.
 const ROUNDING: f32 = 0.5;
 
-/// The share of its cell a square takes, as the presentation's own constant holds it: the look the observed proxy gives
+/// The share of its cell a square takes, as the presentation's own constant holds it: the look the presentation gives
 /// the nine points, with about a third of the cell left for the line that joins them.
 const SQUARE_OF_CELL: f32 = 0.7;
 

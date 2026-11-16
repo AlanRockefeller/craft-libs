@@ -26,9 +26,8 @@ const GRID: usize = 3;
 /// The side of the dot every point shows; the large picker draws the picked one twice as wide.
 const DOT: f32 = 3.5;
 
-/// The share of a cell a point's square takes in the connected-squares presentation: the observed proxy's squares
-/// leave about a third of the pitch for the line that joins them. A room smaller than the picker asks for keeps that
-/// share of the smaller cell, so a square never leaves the cell it is drawn in.
+/// The share of a cell occupied by a square, leaving space for the links between neighbouring marks. Squares shrink
+/// with smaller cells and never grow beyond their natural size.
 const SQUARE: f32 = 0.7;
 
 /// The arrow's tip, from the cell's centre, as a share of the arrow's extent.
@@ -46,7 +45,7 @@ const ARROW_HEAD_HALF_WIDTH: f32 = 3.5 / 12.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PointPresentation {
-    /// A dot at each point, the picked point's dot twice as wide: the default.
+    /// A dot at each point: the default. The picked dot is twice as wide, except in compact mode.
     #[default]
     Dots,
     /// A square at each point, each joined to the squares beside it by a line, so the nine points read as the box's
@@ -87,10 +86,9 @@ pub struct ReferencePointStyle {
 /// points are one Tab stop; the arrows move the focus and stop at the grid's edges, and Space, Enter or a click picks
 /// the focused point. The arrows are directions in the box, so they do not mirror in a right-to-left interface and
 /// neither does the grid. A point shows a muted dot, the pick's twice as wide in the accent colour, and the cell under
-/// the pointer takes the hover fill; a mixed value picks no point. The
-/// [`presentation`](ReferencePoint::presentation) picks that mark instead: the square of
-/// [`PointPresentation::ConnectedSquares`], the nine joined into the box's grid, with the pick's square filled and the
-/// others outlined; the squares take their share of the cell they are drawn in, so a picker in a room smaller than it
+/// the pointer takes the hover fill; a mixed value picks no point. The [`presentation`](ReferencePoint::presentation)
+/// chooses the marks instead: [`PointPresentation::ConnectedSquares`] joins nine squares into the box's grid, with the
+/// picked square filled and the others outlined; the squares take their share of the cell they are drawn in, so a picker in a room smaller than it
 /// asks for still shows nine squares with the lines between them. With [`growth`](ReferencePoint::growth) the cells
 /// next to the pick show arrows toward where the box grows, over whatever the presentation marks them with. The
 /// [`compact`](ReferencePoint::compact) picker is the size of an options bar's icon and shows no arrows: every dot is
@@ -106,8 +104,8 @@ pub struct ReferencePoint<'a> {
     /// it where the box shrinks. Without it the cells show no arrows.
     #[prop]
     growth: Option<(f64, f64)>,
-    /// The options-bar size: the whole grid is `size.icon.md` square, and the pick keeps the dots' one width rather
-    /// than the wider dot of the full size. It shows no growth arrows.
+    /// The options-bar size: the whole grid is `size.icon.md` square. Every mark has the same size; the picked point
+    /// uses the accent colour and, for squares, a filled mark. It shows no growth arrows.
     #[style_key]
     #[prop(flag)]
     compact: bool,
@@ -198,7 +196,7 @@ impl<'a> ReferencePoint<'a> {
                 draw.fill(&PaintShape::Rect(dot, cx.style.dot_radius), cx.resolve(ink));
             }
             PointPresentation::ConnectedSquares => {
-                // The pick is the filled square; the others are outlines, as the observed proxy draws them.
+                // Fill the picked square and outline the others.
                 let square = Rect::from_center_size(cell.center(), Vec2::splat(side));
                 let ink = if picked { &cx.style.ink } else { &cx.style.arrow_ink };
                 if picked {
