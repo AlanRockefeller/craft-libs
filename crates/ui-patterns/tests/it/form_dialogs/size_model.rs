@@ -66,7 +66,7 @@ fn an_untouched_resolution_outside_the_range_is_not_reported_as_changed() {
 }
 
 /// The 180 pt / 12 pt column size of the Units preference.
-const COLUMNS: ColumnSize = ColumnSize { width: 180.0, gutter: 12.0 };
+const COLUMNS: ColumnSize = ColumnSize::new(180.0, 12.0);
 
 fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() < 1e-9
@@ -91,6 +91,14 @@ fn columns_on_the_width_convert_through_the_column_size() {
         }
     }
 
+    relative_columns();
+    degenerate_column_sizes();
+    shared_unit();
+    resample_off();
+}
+
+/// A relative change keeps 0 at 0 and its sign.
+fn relative_columns() {
     let mut relative = document().column_size(COLUMNS);
     relative.relative(true);
     relative.lock(false);
@@ -104,12 +112,11 @@ fn columns_on_the_width_convert_through_the_column_size() {
     relative.set_width(-372.0);
     assert!(relative.set_width_unit(UnitKind::Columns));
     assert!(close(relative.width(), -2.0), "a shrink of two columns reads -2, not {}", relative.width());
+}
 
-    let degenerate = [
-        ColumnSize { width: 0.0, gutter: f64::NAN },
-        ColumnSize { width: f64::NAN, gutter: f64::INFINITY },
-        ColumnSize { width: -5.0, gutter: f64::NAN },
-    ];
+/// A degenerate or negative column size falls back to 180 pt / 12 pt, a negative gutter counts as none.
+fn degenerate_column_sizes() {
+    let degenerate = [ColumnSize::new(0.0, f64::NAN), ColumnSize::new(f64::NAN, f64::INFINITY), ColumnSize::new(-5.0, f64::NAN)];
     for column_size in degenerate {
         let mut size = document().column_size(column_size);
         assert!(size.set_width_unit(UnitKind::Columns));
@@ -117,11 +124,14 @@ fn columns_on_the_width_convert_through_the_column_size() {
         assert_eq!(pixels(&size).0, 372, "{column_size:?} converts as 180 pt / 12 pt");
         assert!(size.width().is_finite());
     }
-    let mut no_gutter = document().column_size(ColumnSize { width: 100.0, gutter: -4.0 });
+    let mut no_gutter = document().column_size(ColumnSize::new(100.0, -4.0));
     assert!(no_gutter.set_width_unit(UnitKind::Columns));
     no_gutter.set_width(2.0);
     assert_eq!(pixels(&no_gutter).0, 200, "a negative gutter counts as none");
+}
 
+/// The height keeps the shared unit; another unit turns Columns off.
+fn shared_unit() {
     let mut shared = document();
     assert!(!shared.set_width_unit(UnitKind::Columns), "without a column size the width offers no Columns");
     assert_eq!(shared.width_unit(), UnitKind::Pixels);
@@ -132,7 +142,10 @@ fn columns_on_the_width_convert_through_the_column_size() {
     assert!(close(shared.height(), 800.0 / 72.0), "the height still reads in inches");
     assert!(shared.set_width_unit(UnitKind::Pixels));
     assert_eq!((shared.width_unit(), shared.unit()), (UnitKind::Pixels, UnitKind::Pixels), "another unit turns Columns off and sets both");
+}
 
+/// With Resample off a Columns width changes the resolution.
+fn resample_off() {
     let mut fixed = document().column_size(COLUMNS);
     fixed.resampling(false);
     assert!(fixed.set_width_unit(UnitKind::Columns));

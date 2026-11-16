@@ -13,7 +13,7 @@ use craft_ui::form::Field;
 use craft_ui::layout_components::{Grid, Row, Stack};
 use craft_ui::patterns::form_dialogs::HostRequests;
 use craft_ui::runtime::env::{Env, Label, WordTemplate};
-use craft_ui::text::{NumberPick, TextField};
+use craft_ui::text::TextField;
 use egui::{Response, Ui};
 
 use super::paragraph::{INDENT_RANGE, SPACE_RANGE};
@@ -151,6 +151,7 @@ pub enum StyleOptionsChange {
     /// The style's new name.
     Rename(String),
     /// An include check switched.
+    #[non_exhaustive]
     Include {
         /// The attribute.
         attribute: StyleAttribute,
@@ -161,6 +162,13 @@ pub enum StyleOptionsChange {
     Character(CharacterChange),
     /// A paragraph field.
     Paragraph(ParagraphChange),
+}
+
+impl StyleOptionsChange {
+    /// The include check of `attribute` switched to `on`.
+    pub fn include(attribute: StyleAttribute, on: bool) -> Self {
+        StyleOptionsChange::Include { attribute, on }
+    }
 }
 
 /// What the options editor did this pass.
@@ -212,7 +220,9 @@ pub struct TextStyleOptions<'a> {
     /// The name field takes input.
     #[prop]
     renamable: bool,
+    /// The family field is craft-font-manager's font picker over `source`.
     #[cfg(feature = "font-picker")]
+    #[prop(name = "font_picker")]
     picker: Option<FontPickerSource<'a>>,
 }
 
@@ -237,13 +247,6 @@ impl<'a> TextStyleOptions<'a> {
             #[cfg(feature = "font-picker")]
             picker: None,
         }
-    }
-
-    /// The family field is craft-font-manager's font picker over `source`.
-    #[cfg(feature = "font-picker")]
-    pub fn font_picker(mut self, source: FontPickerSource<'a>) -> Self {
-        self.picker = Some(source);
-        self
     }
 
     /// Shows the editor and returns the changes the user made.

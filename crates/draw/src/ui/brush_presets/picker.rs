@@ -270,10 +270,20 @@ pub struct BrushPresetPicker<'a, K: Value + Eq + Hash> {
     #[prop]
     resizable: Option<SaveKey>,
     opened_at: Option<(Pos2, Bind<'a, bool>)>,
+    /// The compact form: the popover shows only the head (Size, Hardness for round tips, the tip widget), without the
+    /// search row, the gear or the browser.
+    #[prop]
     compact: bool,
+    /// Whether the picker takes input: off disables its field, its head and its popover. It is enabled by default.
+    #[prop]
     enabled: bool,
-    app_rows: Option<Box<dyn FnOnce(&mut Ui) + 'a>>,
+    /// App rows drawn under the head.
+    #[prop(name = "rows", boxed = "FnOnce(&mut Ui) + 'a")]
+    app_rows: Option<AppRows<'a>>,
 }
+
+/// The app's own rows of the picker's gear menu.
+type AppRows<'a> = Box<dyn FnOnce(&mut Ui) + 'a>;
 
 impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
     /// A picker named `label` over the presets in `rows` (build each with [`brush_row`](super::brush_row)), holding the
@@ -300,25 +310,6 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
             enabled: true,
             app_rows: None,
         }
-    }
-
-    /// The compact form: the popover shows only the head (Size, Hardness for round tips, the tip widget), without the
-    /// search row, the gear or the browser.
-    pub fn compact(mut self, on: bool) -> Self {
-        self.compact = on;
-        self
-    }
-
-    /// Whether the picker takes input: off disables its field, its head and its popover. It is enabled by default.
-    pub fn enabled(mut self, on: bool) -> Self {
-        self.enabled = on;
-        self
-    }
-
-    /// App rows drawn under the head.
-    pub fn rows(mut self, rows: impl FnOnce(&mut Ui) + 'a) -> Self {
-        self.app_rows = Some(Box::new(rows));
-        self
     }
 
     /// Opens the popover at `at`, a point in the parent's layer space, while `open` is true, and shows no field: the
@@ -381,7 +372,7 @@ impl<'a, K: Value + Eq + Hash> BrushPresetPicker<'a, K> {
                                 .step(1.0)
                                 .unit_kind(UnitKind::Percent)
                                 .show(ui);
-                            hardness = field.events.map(|percent| (percent / 100.0).clamp(0.0, 1.0));
+                            hardness = field.edit.events.map(|percent| (percent / 100.0).clamp(0.0, 1.0));
                         }
                     });
                 });

@@ -266,7 +266,7 @@ fn swatches_panel_reports_each_edit_and_leaves_the_library() {
     let blue = SwatchColor::Rgb([0.0, 0.0, 1.0]);
     let entry = |name: &str, color: SwatchColor| craft_color::palette::SwatchEntry::new(name.to_owned(), color);
     let groups = vec![
-        SwatchGroup { name: "Basics".to_owned(), entries: vec![entry("Red", red.clone()), entry("Color Swatch 1", blue.clone())] },
+        SwatchGroup { name: "Basics".to_owned(), entries: vec![entry("Red", red), entry("Color Swatch 1", blue)] },
         SwatchGroup { name: "Other".to_owned(), entries: vec![entry("Blue", blue)] },
     ];
     let (mut fixture, edits) = swatches_rig(groups.clone());
@@ -274,7 +274,7 @@ fn swatches_panel_reports_each_edit_and_leaves_the_library() {
     fixture.click(&row).settle();
     assert!(edits.borrow().is_empty(), "a click selects and uses, it edits nothing: {:?}", edits.borrow());
     fixture.key(Key::Delete, Modifiers::NONE).settle();
-    assert_eq!(*edits.borrow(), [SwatchEdit::Delete { swatch: "Red".to_owned() }], "one resolved edit, once");
+    assert_eq!(*edits.borrow(), [SwatchEdit::delete("Red".to_owned())], "one resolved edit, once");
 
     let (mut fixture, edits) = swatches_rig(groups.clone());
     let row = fixture.by_label("Red, #ff0000").expect("the Red swatch");
@@ -292,7 +292,7 @@ fn swatches_panel_reports_each_edit_and_leaves_the_library() {
     let made = SwatchesMenu::run_command(&groups, &mut state, SwatchesCommand::NewSwatch, RED, &Default::default());
     assert_eq!(
         made.edit,
-        Some(SwatchEdit::Add { group: Some("Basics".to_owned()), name: "Color Swatch 2".to_owned(), color: red }),
+        Some(SwatchEdit::add(Some("Basics".to_owned()), "Color Swatch 2".to_owned(), red)),
         "the next free number, in the selected swatch's group, with the foreground"
     );
     assert_eq!(state.rename, Some(SwatchKey::Swatch("Color Swatch 2".to_owned())), "the new swatch opens for renaming");
@@ -369,4 +369,31 @@ fn a_swatch_table_cell_reports_its_colour_selects_on_click_and_shows_its_name() 
     fixture.advance(DELAY);
     fixture.settle();
     assert!(fixture.texts().iter().any(|run| run.text == "Red"), "the pointer's rest on a cell shows its name");
+}
+
+/// Whether the Info panel over `measure` shows each of the names "A", "L", "L1", "L2".
+fn measure_names(measure: Option<craft_color::ui::InfoMeasure>) -> [bool; 4] {
+    let mut fixture = Fixture::new(move |ui| {
+        let readings = craft_color::ui::InfoReadings::new().measure(measure.clone()).document(Some([640, 480]));
+        let _ = craft_color::ui::InfoPanel::new("Info", &readings).show(ui);
+    });
+    fixture.settle();
+    ["A", "L", "L1", "L2"].map(|name| fixture.by_label(name).is_some())
+}
+
+#[trial]
+fn the_info_panel_shows_the_rulers_measure_while_it_has_one() {
+    use craft_color::ui::InfoMeasure;
+    assert_eq!(measure_names(Some(InfoMeasure::line("-36.9°", "250.00"))), [true, true, false, false], "a ruler: A and L");
+    assert_eq!(measure_names(Some(InfoMeasure::protractor("45.0°", "200.00", "141.42"))), [true, false, true, true], "a protractor: A, L1 and L2");
+    assert_eq!(measure_names(None), [false; 4], "no ruler, no measure names");
+    let mut fixture = Fixture::new(|ui| {
+        let readings =
+            craft_color::ui::InfoReadings::new().measure(Some(InfoMeasure::protractor("45.0°", "200.00", "141.42"))).document(Some([640, 480]));
+        let _ = craft_color::ui::InfoPanel::new("Info", &readings).show(ui);
+    });
+    fixture.settle();
+    for value in ["45.0°", "200.00", "141.42"] {
+        assert!(fixture.by_label(value).is_some(), "the protractor's {value} shows");
+    }
 }

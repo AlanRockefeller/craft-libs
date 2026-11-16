@@ -5,7 +5,7 @@
 //!   [`GradientMapEditor`] and the [`GradientFillEditor`]. The stop bar and the stop rules are
 //!   craft-color's (`craft_color::ui::gradient`).
 //! - [`pen`]: the `PenDraft` of the Pen tool and the [`BezierOverlay`] that edits paths, with the
-//!   path model they share ([`EditPath`]), and the [`PathOptionsPopover`].
+//!   path model they share ([`EditPath`]), the anchor tools' [`AnchorTool`], and the [`PathOptionsPopover`].
 //! - [`stroke`]: the [`StrokeEditor`], the [`StrokeButton`] that opens it and the [`StrokePreview`].
 //! - [`corner`]: the [`CornerWidgets`] for corner radii.
 //! - [`crop`]: the [`PerspectiveCropQuad`], the [`CropTool`] with its [`CropSession`], and the [`CropBar`].
@@ -82,7 +82,9 @@ pub use gradient::{
     GradientGroup, GradientItem, GradientLine, GradientMap, GradientMapEditor, GradientMapOutput, GradientOverlay, GradientPalette, GradientRef,
     GradientSwatch, LineGradient, LinePart,
 };
-pub use measure::{MIN_LINE, RulerBar, RulerBarOutput, RulerLine, RulerOverlay, RulerPass, RulerTool, RulerWords, box_distances, ruler_line_form};
+pub use measure::{
+    MIN_LINE, RulerBar, RulerBarOutput, RulerLine, RulerOverlay, RulerPass, RulerTool, RulerWords, box_distances, ruler_line_form, show_ruler,
+};
 pub use paint_bar::{
     EraserMode, MIXER_COMBINATIONS, MIXER_GROUP_STARTS, MixerValues, PaintBar, PaintBarOutput, PaintBarWords, PaintTool, PaintValues, Smoothing,
 };
@@ -90,19 +92,24 @@ pub use paths::{PathKind, PathRow, PathsCommands, PathsEvent, PathsFooterButton,
 pub use pattern::{
     PatternColors, PatternFillDialog, PatternFillEditor, PatternFillOptions, PatternFillOutput, PatternSwatch, PatternWords, SwatchPainter,
 };
-pub use pen::{AnchorDelete, PenEnd};
+pub use pen::{AnchorDelete, AnchorTool, PenEnd};
 pub use pen::{AnchorsShown, HitMark, PATH_OPTIONS_COLOR_KEY, PathMode, PathOptionsPopover, PathOptionsSettings, PathTool, PenMode, SegmentMark};
 pub use pen::{
     BezierHit, BezierOverlay, BezierStyle, BezierTool, EditPath, EditSubpath, HandleSide, HandlesShown, Knot, KnotRef, MAX_ANCHORS, PathEdit,
     PathSelection, PenStyle,
 };
 pub use picture_fill::{PictureFill, PictureFillEditor, PictureFillOutput, PictureMode};
-pub use shape::{Arrowheads, ArrowheadsOutput, ArrowheadsPopover, LINE_WEIGHT_RANGE, RADIUS_RANGE, StrokeCells, VectorMode, VectorModeSelect};
+pub use shape::{
+    Arrowheads, ArrowheadsOutput, ArrowheadsPopover, LINE_WEIGHT_RANGE, RADIUS_RANGE, StrokeCells, StrokeCellsOutput, VectorMode, VectorModeSelect,
+};
+pub use shape::{BoxConstraintsOutput, BoxConstraintsPopover};
 pub use shape::{
     ChipSetup, LiveShape, ShapeAppearance, ShapeBar, ShapeBarOutput, ShapeChange, ShapePaint, ShapePanel, ShapePanelOutput, ShapeToolSettings,
     ShapeWords,
 };
-pub use shape_drag::{CreateShapeDialog, CreateShapeOptions, CreatedShape, ShapeDragEvent, ShapeDragOptions, ShapeDragTool, ShapeKind};
+pub use shape_drag::{
+    BoxConstraint, BoxConstraints, CreateShapeDialog, CreateShapeOptions, CreatedShape, ShapeDragEvent, ShapeDragOptions, ShapeDragTool, ShapeKind,
+};
 pub use shape_presets::{ShapeMenu, ShapePresetWords};
 pub use slice::{
     DivideBy, DivideSlices, DivideSlicesDialog, SliceBar, SliceBarOutput, SliceCommand, SliceEvent, SliceItem, SliceKind, SliceMode, SliceOptions,

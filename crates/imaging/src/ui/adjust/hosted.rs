@@ -17,6 +17,9 @@ use serde::de::DeserializeOwned;
 
 use super::{AdjustContext, LevelsClip, TonePicker};
 
+/// The target a reset aims for, from the current and the opening value.
+type ResetWith<V> = Box<dyn Fn(&V, &V) -> V + Send>;
+
 /// The phase of the editor's edit this pass, mirroring [`craft_behavior::EditEvent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -33,6 +36,7 @@ pub enum EditPhase {
 
 /// What an adjustment editor shares with its dialog for one pass: the context, the canvas, the dialog's own picker,
 /// channel and clipping state, and the editor's edit phase.
+#[non_exhaustive]
 pub struct AdjustDialogCx<'a> {
     /// Where the editor is shown.
     pub context: AdjustContext,
@@ -48,6 +52,14 @@ pub struct AdjustDialogCx<'a> {
     pub clipping: &'a mut Option<LevelsClip>,
     /// The editor's edit phase and its gesture this pass.
     pub edit: Option<(EditPhase, GestureId)>,
+}
+
+impl<'a> AdjustDialogCx<'a> {
+    /// The context for an editor shown in `context` over the dialog's own `picker`, `channel` and `clipping` state, with
+    /// no canvas, no curve point to select and no edit phase; the fields set the rest.
+    pub fn new(context: AdjustContext, picker: &'a mut Option<TonePicker>, channel: &'a mut usize, clipping: &'a mut Option<LevelsClip>) -> Self {
+        Self { context, canvas: None, picker, channel, select_point: None, clipping, edit: None }
+    }
 }
 
 /// The clipping display as automation names it: `"shadows"`, `"highlights"` or null (`LevelsClip` has no serde).
@@ -105,7 +117,7 @@ pub struct HostedAdjustDialog<V, E = ()> {
     resizable: bool,
     remember: Option<SaveKey>,
     canvas: Option<egui::Id>,
-    reset_with: Option<Box<dyn Fn(&V, &V) -> V + Send>>,
+    reset_with: Option<ResetWith<V>>,
     picker: Option<TonePicker>,
     channel: usize,
     clipping: Option<LevelsClip>,

@@ -14,13 +14,14 @@ use super::rows::{ParamRows, ParamRowsOutput};
 
 use crate::contract::{Bind, BodyCx, CanvasGesture, NoValue, Outcome, Remember as _, Sampler as _, SaveKey, Show as _, ShowContainer as _};
 
-use crate::dialog::{Dialog, DialogId, DialogResult, DialogStack, FieldRefusal, FooterHooks, HeldAnswer, HeldOk, StackDialog, dialog_id};
+use crate::dialog::{Alert, Dialog, DialogId, DialogResult, DialogStack, FieldRefusal, FooterHooks, HeldAnswer, HeldOk, StackDialog, dialog_id};
 
 use crate::display::{Shade, Text};
 use crate::layout_components::{Row, Stack};
 use crate::notices::{Notice, NoticeLayout};
 
 use crate::runtime::env::{Env, Label};
+use crate::text::RangeAlert;
 
 use crate::runtime::memory::MemoryStage;
 
@@ -170,6 +171,10 @@ pub struct ParamDialog<'a> {
     /// The second button's label when it is not Cancel (Close, say).
     #[prop]
     cancel_label: Option<Label>,
+    /// The title of the range alert a hosted dialog words for a clamped value ([`HostedParamDialog::take_range_alert`]);
+    /// the dialog's title when not set. An app names itself here.
+    #[prop(into)]
+    alert_title: Option<Label>,
     /// Whether holding Alt turns the second button into Reset; the default is true.
     #[prop]
     alt_resets: bool,
@@ -220,7 +225,8 @@ pub struct ParamDialog<'a> {
     /// The patterns the dialog's [`ParamKind::Pattern`] rows offer.
     #[prop]
     patterns: Cow<'a, [PresetRow<String>]>,
-    /// A muted line at the footer's start edge (JPEG Options' size estimate).
+    /// A muted line at the footer's start edge, left of the buttons (a file size estimate, say).
+    #[prop(into)]
     footer_note: Option<Label>,
     /// A section under the rows that only reads the values (a monitor note).
     #[prop(func = "Fn(&mut Ui, &DialogFields)")]
@@ -229,19 +235,24 @@ pub struct ParamDialog<'a> {
     /// The host's answers to the requests of earlier passes; the dialog writes them into its values first.
     #[prop]
     answers: Vec<HostAnswer>,
-    /// The values a [`HostedParamDialog`] opened before the first pass: the first pass leaves them and Reset restores
-    /// them.
+    /// Marks the bound values as opened by the host with `opening`, so the first pass doesn't open them again and
+    /// Reset restores `opening`.
+    #[prop(vis = "pub(crate)")]
     values_opened: Option<DialogFields>,
-    /// OK keeps the dialog open and reports its answer in `ParamDialogOutput::held` ([`HostedParamDialog::held_ok`]).
+    /// Makes OK keep the dialog open and report its answer in `ParamDialogOutput::held`.
+    #[prop(name = "hold_ok", vis = "pub(crate)")]
     hold: bool,
-    /// The host accepted the held OK: this pass closes the dialog as OK.
+    /// Closes the dialog as OK in this pass: the host accepted the held answer.
+    #[prop(vis = "pub(crate)")]
     finish_held: bool,
-    /// Why the host refused the held OK, and the values it refused: the notice under the rows shows while the values
-    /// are those.
+    /// Shows `reason` under the rows while the values are `refused`.
+    #[prop(vis = "pub(crate)")]
     refusal: Option<(Label, DialogFields)>,
-    /// The picture point this pass centres the preview pane's view on ([`HostedParamDialog::centre_preview`]).
+    /// Centres the preview pane's view on the picture point `point` in this pass; without a picture it does nothing.
+    #[prop(name = "centre_on", vis = "pub(crate)")]
     centre: Option<Pos2>,
-    /// The colours a child picker previews in the colour rows, by row key ([`HostedParamDialog::preview_color`]).
+    /// The colours the colour rows show in place of their values in this pass, by row key.
+    #[prop(vis = "pub(crate)")]
     preview_colors: Vec<(String, Srgba)>,
 }
 
@@ -274,6 +285,7 @@ impl<'a> ParamDialog<'a> {
             ok_reason: None,
             ok_label: None,
             cancel_label: None,
+            alert_title: None,
             alt_resets: true,
             outer_gesture: false,
             history: false,
@@ -305,43 +317,6 @@ impl<'a> ParamDialog<'a> {
     /// has no setter for (`Dialog::overlay`, say). It runs after the settings `ParamDialog` makes itself.
     pub fn shaped(mut self, shape: impl FnOnce(Dialog<'a>) -> Dialog<'a> + 'a) -> Self {
         self.shaped = Some(Shaped(Box::new(shape)));
-        self
-    }
-
-    /// Marks the bound values as opened by the host with `opening`, so the first pass doesn't open them again and
-    /// Reset restores `opening`.
-    pub(crate) fn values_opened(mut self, opening: DialogFields) -> Self {
-        self.values_opened = Some(opening);
-        self
-    }
-
-    /// Makes OK keep the dialog open and report its answer in `ParamDialogOutput::held`.
-    fn hold_ok(mut self, on: bool) -> Self {
-        self.hold = on;
-        self
-    }
-
-    /// Closes the dialog as OK in this pass: the host accepted the held answer.
-    fn finish_held(mut self, on: bool) -> Self {
-        self.finish_held = on;
-        self
-    }
-
-    /// Shows `reason` under the rows while the values are `refused`.
-    fn refusal(mut self, refusal: Option<(Label, DialogFields)>) -> Self {
-        self.refusal = refusal;
-        self
-    }
-
-    /// Centres the preview pane's view on the picture point `point` in this pass; without a picture it does nothing.
-    fn centre_on(mut self, point: Option<Pos2>) -> Self {
-        self.centre = point;
-        self
-    }
-
-    /// The colours the colour rows show in place of their values in this pass, by row key.
-    fn preview_colors(mut self, colors: Vec<(String, Srgba)>) -> Self {
-        self.preview_colors = colors;
         self
     }
 
@@ -415,6 +390,7 @@ impl<'a> ParamDialog<'a> {
             ok_reason,
             ok_label,
             cancel_label,
+            alert_title: _,
             alt_resets,
             outer_gesture,
             history,
@@ -605,12 +581,6 @@ impl<'a> ParamDialog<'a> {
             preview_centre: shown_preview.centre,
         }
     }
-
-    /// A muted line at the footer's start edge, left of the buttons (a file size estimate, say).
-    pub fn footer_note(mut self, note: impl Into<Label>) -> Self {
-        self.footer_note = Some(note.into());
-        self
-    }
 }
 
 /// What the footer of an installed Reset footer reads from the body.
@@ -790,6 +760,9 @@ pub struct HostedParamDialog {
     fields: DialogFields,
     build: Box<Build>,
     requests: HostRequests,
+    /// The last range alert a row raised, with its title and the env the dialog showed in (which words it), until the
+    /// host takes it.
+    range_alert: Option<(Label, RangeAlert, Env)>,
     /// Whether the dialog is open: bound to the dialog's `opened` prop, so the dialog's own open state, kept under
     /// its id, cannot hold a dialog closed that the host opened again.
     open: bool,
@@ -843,6 +816,7 @@ impl HostedParamDialog {
             fields,
             build: Box::new(build),
             requests: HostRequests::new(),
+            range_alert: None,
             open: true,
             previews,
             preview_on: true,
@@ -967,6 +941,13 @@ impl HostedParamDialog {
         self.requests.take_listing()
     }
 
+    /// The range alert of a value typed past a row's range and clamped, worded and titled
+    /// ([`ParamDialog::alert_title`]), once: the host opens it.
+    pub fn take_range_alert(&mut self) -> Option<Alert<'static>> {
+        let (title, alert, env) = self.range_alert.take()?;
+        Some(Alert::range(title, &alert, &env))
+    }
+
     /// Answers the listing request `key` with the `files` of its folder.
     pub fn answer_listing(&mut self, key: impl Into<String>, files: Vec<std::path::PathBuf>) {
         self.requests.answer_listing(key, files);
@@ -1025,7 +1006,7 @@ pub fn set_param_field(params: &[Param], fields: &mut DialogFields, field: &str,
         return Err(FieldRefusal::Inactive.message(field));
     }
     let writes = if companion(param) {
-        Some(vec![(field.to_owned(), Some(FieldValue::Json(value.clone())).filter(|_| !value.is_null()))])
+        Some(vec![(field.to_owned(), (!value.is_null()).then_some(FieldValue::Json(value.clone())))])
     } else if param.key != field {
         value.as_str().map(|unit| vec![(field.to_owned(), Some(FieldValue::Text(unit.to_owned())))])
     } else if matches!(param.kind, ParamKind::Files { .. }) {
@@ -1107,9 +1088,13 @@ impl StackDialog for HostedParamDialog {
             .opened(Bind::bound(&mut self.open))
             .hold_ok(self.hold)
             .finish_held(finish)
-            .refusal(self.held.refusal().map(|(reason, refused)| (reason.clone(), refused.fields.clone())))
-            .preview_colors(self.requests.previewed_colors().to_vec())
-            .centre_on(centre);
+            .preview_colors(self.requests.previewed_colors().to_vec());
+        if let Some((reason, refused)) = self.held.refusal() {
+            dialog = dialog.refusal((reason.clone(), refused.fields.clone()));
+        }
+        if let Some(point) = centre {
+            dialog = dialog.centre_on(point);
+        }
         // OK waits for the host's answer: a second OK cannot file over the held one.
         if self.held.is_waiting() {
             dialog = dialog.ok_enabled(false);
@@ -1117,9 +1102,13 @@ impl StackDialog for HostedParamDialog {
         if let Some(picture) = self.picture {
             dialog = dialog.preview(picture);
         }
+        let alert_title = dialog.alert_title.clone().unwrap_or_else(|| dialog.title.clone());
         let shown = dialog.show(ui);
         if let Some(mut rows) = shown.rows {
             self.requests.absorb(&mut rows);
+            if let Some(alert) = rows.out_of_range {
+                self.range_alert = Some((alert_title, alert, Env::of(ui)));
+            }
         }
         if let Some(point) = shown.preview_click {
             self.requests.request_preview_click(point);

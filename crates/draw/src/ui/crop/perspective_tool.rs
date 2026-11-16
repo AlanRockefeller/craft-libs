@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use craft_behavior::geometry::Constraint;
 use craft_behavior::kurbo::Point;
-use craft_behavior::{CancelReason, Cursor, CursorIcon, EditEvent, GestureId, IconId, Mixed, PaintedCursor};
+use craft_behavior::{CancelReason, Cursor, CursorIcon, EditEvent, GestureId, IconId, Mixed, PaintedCursor, PointerGlyph};
 use craft_theme::variant::Tone;
 use craft_ui::canvas::{CanvasTool, CropShield, ToolAction, ToolContext, ToolKey, ToolPath, ToolPointer};
 use craft_ui::contract::{Bind, Show as _};
@@ -128,11 +128,6 @@ impl PerspectiveCropTool {
 fn boxed(anchor: Point, to: Point) -> PerspectiveQuad {
     let (x0, y0, x1, y1) = (anchor.x.min(to.x), anchor.y.min(to.y), anchor.x.max(to.x), anchor.y.max(to.y));
     (x1 > x0 && y1 > y0).then_some([Point::new(x0, y0), Point::new(x1, y0), Point::new(x1, y1), Point::new(x0, y1)])
-}
-
-/// Whether `q` is convex whichever way it is wound: the preview of corners clicked in any order.
-fn convex(q: &[Point; 4]) -> bool {
-    is_valid(q) || is_valid(&[q[0], q[3], q[2], q[1]])
 }
 
 /// What the host hands the perspective crop pass each frame.
@@ -271,7 +266,7 @@ impl CanvasTool for PerspectiveCropPass<'_> {
             _ => None,
         };
         if let Some(quad) = preview {
-            let ok = clicks.len() == 2 || convex(&quad);
+            let ok = clicks.len() == 2 || is_valid(&quad);
             if ok && self.input.show_grid {
                 let grid = grid_color(style);
                 for [a, b] in grid_lines(view, &quad, grid_step(style)) {
@@ -292,7 +287,7 @@ impl CanvasTool for PerspectiveCropPass<'_> {
 
     fn cursor(&self, _: &ToolContext<'_>) -> Cursor {
         if self.tool.quad.is_none() {
-            PaintedCursor::crosshair_tool(IconId::new("perspective_crop")).into()
+            PaintedCursor::pointer_tool(PointerGlyph::Crosshair, IconId::new("perspective_crop")).into()
         } else {
             Cursor::System(CursorIcon::Default)
         }

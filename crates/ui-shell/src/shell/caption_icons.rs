@@ -34,7 +34,6 @@ impl CaptionIcon {
     }
 
     /// The icon name the freedesktop themes give the glyph.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn theme_name(self) -> &'static str {
         match self {
             CaptionIcon::Minimize => "window-minimize-symbolic",
@@ -121,26 +120,19 @@ impl std::fmt::Debug for CaptionIcons {
     }
 }
 
-/// The four glyph SVGs of icon theme `theme` (with its parents and `hicolor`), in [`CaptionIcon::ALL`] order.
-#[cfg(target_os = "linux")]
+/// The four glyph SVGs of icon theme `theme` (with its parents and `hicolor`), in [`CaptionIcon::ALL`] order; none
+/// where the platform has no icon themes.
 fn theme_files(theme: &str) -> [Option<Arc<[u8]>>; 4] {
-    use craft_window::desktop::{IconTheme, base_dirs, read_small};
-    let Some(found) = IconTheme::load(theme, &base_dirs(&|key: &str| std::env::var(key).ok())) else {
-        return Default::default();
-    };
-    CaptionIcon::ALL.map(|icon| found.find_svg(icon.theme_name()).and_then(|path| read_small(&path)).map(Arc::<[u8]>::from))
+    craft_window::desktop::theme_svgs(theme, CaptionIcon::ALL.map(CaptionIcon::theme_name)).map(|file| file.map(Arc::<[u8]>::from))
 }
 
-/// The freedesktop lookup is Linux's; elsewhere every glyph is the family's own.
-#[cfg(not(target_os = "linux"))]
-fn theme_files(_theme: &str) -> [Option<Arc<[u8]>>; 4] {
-    Default::default()
-}
+/// Bytes drawing one caption icon may allocate, its target included.
+const MASK_DRAW_BUDGET: u64 = 64 << 20;
 
 /// An SVG's coverage (alpha) as a `px` x `px` mask, the drawing fitted and centred. `None` for an unreadable SVG or
 /// an absurd size.
 fn rasterize_mask(svg: &[u8], px: u32) -> Option<CaptionMask> {
-    use resvg::tiny_skia;
+    use craft_svg::tree::draw::{self, tiny_skia};
     if !(1..=MAX_MASK_SIDE).contains(&px) {
         return None;
     }
@@ -155,8 +147,8 @@ fn rasterize_mask(svg: &[u8], px: u32) -> Option<CaptionMask> {
         }
         let scale = px as f32 / side;
         let (dx, dy) = ((px as f32 - size.width() * scale) / 2.0, (px as f32 - size.height() * scale) / 2.0);
-        let mut pixmap = tiny_skia::Pixmap::new(px, px)?;
-        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy), &mut pixmap.as_mut());
+        let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
+        let pixmap = draw::render(&tree, transform, px, px, 0, MASK_DRAW_BUDGET).ok()?;
         Some(pixmap.data().as_chunks::<4>().0.iter().map(|[_, _, _, a]| *a).collect())
     }))
     .ok()
